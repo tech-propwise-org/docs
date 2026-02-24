@@ -1,0 +1,1774 @@
+---
+title: 'Query optimization patterns'
+description: 'Project-wide standards for database query optimization, access control queries, pagination, business logic verification, and performance best practices using MikroORM and PostgreSQL.'
+---
+
+This document defines **project-wide patterns** for optimizing database queries, ensuring complete business logic implementation, and maintaining code quality. These patterns apply to all existing and future modules.
+
+<Info>
+  **Applies to:** All modules (CRM, Real Estate, Marketing, Channels, etc.). Use
+  this reference when creating a new module or service, reviewing existing code
+  for optimization, implementing complex queries, or running code reviews.
+</Info>
+
+## Query optimization patterns
+
+### EXISTS subqueries for access control
+
+Checking if a user has access to entities often requires loading IDs first, then filtering. This creates two database round trips and memory overhead for large ID arrays.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const stakeholderLeadIds = await this.em
+  .find(EntityStakeholder, {
+    entityType: 'lead',
+    user: userId,
+    isDeleted: false,
+  })
+  .then((stakes) => stakes.map((s) => s.entityId));
+
+queryBuilder.andWhere({ id: { $in: stakeholderLeadIds } });
+
+````
+
+<Warning>
+Two database round trips, memory overhead for large ID arrays, and PostgreSQL `IN` clause parameter limits (~32K) make this pattern unsafe at scale.
+</Warning>
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+queryBuilder.andWhere(
+  `(
+    lead.created_by_id = ?
+    OR EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'lead'
+      AND es.entity_id = lead.id
+      AND es.user_id = ?
+      AND es.is_deleted = false
+    )
+  )`,
+  [userId, userId],
+);
+````
+
+<Tip>
+Single database round trip. The database optimizer uses indexes efficiently, there is no memory overhead for ID arrays, and it works with any number of records.
+</Tip>
+</Tab>
+</Tabs>
+
+### NOT EXISTS for pool/unassigned queries
+
+Finding entities without a primary stakeholder (lead pool) should use `NOT EXISTS` instead of loading all entities and filtering in application code.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const allLeads = await this.em.find(Lead, { isDeleted: false });
+
+const assignedIds = await this.em
+.find(EntityStakeholder, {
+entityType: 'lead',
+isPrimary: true,
+isDeleted: false,
+})
+.then((s) => s.map((x) => x.entityId));
+
+const unassignedLeads = allLeads.filter((l) => !assignedIds.includes(l.id));
+
+````
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+queryBuilder.andWhere(
+  `NOT EXISTS (
+    SELECT 1 FROM entity_stakeholder es
+    WHERE es.entity_type = 'lead'
+    AND es.entity_id = lead.id
+    AND es.is_primary = true
+    AND es.is_deleted = false
+  )`,
+);
+````
+
+</Tab>
+</Tabs>
+
+Use `NOT EXISTS` for lead pool (unassigned leads), orphaned entities, and records missing required relationships.
+
+### IN with subquery for team access
+
+Fetching entities assigned to teams where the user has permissions uses a small `IN` clause, which is acceptable because team count per user is typically under 10.
+
+```typescript
+const teamIds = await this.accessService.getUserTeamsWithPermissions(userId, [
+  'team_crm.view',
+  'team_crm.manage',
+]);
+
+if (teamIds.length === 0) {
+  return { items: [], total: 0, page: 1, limit: 10, hasMore: false };
+}
+
+const teamIdsParam = teamIds.map(() => '?').join(', ');
+queryBuilder.andWhere(
+  `EXISTS (
+    SELECT 1 FROM entity_stakeholder es
+    WHERE es.entity_type = 'lead'
+    AND es.entity_id = lead.id
+    AND es.team_id IN (${teamIdsParam})
+    AND es.is_deleted = false
+  )`,
+  teamIds,
+);
+```
+
+<Tip>
+  Use `AccessService.getUserTeamsWithPermissions()` for centralized permission
+  checking instead of hardcoding role names in each service.
+</Tip>
+
+### Proper JOIN loading
+
+Prevent N+1 queries by eagerly loading related entities with `leftJoinAndSelect`.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const leads = await this.em.find(Lead, { isDeleted: false });
+for (const lead of leads) {
+  console.log(lead.person.firstName); // Query per lead!
+}
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+const queryBuilder = this.em.createQueryBuilder(Lead, 'lead');
+
+queryBuilder.leftJoinAndSelect('lead.person', 'person');
+queryBuilder.leftJoinAndSelect('person.emails', 'emails');
+queryBuilder.leftJoinAndSelect('person.phones', 'phones');
+queryBuilder.leftJoinAndSelect('lead.stage', 'stage');
+queryBuilder.leftJoinAndSelect('lead.company', 'company');
+queryBuilder.leftJoinAndSelect('lead.createdBy', 'createdBy');
+
+````
+</Tab>
+</Tabs>
+
+**Join decision matrix:**
+
+| Relation | Always join? | Notes |
+| --- | --- | --- |
+| `person` | Yes | Core identity, always needed |
+| `person.emails` | Yes | Primary email usually displayed |
+| `person.phones` | Yes | Primary phone usually displayed |
+| `stage` | Yes | Required for pipeline views |
+| `company` | Optional | Join if showing company info |
+| `stakeholders` | No | Separate query or lazy load |
+| `activities` | No | Paginated separately |
+| `notes` | No | Paginated separately |
+
+### When to use raw SQL
+
+Use **MikroORM QueryBuilder** for standard CRUD operations, simple filters and joins, `ORDER BY` / `LIMIT` / `OFFSET`, and basic aggregations.
+
+Use **raw SQL** for complex subqueries (`EXISTS`, `NOT EXISTS`, correlated), window functions, CTEs, database-specific optimizations, and complex `GROUP BY` with `HAVING`.
+
+```typescript
+queryBuilder.andWhere(
+  `(
+    lead.created_by_id = ?
+    OR EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'lead'
+      AND es.entity_id = lead.id
+      AND (
+        es.user_id = ?
+        OR es.team_id IN (
+          SELECT team_id FROM team_member
+          WHERE user_id = ? AND role = 'leader'
+        )
+      )
+      AND es.is_deleted = false
+    )
+  )`,
+  [userId, userId, userId],
+);
+````
+
+### View type architecture
+
+Multiple tabs/views require different access control logic (My Leads, All Leads, Pool, Team Leads, etc.). Use a single endpoint with an optional `type` parameter instead of separate endpoints.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+@Get('/my')
+async getMyLeads() { ... }
+
+@Get('/all')
+async getAllLeads() { ... }
+
+@Get('/pool')
+async getPoolLeads() { ... }
+
+@Get('/team')
+async getTeamLeads() { ... }
+
+````
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+export enum LeadViewType {
+  ALL = 'all',
+  MY = 'my',
+  POOL = 'pool',
+  TEAM = 'team',
+  TEAM_POOL = 'teamPool',
+}
+
+@Get()
+async getLeads(
+  @Query('type') type?: LeadViewType,
+  @Query('teamId') teamId?: string,
+) {
+  return this.service.getLeads(user, { type, teamId, ...params });
+}
+````
+
+</Tab>
+</Tabs>
+
+**Behavior:**
+
+- **No `type` parameter**: Returns all available tabs concurrently (initial page load)
+- **With `type` parameter**: Returns only that specific tab (for "load more" pagination)
+
+This gives you a single source of truth for query building, consistent filter/pagination logic, and easy extensibility for new view types.
+
+### Permission validation before query building
+
+Building complex queries for users who lack access wastes resources. Validate permissions first, then build the query.
+
+```typescript
+private validateTypeAccess(user: any, type: LeadViewType, teamId?: string): void {
+  const perms = this.getLeadPermissions(user);
+
+  switch (type) {
+    case LeadViewType.ALL:
+      if (!perms.canViewAll) {
+        throw new ForbiddenException(
+          'Access denied: requires system.admin, crm.view, or crm.manage permission',
+        );
+      }
+      break;
+
+    case LeadViewType.TEAM:
+      if (!perms.canViewTeam) {
+        throw new ForbiddenException(
+          'Access denied: requires team_crm.view or team_crm.manage permission',
+        );
+      }
+      if (!teamId) {
+        throw new ForbiddenException('teamId is required for team view type');
+      }
+      break;
+
+    case LeadViewType.MY:
+    case LeadViewType.POOL:
+      break;
+  }
+}
+
+async getLeads(user: any, query: LeadsQuery): Promise<LeadsResponse> {
+  this.validateTypeAccess(user, query.type, query.teamId);
+
+  const qb = this.buildQueryForType(user, query.type, query.teamId);
+  // ...
+}
+```
+
+<Tip>
+  Fail-fast principle prevents wasted database queries. Centralized permission
+  logic is easier to audit and produces clear error messages for the frontend.
+</Tip>
+
+### Reusable access control filter methods
+
+Extract access control logic into private filter methods per view type so they are testable in isolation and reusable across Kanban and List views.
+
+```typescript
+private applyMyLeadsFilter(qb: any, userId: string): void {
+  qb.andWhere(
+    `(
+      lead.created_by_id = ?
+      OR EXISTS (
+        SELECT 1 FROM entity_stakeholder es
+        WHERE es.entity_type = 'lead'
+        AND es.entity_id = lead.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+      )
+    )`,
+    [userId, userId],
+  );
+}
+
+private applyPoolLeadsFilter(qb: any): void {
+  qb.andWhere(
+    `NOT EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'lead'
+      AND es.entity_id = lead.id
+      AND es.is_deleted = false
+    )`,
+  );
+}
+
+private applyTeamLeadsFilter(qb: any, teamId: string): void {
+  qb.andWhere(
+    `EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'lead'
+      AND es.entity_id = lead.id
+      AND es.team_id = ?
+      AND es.is_deleted = false
+    )`,
+    [teamId],
+  );
+}
+
+private applyTeamPoolLeadsFilter(qb: any, teamId: string): void {
+  qb.andWhere(
+    `EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'lead'
+      AND es.entity_id = lead.id
+      AND es.team_id = ?
+      AND es.user_id IS NULL
+      AND es.is_deleted = false
+    )`,
+    [teamId],
+  );
+}
+```
+
+Wire them together in a switch:
+
+```typescript
+private buildLeadQueryForType(user: any, type: LeadViewType, teamId?: string) {
+  const qb = this.em.createQueryBuilder(Lead, 'lead');
+
+  switch (type) {
+    case LeadViewType.ALL:
+      break;
+    case LeadViewType.MY:
+      this.applyMyLeadsFilter(qb, user.id);
+      break;
+    case LeadViewType.POOL:
+      this.applyPoolLeadsFilter(qb);
+      break;
+    case LeadViewType.TEAM:
+      this.applyTeamLeadsFilter(qb, teamId!);
+      break;
+    case LeadViewType.TEAM_POOL:
+      this.applyTeamPoolLeadsFilter(qb, teamId!);
+      break;
+  }
+
+  return qb;
+}
+```
+
+### Centralized team permission lookup
+
+Use `AccessService` for permission-based team lookups instead of hardcoding role names in each service.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+private async getUserLeadershipTeams(userId: string): Promise<string[]> {
+  const memberships = await this.em.find(TeamMembership, { user: userId });
+  return memberships
+    .filter((tm) => tm.teamRoles.some((tmr) => tmr.role.name === 'Team Leader'))
+    .map((tm) => tm.team.id);
+}
+```
+
+<Warning>
+Hardcoded role names are fragile and duplicated across every service that needs team checks.
+</Warning>
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+async getUserTeamsWithPermissions(
+  userId: string,
+  requiredPermissions: string[],
+): Promise<string[]> {
+  const memberships = await this.em.find(TeamMembership, {
+    user: userId,
+    isDeleted: false,
+  }, {
+    populate: ['team', 'teamRoles', 'teamRoles.role', 'teamRoles.role.permissions'],
+  });
+
+return memberships
+.filter((m) => m.teamRoles.some((tr) =>
+tr.role.permissions.some((p) => requiredPermissions.includes(p.key))
+))
+.map((m) => m.team.id);
+}
+
+const teamIds = await this.accessService.getUserTeamsWithPermissions(userId, [
+'team_crm.view',
+'team_crm.manage',
+]);
+
+````
+</Tab>
+</Tabs>
+
+### Response shape determines tab visibility
+
+The presence or absence of top-level keys in the response tells the frontend which tabs the user has access to. No explicit metadata fields are needed.
+
+```typescript
+export interface LeadsKanbanResponse {
+  all?: Record<string, ListTabData>;
+  my?: Record<string, ListTabData>;
+  team?: Record<string, Record<string, ListTabData>>;
+  pool?: ListTabData;
+  teamPool?: Record<string, ListTabData>;
+}
+
+export interface DealsKanbanResponse {
+  all?: Record<string, DealTabData>;
+  my?: Record<string, DealTabData>;
+  team?: Record<string, Record<string, DealTabData>>;
+}
+
+export interface CommissionPaymentsListResponse {
+  all?: CommissionPaymentListTabData;
+  my?: CommissionPaymentListTabData;
+  team?: Record<string, CommissionPaymentListTabData>;
+}
+````
+
+The frontend checks which keys are present:
+
+```typescript
+const response = await LeadApi.findAll({ limit: 10 });
+
+const tabs = {
+  all: 'all' in response,
+  my: 'my' in response,
+  team: 'team' in response,
+  pool: 'pool' in response,
+  teamPool: 'teamPool' in response,
+};
+```
+
+**Entity view type matrix:**
+
+| Entity            | View types                    | ALL permission    | TEAM permission        |
+| ----------------- | ----------------------------- | ----------------- | ---------------------- |
+| Lead              | all, my, pool, team, teamPool | crm.view/manage   | team_crm.view/manage   |
+| Deal              | all, my, team                 | sales.view/manage | team_sales.view/manage |
+| Contact           | all, my, team                 | crm.view/manage   | team_crm.view/manage   |
+| Company           | all, my, team                 | crm.view/manage   | team_crm.view/manage   |
+| CommissionPayment | all, my, team                 | sales.view/manage | team_sales.view/manage |
+
+## Access control patterns
+
+### User access levels
+
+```typescript
+async getLeadsWithAccessControl(
+  userId: string,
+  userRole: string,
+  orgId: string,
+): Promise<Lead[]> {
+  const queryBuilder = this.em.createQueryBuilder(Lead, 'lead');
+
+  queryBuilder.andWhere({ isDeleted: false, organization: orgId });
+
+  if (userRole === 'admin' || userRole === 'owner') {
+    // Full org access
+  } else if (userRole === 'manager') {
+    const teamIds = await this.getUserManagedTeams(userId);
+    this.applyTeamAccessFilter(queryBuilder, teamIds);
+  } else {
+    this.applyUserAccessFilter(queryBuilder, userId);
+  }
+
+  return queryBuilder.getResultList();
+}
+```
+
+### Contact visibility
+
+Contacts are visible via both Lead and Deal stakeholder chains. A contact is accessible if the user is a stakeholder on any lead linked through the contact's person, or on any deal the contact is linked to.
+
+```typescript
+async getMyContacts(userId: string, orgId: string): Promise<Contact[]> {
+  const queryBuilder = this.em.createQueryBuilder(Contact, 'contact');
+
+  queryBuilder.leftJoinAndSelect('contact.person', 'person');
+  queryBuilder.andWhere({ isDeleted: false, organization: orgId });
+
+  queryBuilder.andWhere(
+    `(
+      EXISTS (
+        SELECT 1 FROM lead l
+        JOIN entity_stakeholder es ON es.entity_type = 'lead'
+          AND es.entity_id = l.id
+        WHERE l.person_id = contact.person_id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+        AND l.is_deleted = false
+      )
+      OR
+      EXISTS (
+        SELECT 1 FROM deal_contact dc
+        JOIN entity_stakeholder es ON es.entity_type = 'deal'
+          AND es.entity_id = dc.deal_id
+        WHERE dc.contact_id = contact.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+        AND dc.is_deleted = false
+      )
+    )`,
+    [userId, userId],
+  );
+
+  return queryBuilder.getResultList();
+}
+```
+
+### Company visibility
+
+Companies are visible via the `ContactCompanyRole` -> Contact -> Lead/Deal stakeholder chain.
+
+```typescript
+async getMyCompanies(userId: string, orgId: string): Promise<Company[]> {
+  const queryBuilder = this.em.createQueryBuilder(Company, 'company');
+
+  queryBuilder.andWhere({ isDeleted: false });
+
+  queryBuilder.andWhere(
+    `(
+      EXISTS (
+        SELECT 1 FROM contact_company_role ccr
+        JOIN contact c ON c.id = ccr.contact_id
+        JOIN lead l ON l.person_id = c.person_id
+        JOIN entity_stakeholder es ON es.entity_type = 'lead'
+          AND es.entity_id = l.id
+        WHERE ccr.company_id = company.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+        AND l.is_deleted = false
+        AND ccr.is_deleted = false
+      )
+      OR
+      EXISTS (
+        SELECT 1 FROM contact_company_role ccr
+        JOIN deal_contact dc ON dc.contact_id = ccr.contact_id
+        JOIN entity_stakeholder es ON es.entity_type = 'deal'
+          AND es.entity_id = dc.deal_id
+        WHERE ccr.company_id = company.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+        AND dc.is_deleted = false
+        AND ccr.is_deleted = false
+      )
+    )`,
+    [userId, userId],
+  );
+
+  return queryBuilder.getResultList();
+}
+```
+
+### Commission payment visibility
+
+Commission payments for teams are visible via Deal stakeholder.
+
+```typescript
+async getTeamCommissions(teamId: string, orgId: string): Promise<CommissionPayment[]> {
+  const queryBuilder = this.em.createQueryBuilder(CommissionPayment, 'commission_payment');
+
+  queryBuilder.leftJoinAndSelect('commission_payment.user', 'user');
+
+  queryBuilder.andWhere(
+    `EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = 'deal'
+      AND es.entity_id = commission_payment.deal_id
+      AND es.team_id = ?
+      AND es.is_deleted = false
+    )`,
+    [teamId],
+  );
+
+  return queryBuilder.getResultList();
+}
+```
+
+## Pagination patterns
+
+### Always get total count
+
+Clone the query builder before applying `LIMIT`/`OFFSET` so the count reflects the full filtered result set, not just the current page.
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+let total = 0;
+if (page === 1) {
+  total = await queryBuilder.clone().getCount();
+}
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+const countQuery = queryBuilder.clone();
+const total = await countQuery.getCount();
+
+queryBuilder.limit(limit).offset((page - 1) \* limit);
+const items = await queryBuilder.getResultList();
+
+return {
+items,
+total,
+page,
+limit,
+hasMore: page \* limit < total,
+};
+
+````
+</Tab>
+</Tabs>
+
+### Kanban/board pagination
+
+For board views, each column needs limited items plus a `hasMore` indicator. Use `Promise.all` to query all stages concurrently.
+
+```typescript
+async getLeadsByStages(
+  userId: string,
+  stageIds: string[],
+  perStage: number = 20,
+): Promise<Record<string, { leads: Lead[]; hasMore: boolean; count: number }>> {
+  const result: Record<string, { leads: Lead[]; hasMore: boolean; count: number }> = {};
+
+  await Promise.all(stageIds.map(async (stageId) => {
+    const queryBuilder = this.em.createQueryBuilder(Lead, 'lead');
+
+    this.applyAccessControl(queryBuilder, userId);
+    queryBuilder.andWhere({ stage: stageId, isDeleted: false });
+
+    const count = await queryBuilder.clone().getCount();
+
+    queryBuilder.limit(perStage + 1);
+    const leads = await queryBuilder.getResultList();
+
+    const hasMore = leads.length > perStage;
+    if (hasMore) leads.pop();
+
+    result[stageId] = { leads, hasMore, count };
+  }));
+
+  return result;
+}
+````
+
+### Cursor-based pagination
+
+When offset pagination becomes slow on large datasets, use cursor-based pagination with a compound sort key.
+
+```typescript
+async getLeadsWithCursor(
+  cursor?: string,
+  limit: number = 20,
+): Promise<{ items: Lead[]; nextCursor?: string }> {
+  const queryBuilder = this.em.createQueryBuilder(Lead, 'lead');
+
+  if (cursor) {
+    const { id, createdAt } = JSON.parse(Buffer.from(cursor, 'base64').toString());
+    queryBuilder.andWhere(
+      `(lead.created_at < ? OR (lead.created_at = ? AND lead.id < ?))`,
+      [createdAt, createdAt, id],
+    );
+  }
+
+  queryBuilder.orderBy({ createdAt: 'DESC', id: 'DESC' });
+  queryBuilder.limit(limit + 1);
+
+  const items = await queryBuilder.getResultList();
+  const hasMore = items.length > limit;
+
+  if (hasMore) items.pop();
+
+  const nextCursor = hasMore && items.length > 0
+    ? Buffer.from(JSON.stringify({
+        id: items[items.length - 1].id,
+        createdAt: items[items.length - 1].createdAt,
+      })).toString('base64')
+    : undefined;
+
+  return { items, nextCursor };
+}
+```
+
+## Business logic verification
+
+This section covers generic patterns for implementing business logic. For module-specific rules, see the [module-specific business rules](#module-specific-business-rules) section.
+
+### Business logic checklist template
+
+When implementing any entity, verify these common patterns:
+
+| Pattern                | Implementation                                      | Verification                               |
+| ---------------------- | --------------------------------------------------- | ------------------------------------------ |
+| Required relationships | FK constraints with `NOT NULL`                      | Schema validation                          |
+| Deduplication          | Check unique fields before create                   | Unit test with duplicate data              |
+| History/audit tracking | Create history record on state changes              | Verify history records exist after update  |
+| Cascading creates      | Auto-create related entities when parent is created | Check related tables after creation        |
+| State transitions      | Validate allowed transitions, record changes        | Test invalid transitions throw errors      |
+| Soft delete handling   | Always filter `is_deleted = false` in queries       | Verify deleted items don't appear in lists |
+| Organization isolation | Always include `organization_id` in queries (RLS)   | Multi-tenant tests                         |
+
+### Deduplication pattern
+
+Check for duplicates before creating any entity that has uniqueness constraints.
+
+```typescript
+async createEntity(dto: CreateEntityDto): Promise<Entity> {
+  if (dto.uniqueField1 && dto.uniqueField2) {
+    const existing = await this.em.findOne(Entity, {
+      organization: dto.organizationId,
+      uniqueField1: dto.uniqueField1,
+      uniqueField2: dto.uniqueField2,
+      isDeleted: false,
+    });
+
+    if (existing) {
+      throw new ConflictException(
+        `Entity with this combination already exists`,
+      );
+    }
+  }
+
+  // Proceed with creation...
+}
+```
+
+**Examples by module:**
+
+| Module      | Entity        | Unique fields                   |
+| ----------- | ------------- | ------------------------------- |
+| CRM         | Lead          | `referenceId + leadSource`      |
+| CRM         | Person        | `email` or `phone` (soft match) |
+| Real Estate | Unit          | `development_id + unit_number`  |
+| Real Estate | Development   | `name` (within org)             |
+| Marketing   | Campaign      | `name` (within org)             |
+| Channels    | WhatsApp User | `phone_number`                  |
+
+### History/audit recording pattern
+
+Record state changes in a history table for audit trails and analytics.
+
+```typescript
+async updateEntityState(
+  entityId: string,
+  newStateId: string,
+  userId: string,
+): Promise<Entity> {
+  const entity = await this.em.findOneOrFail(Entity, entityId);
+  const previousStateId = entity.state?.id;
+
+  if (previousStateId === newStateId) return entity;
+
+  const lastHistory = await this.em.findOne(EntityStateHistory, {
+    entity: entityId,
+  }, { orderBy: { changedAt: 'DESC' } });
+
+  const durationStart = lastHistory?.changedAt || entity.createdAt;
+  const durationSeconds = Math.floor((Date.now() - durationStart.getTime()) / 1000);
+
+  const history = this.em.create(EntityStateHistory, {
+    entity: entityId,
+    previousState: previousStateId,
+    state: newStateId,
+    durationInPreviousState: durationSeconds,
+    changedBy: userId,
+    changedAt: new Date(),
+  });
+
+  entity.state = this.em.getReference(State, newStateId);
+
+  await this.em.persistAndFlush([history, entity]);
+
+  return entity;
+}
+```
+
+**Use cases by module:**
+
+| Module      | Entity       | State field | History table          |
+| ----------- | ------------ | ----------- | ---------------------- |
+| CRM         | Lead         | `stage_id`  | `lead_stage_history`   |
+| CRM         | Deal         | `stage_id`  | `deal_stage_history`   |
+| Real Estate | Unit         | `status`    | `unit_status_history`  |
+| Marketing   | Campaign     | `status`    | `campaign_history`     |
+| Channels    | Conversation | `status`    | `conversation_history` |
+
+### Aggregate validation pattern
+
+Validate that related records do not exceed business constraints.
+
+```typescript
+async validateAggregate(
+  parentId: string,
+  newValue: number,
+  excludeChildId?: string,
+): Promise<void> {
+  const children = await this.em.find(ChildEntity, {
+    parentId,
+    isDeleted: false,
+    ...(excludeChildId ? { id: { $ne: excludeChildId } } : {}),
+  });
+
+  const lockedTotal = children
+    .filter(c => c.isLocked)
+    .reduce((sum, c) => sum + (c.value || 0), 0);
+
+  const projectedTotal = lockedTotal + newValue;
+
+  if (projectedTotal > MAX_ALLOWED) {
+    throw new BadRequestException(
+      `Total would exceed ${MAX_ALLOWED}. Current: ${lockedTotal}, ` +
+      `New: ${newValue}, Projected: ${projectedTotal}`,
+    );
+  }
+}
+```
+
+| Module      | Constraint                        | Max value    |
+| ----------- | --------------------------------- | ------------ |
+| CRM         | Stakeholder commission total      | 100%         |
+| Real Estate | Unit floor allocation percentage  | 100%         |
+| Marketing   | Campaign budget allocation        | Total budget |
+| Inventory   | Stock allocation across locations | Total stock  |
+
+### Cascading entity creation pattern
+
+When creating an entity from a parent, copy relevant related records.
+
+```typescript
+async createChildFromParent(
+  parentId: string,
+  childData: CreateChildDto,
+): Promise<ChildEntity> {
+  const parent = await this.em.findOneOrFail(ParentEntity, parentId, {
+    populate: ['relatedRecords'],
+  });
+
+  const child = this.em.create(ChildEntity, {
+    ...childData,
+    parent: parent,
+    person: parent.person,
+    organization: parent.organization,
+  });
+
+  const recordsToCopy = await this.em.find(RelatedRecord, {
+    parentId,
+    shouldCascade: true,
+    isDeleted: false,
+  });
+
+  for (const record of recordsToCopy) {
+    const copiedRecord = this.em.create(RelatedRecord, {
+      ...record,
+      id: undefined,
+      parentId: child.id,
+      parentType: 'child',
+    });
+    this.em.persist(copiedRecord);
+  }
+
+  await this.em.persistAndFlush(child);
+
+  return child;
+}
+```
+
+| Module      | Parent to child          | Cascaded records                |
+| ----------- | ------------------------ | ------------------------------- |
+| CRM         | Lead to Deal             | Stakeholders (with future flag) |
+| CRM         | Lead to Contact          | Person link, tags               |
+| Real Estate | Development to Unit      | Amenities, default pricing      |
+| Marketing   | Campaign to Campaign Run | Audience segments, content      |
+
+## Performance checklist
+
+### Database indexes
+
+Verify these indexes exist for optimized queries:
+
+```sql
+CREATE INDEX idx_stakeholder_entity_primary
+ON entity_stakeholder (entity_type, entity_id, is_primary)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_stakeholder_user_entity
+ON entity_stakeholder (user_id, entity_type, entity_id)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_stakeholder_team_entity
+ON entity_stakeholder (team_id, entity_type, entity_id)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_lead_dedup
+ON lead (organization_id, lead_source, reference_id)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_lead_stage
+ON lead (organization_id, stage_id, is_deleted);
+
+CREATE INDEX idx_lead_person
+ON lead (organization_id, person_id)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_activity_person
+ON activity (person_id, created_at DESC)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_activity_lead
+ON activity (lead_id, created_at DESC)
+WHERE is_deleted = false;
+
+CREATE INDEX idx_activity_deal
+ON activity (deal_id, created_at DESC)
+WHERE is_deleted = false;
+```
+
+### Query analysis commands
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM lead l
+WHERE l.organization_id = 'xxx'
+AND EXISTS (SELECT 1 FROM entity_stakeholder es WHERE es.entity_id = l.id);
+
+SELECT
+  schemaname, tablename, indexname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public'
+ORDER BY idx_scan DESC;
+
+SELECT query, calls, total_time, mean_time
+FROM pg_stat_statements
+ORDER BY mean_time DESC
+LIMIT 20;
+```
+
+### Response time targets
+
+| Operation               | Target  | Max acceptable |
+| ----------------------- | ------- | -------------- |
+| Single entity fetch     | < 50ms  | 100ms          |
+| List view (20 items)    | < 100ms | 200ms          |
+| Kanban board (5 stages) | < 200ms | 400ms          |
+| Search with filters     | < 150ms | 300ms          |
+| Create entity           | < 100ms | 200ms          |
+| Update entity           | < 100ms | 200ms          |
+
+## Anti-patterns to avoid
+
+### Loading all then filtering
+
+<Warning>
+  Never load all records and filter in application memory. This wastes
+  bandwidth, memory, and CPU.
+</Warning>
+
+```typescript
+// Never do this
+const allLeads = await this.em.find(Lead, {});
+const myLeads = allLeads.filter((l) => l.createdBy.id === userId);
+```
+
+### Memory-based pagination
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+async getLeads(page: number, limit: number): Promise<Lead[]> {
+  const allLeads = await this.em.find(Lead, { isDeleted: false });
+  const start = (page - 1) * limit;
+  return allLeads.slice(start, start + limit);
+}
+```
+
+With 10,000 leads this loads ALL records into memory, then throws away 9,950. Memory usage is O(N) instead of O(limit).
+
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+async getLeads(page: number, limit: number): Promise<Lead[]> {
+  const qb = this.em.createQueryBuilder(Lead, 'lead');
+  qb.andWhere({ isDeleted: false });
+  qb.limit(limit).offset((page - 1) * limit);
+  return qb.getResultList();
+}
+```
+</Tab>
+</Tabs>
+
+### N+1 access control checks
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+async getAccessibleLeads(userId: string, leads: Lead[]): Promise<Lead[]> {
+  const accessibleLeads: Lead[] = [];
+
+for (const lead of leads) {
+const canAccess = await this.checkLeadAccess(userId, lead.id);
+if (canAccess) {
+accessibleLeads.push(lead);
+}
+}
+
+return accessibleLeads;
+}
+
+````
+
+100 leads x 1 access check query = 101 queries.
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+async getAccessibleLeads(userId: string): Promise<Lead[]> {
+  const qb = this.em.createQueryBuilder(Lead, 'lead');
+  qb.andWhere({ isDeleted: false });
+
+  qb.andWhere(
+    `(
+      lead.created_by_id = ?
+      OR EXISTS (
+        SELECT 1 FROM entity_stakeholder es
+        WHERE es.entity_type = 'lead'
+        AND es.entity_id = lead.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+      )
+    )`,
+    [userId, userId],
+  );
+
+  return qb.getResultList();
+}
+````
+
+With the `EXISTS` pattern, a single query replaces 101 — roughly a 100x performance improvement.
+
+</Tab>
+</Tabs>
+
+### Multiple sequential queries
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const lead = await this.em.findOne(Lead, id);
+const person = await this.em.findOne(Person, lead.personId);
+const emails = await this.em.find(PersonEmail, { person: person.id });
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+const lead = await this.em.findOne(Lead, id, {
+  populate: ['person', 'person.emails'],
+});
+```
+</Tab>
+</Tabs>
+
+### N+1 in loops
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const leads = await this.em.find(Lead, {});
+for (const lead of leads) {
+  const stakeholders = await this.em.find(EntityStakeholder, { entityId: lead.id });
+}
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+const leads = await this.em.find(Lead, {});
+const leadIds = leads.map((l) => l.id);
+const allStakeholders = await this.em.find(EntityStakeholder, {
+  entityType: 'lead',
+  entityId: { $in: leadIds },
+});
+const stakeholdersByLead = groupBy(allStakeholders, 'entityId');
+```
+</Tab>
+</Tabs>
+
+### Unbounded queries
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const allActivities = await this.em.find(Activity, { personId });
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+const activities = await this.em.find(
+  Activity,
+  { personId },
+  {
+    limit: 50,
+    orderBy: { createdAt: 'DESC' },
+  },
+);
+```
+</Tab>
+</Tabs>
+
+### String concatenation for SQL
+
+<Warning>
+  Never interpolate user input directly into SQL strings. Always use
+  parameterized queries.
+</Warning>
+
+<Tabs>
+<Tab title="Bad pattern">
+```typescript
+const query = `SELECT * FROM lead WHERE name = '${userInput}'`;
+```
+</Tab>
+
+<Tab title="Good pattern">
+```typescript
+queryBuilder.andWhere('lead.name = ?', [userInput]);
+```
+</Tab>
+</Tabs>
+
+### Separate endpoints per view type
+
+Use a single endpoint with an optional `type` parameter instead of creating separate endpoints for each view type. The service fetches all tabs the user has permission to see in parallel using `Promise.all` on initial load, and targets a single tab when the frontend passes a `type` for pagination.
+
+```typescript
+// Single endpoint, optional type parameter
+@Get()
+async getLeads(@Query('type') type?: LeadViewType) {
+  return this.service.getLeads(user, { type });
+}
+```
+
+## Module review checklist
+
+Use these checklists when reviewing or implementing any module.
+
+<AccordionGroup>
+<Accordion title="Query optimization">
+- All list endpoints use proper pagination with total count
+- Access control uses `EXISTS` subqueries (not load-then-filter)
+- Related entities loaded with `leftJoinAndSelect` (not lazy)
+- No N+1 query patterns
+- No memory-based pagination (slice/filter after fetch)
+- No N+1 access control checks in loops
+- Raw SQL used only when necessary (complex subqueries)
+- Indexes exist for common query patterns
+- View types use single endpoint with optional type parameter (not separate endpoints)
+- No `type` fetches all available tabs; with `type` fetches single tab (load more)
+- Permission validation happens before query building
+- Response shape determines tab visibility (no `availableTabs`/`availableTeams` metadata)
+- Team permission checks use `AccessService.getUserTeamsWithPermissions`
+</Accordion>
+
+<Accordion title="Business logic (generic patterns)">
+**For any entity with state/stage:**
+
+- State transitions recorded in history table
+- Duration in previous state calculated
+- Invalid transitions throw appropriate errors
+- Changed by user tracked
+
+**For any entity with relationships:**
+
+- Required relationships have `NOT NULL` FK constraints
+- Deduplication checked on create (if applicable)
+- Cascading creates handled (if applicable)
+- Soft delete respects relationship integrity
+
+**For any entity with access control:**
+
+- `EXISTS` subquery for stakeholder/assignment check
+- `NOT EXISTS` for unassigned/pool queries
+- Team-based access handled
+- Creator always has access
+
+**For any entity with aggregates:**
+
+- Sum validations enforced (e.g., percentages do not exceed 100%)
+- Locked values protected from changes
+- Cascade updates to child aggregates
+</Accordion>
+
+<Accordion title="DTO and serialization">
+- Uses `class-transformer` with `@Expose` decorators
+- Groups defined for LIST, DETAIL, FULL views
+- Service returns DTO instances (`plainToInstance`)
+- Nested DTOs properly typed
+- No sensitive data leakage
+</Accordion>
+
+<Accordion title="Error handling">
+- Proper HTTP status codes
+- Descriptive error messages
+- Validation errors from `class-validator`
+- Not Found handled gracefully
+- Conflict errors for duplicates
+</Accordion>
+
+<Accordion title="Code quality">
+- Service methods focused (single responsibility)
+- Controller is thin (validation + routing only)
+- Reusable helper methods for common patterns
+- TypeScript strict mode passes
+- No unused imports or dead code
+</Accordion>
+</AccordionGroup>
+
+## Module-specific business rules
+
+This section contains checklists for specific modules.
+
+<AccordionGroup>
+<Accordion title="CRM module — Lead">
+**Reference:** CRM module specification
+
+- Person-centric: Lead always links to Person
+- Deduplication: Check `referenceId + leadSource` on create
+- Stakeholder: Auto-create owner on lead creation
+- Stage history: Record on every stage change
+- Pool: `NOT EXISTS` query for unassigned leads
+- Conversion: Creates Contact + Deal, copies stakeholders
+- Disqualification: Sets `disqualified_at`, tracks reason
+- Requalification: Clears disqualification, logs history
+
+**Lead views query patterns:**
+
+- Single endpoint with optional `type` parameter (`LeadViewType` enum)
+- No `type` fetches all available tabs in parallel; with `type` fetches single tab
+- `applyMyLeadsFilter`: `created_by` OR `EXISTS` stakeholder
+- `applyPoolLeadsFilter`: `NOT EXISTS` any stakeholder
+- `applyTeamLeadsFilter`: `EXISTS` stakeholder for `team_id`
+- `applyTeamPoolLeadsFilter`: `EXISTS` team stakeholder AND `user_id IS NULL`
+- Permission validation via `validateTypeAccess()` before query building
+- Kanban view uses `Promise.all` for parallel stage queries
+- List view uses DB-level `LIMIT`/`OFFSET` (not memory slice)
+- Response shape determines tab visibility (no `availableTabs` metadata)
+</Accordion>
+
+<Accordion title="CRM module — Deal">
+- Origin: Links to `originating_lead_id`
+- Stakeholder copy: From lead with `applies_to_future_deals`
+- Stage history: Record on every stage change
+- Close: Creates `commission_payment` records on `won_at`
+- Commission: Validates total does not exceed 100%
+</Accordion>
+
+<Accordion title="CRM module — Contact">
+- Person-centric: One Contact per Person per org
+- Visibility: Derived from Lead AND Deal stakeholders
+- No direct assignment: Uses lead/deal access
+
+**Contact views query patterns:**
+
+- Single endpoint with optional `type` parameter (`ContactViewType` enum)
+- No `type` fetches all available tabs in parallel; with `type` fetches single tab
+- `applyMyContactsFilter`: `EXISTS` via Lead OR Deal stakeholder (user)
+- `applyTeamContactsFilter`: `EXISTS` via Lead OR Deal stakeholder (team)
+- Permission validation via `validateTypeAccess()` before query building
+- Response shape determines tab visibility
+</Accordion>
+
+<Accordion title="CRM module — Company">
+- No direct stakeholder: Visibility via `ContactCompanyRole` chain
+- Visibility: Derived from Contact to Lead/Deal stakeholders
+- No direct assignment: Uses contact's lead/deal access
+
+**Company views query patterns:**
+
+- Single endpoint with optional `type` parameter (`CompanyViewType` enum)
+- No `type` fetches all available tabs in parallel; with `type` fetches single tab
+- `applyMyCompaniesFilter`: `EXISTS` via `ContactCompanyRole` to Contact to Lead/Deal stakeholder (user)
+- `applyTeamCompaniesFilter`: `EXISTS` via `ContactCompanyRole` to Contact to Lead/Deal stakeholder (team)
+- Permission validation via `validateTypeAccess()` before query building
+- Response shape determines tab visibility
+</Accordion>
+
+<Accordion title="CRM module — CommissionPayment">
+- Direct link to Deal and User
+- Visibility: ALL (sales permissions), MY (recipient), TEAM (deal stakeholder)
+- No pool: Commission payments always assigned
+
+**CommissionPayment views query patterns:**
+
+- Single endpoint with optional `type` parameter (`CommissionPaymentViewType` enum)
+- No `type` fetches all available tabs in parallel; with `type` fetches single tab
+- `applyMyCommissionsFilter`: Simple `user_id = current user`
+- `applyTeamCommissionsFilter`: `EXISTS` via Deal stakeholder (team)
+- Permission validation via `validateTypeAccess()` before query building
+- Response shape determines tab visibility
+</Accordion>
+
+<Accordion title="CRM module — Entity stakeholder">
+- One primary: Only one `is_primary` per entity
+- Locked commission: Protected from dilution
+- Future deals: Copy to deals when flag set
+- History: Log all changes to `entity_stakeholder_history`
+</Accordion>
+
+<Accordion title="CRM module — Transfer system">
+- Approval workflow: pending to accepted/rejected
+- Commission split: `from_keeps_percentage` applied
+- Role change: Transferor becomes `from_new_role`
+- History: All changes logged
+</Accordion>
+
+<Accordion title="Real estate module">
+**Development:**
+- Unique name within organization
+- Location and coordinates validated
+- Status transitions tracked
+
+**Unit:**
+
+- Unique `unit_number` within development
+- Status: available to reserved to sold
+- Ownership links to Person (not Contact)
+- Transactions link to Person
+- Price history tracked
+
+**Site visit:**
+
+- Links to Person and Development/Unit
+- Creates Activity record
+- Scheduled vs actual times tracked
+- Interest level and feedback recorded
+</Accordion>
+
+<Accordion title="Marketing module">
+**Campaign:**
+- Unique name within organization
+- Budget validation and tracking
+- Status lifecycle: draft to active to paused to completed
+- Lead attribution tracking
+
+**Campaign Lead:**
+
+- Links Campaign to Lead
+- Attribution tracking (first touch, last touch)
+- Conversion tracking
+</Accordion>
+
+<Accordion title="Channels module">
+**WhatsApp/Instagram User:**
+- Links to Person via `person_channel`
+- Unique identifier per channel type
+- Opt-in/opt-out tracking
+- Message history preserved
+
+**Conversation:**
+
+- Links to Person and Channel
+- Status: open to pending to resolved to closed
+- Assignment to agents
+- SLA tracking
+</Accordion>
+</AccordionGroup>
+
+## Quick reference SQL patterns
+
+### Access control subquery template
+
+```sql
+-- User has direct access
+EXISTS (
+  SELECT 1 FROM entity_stakeholder es
+  WHERE es.entity_type = :entityType
+  AND es.entity_id = entity.id
+  AND es.user_id = :userId
+  AND es.is_deleted = false
+)
+
+-- User has team access
+EXISTS (
+  SELECT 1 FROM entity_stakeholder es
+  WHERE es.entity_type = :entityType
+  AND es.entity_id = entity.id
+  AND es.team_id IN (:teamIds)
+  AND es.is_deleted = false
+)
+
+-- Combined: creator OR stakeholder
+(
+  entity.created_by_id = :userId
+  OR EXISTS (
+    SELECT 1 FROM entity_stakeholder es
+    WHERE es.entity_type = :entityType
+    AND es.entity_id = entity.id
+    AND es.user_id = :userId
+    AND es.is_deleted = false
+  )
+)
+```
+
+### Unassigned entity template
+
+```sql
+NOT EXISTS (
+  SELECT 1 FROM entity_stakeholder es
+  WHERE es.entity_type = :entityType
+  AND es.entity_id = entity.id
+  AND es.is_primary = true
+  AND es.is_deleted = false
+)
+```
+
+### Stage duration query
+
+```sql
+SELECT
+  ls.name as stage_name,
+  AVG(lsh.duration_in_previous_stage) / 3600 as avg_hours,
+  COUNT(*) as transitions
+FROM lead_stage_history lsh
+JOIN lead_stage ls ON lsh.previous_stage_id = ls.id
+WHERE lsh.organization_id = :orgId
+AND lsh.changed_at > NOW() - INTERVAL '90 days'
+GROUP BY ls.id, ls.name
+ORDER BY ls.order;
+```
+
+## TypeScript helper functions
+
+### Pagination builder
+
+```typescript
+export function buildPaginatedResponse<T>(
+  items: T[],
+  page: number,
+  limit: number,
+  total: number,
+): PaginatedResponse<T> {
+  return {
+    items,
+    total,
+    page,
+    limit,
+    hasMore: page * limit < total,
+    totalPages: Math.ceil(total / limit),
+  };
+}
+```
+
+### Access control helper
+
+```typescript
+export function applyAccessControl(
+  queryBuilder: QueryBuilder<any>,
+  userId: string,
+  entityType: 'lead' | 'deal',
+  entityAlias: string,
+): void {
+  queryBuilder.andWhere(
+    `(
+      ${entityAlias}.created_by_id = ?
+      OR EXISTS (
+        SELECT 1 FROM entity_stakeholder es
+        WHERE es.entity_type = ?
+        AND es.entity_id = ${entityAlias}.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+      )
+    )`,
+    [userId, entityType, userId],
+  );
+}
+```
+
+### DTO transformation helpers
+
+```typescript
+private toDto(entity: Lead, groups: string[] = [LEAD_GROUPS.DETAIL]): LeadDto {
+  return plainToInstance(LeadDto, entity, {
+    groups,
+    excludeExtraneousValues: true,
+    enableImplicitConversion: true,
+  });
+}
+
+private toDtos(entities: Lead[], groups: string[] = [LEAD_GROUPS.LIST]): LeadDto[] {
+  return entities.map(e => this.toDto(e, groups));
+}
+```
+
+### Permission extraction helper
+
+```typescript
+private getLeadPermissions(user: any) {
+  const permissions = this.accessService.getPermissionsAsSet(user);
+  return {
+    hasSystemAdmin: permissions.has('system.admin'),
+    hasCrmView: permissions.has('crm.view'),
+    hasCrmManage: permissions.has('crm.manage'),
+    hasTeamCrmView: permissions.has('team_crm.view'),
+    hasTeamCrmManage: permissions.has('team_crm.manage'),
+    canViewAll:
+      permissions.has('system.admin') ||
+      permissions.has('crm.view') ||
+      permissions.has('crm.manage'),
+    canViewTeam: permissions.has('team_crm.view') || permissions.has('team_crm.manage'),
+  };
+}
+```
+
+### Reusable filter methods template
+
+```typescript
+private applyMyEntityFilter(qb: any, userId: string, entityType: string): void {
+  qb.andWhere(
+    `(
+      ${entityType}.created_by_id = ?
+      OR EXISTS (
+        SELECT 1 FROM entity_stakeholder es
+        WHERE es.entity_type = '${entityType}'
+        AND es.entity_id = ${entityType}.id
+        AND es.user_id = ?
+        AND es.is_deleted = false
+      )
+    )`,
+    [userId, userId],
+  );
+}
+
+private applyPoolFilter(qb: any, entityType: string): void {
+  qb.andWhere(
+    `NOT EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = '${entityType}'
+      AND es.entity_id = ${entityType}.id
+      AND es.is_deleted = false
+    )`,
+  );
+}
+
+private applyTeamFilter(qb: any, teamId: string, entityType: string): void {
+  qb.andWhere(
+    `EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = '${entityType}'
+      AND es.entity_id = ${entityType}.id
+      AND es.team_id = ?
+      AND es.is_deleted = false
+    )`,
+    [teamId],
+  );
+}
+
+private applyTeamPoolFilter(qb: any, teamId: string, entityType: string): void {
+  qb.andWhere(
+    `EXISTS (
+      SELECT 1 FROM entity_stakeholder es
+      WHERE es.entity_type = '${entityType}'
+      AND es.entity_id = ${entityType}.id
+      AND es.team_id = ?
+      AND es.user_id IS NULL
+      AND es.is_deleted = false
+    )`,
+    [teamId],
+  );
+}
+```
+
+### Kanban view with parallel queries
+
+```typescript
+async getKanbanView(
+  user: any,
+  type: ViewType,
+  teamId?: string,
+  filters?: FilterParams,
+): Promise<KanbanResponse> {
+  this.validateTypeAccess(user, type, teamId);
+
+  const stages = await this.em.find(Stage, { isDeleted: false }, { orderBy: { order: 'asc' } });
+
+  const result: KanbanResponse = { stages: {} };
+
+  await Promise.all(
+    stages.map(async (stage) => {
+      const qb = this.buildQueryForType(user, type, teamId);
+      qb.andWhere({ stage: stage.id });
+      this.applyCommonFilters(qb, filters);
+
+      const total = await qb.clone().getCount();
+
+      qb.limit(filters?.limit || 10).offset(((filters?.page || 1) - 1) * (filters?.limit || 10));
+      qb.orderBy({ createdAt: 'DESC' });
+
+      const items = await qb.getResultList();
+
+      result.stages[stage.id] = {
+        items: items.map((item) => new ItemDto(item)),
+        total,
+        hasMore: ((filters?.page || 1) - 1) * (filters?.limit || 10) + items.length < total,
+      };
+    }),
+  );
+
+  return result;
+}
+```
+
+## New module implementation template
+
+<Steps>
+<Step title="Create module specification">
+Create `Docs/[MODULE_NAME]_SPECIFICATION.md` including entity definitions and relationships, business rules and workflows, state transitions, and query patterns.
+</Step>
+
+<Step title="Implement entity with patterns">
+```typescript
+@Entity()
+export class MyEntity extends BaseEntity {
+  @ManyToOne(() => Organization)
+  organization: Organization;
+
+@Property({ default: false })
+isDeleted: boolean = false;
+
+@Property()
+createdAt: Date = new Date();
+
+@Property({ onUpdate: () => new Date() })
+updatedAt: Date = new Date();
+}
+
+````
+</Step>
+
+<Step title="Implement service with optimizations">
+```typescript
+@Injectable()
+export class MyEntityService {
+  private toDto(entity: MyEntity, groups: string[]): MyEntityResponseDto {
+    return plainToInstance(MyEntityResponseDto, entity, {
+      groups,
+      excludeExtraneousValues: true,
+      enableImplicitConversion: true,
+    });
+  }
+
+  private toDtos(entities: MyEntity[], groups: string[]): MyEntityResponseDto[] {
+    return entities.map((e) => this.toDto(e, groups));
+  }
+
+  async findAll(
+    userId: string,
+    orgId: string,
+    pagination: PaginationParams,
+  ): Promise<PaginatedResponse<MyEntityResponseDto>> {
+    const qb = this.em.createQueryBuilder(MyEntity, 'e');
+
+    qb.andWhere({ isDeleted: false, organization: orgId });
+    this.applyAccessControl(qb, userId);
+    qb.leftJoinAndSelect('e.relation1', 'r1');
+
+    const total = await qb.clone().getCount();
+    qb.limit(pagination.limit).offset((pagination.page - 1) * pagination.limit);
+
+    const items = await qb.getResultList();
+
+    return buildPaginatedResponse(
+      this.toDtos(items, [GROUPS.LIST]),
+      pagination.page,
+      pagination.limit,
+      total,
+    );
+  }
+
+  async create(dto: CreateDto, userId: string): Promise<MyEntityResponseDto> {
+    const existing = await this.em.findOne(MyEntity, {
+      uniqueField: dto.uniqueField,
+      organization: dto.organizationId,
+      isDeleted: false,
+    });
+
+    if (existing) {
+      throw new ConflictException('Entity already exists');
+    }
+
+    const entity = this.em.create(MyEntity, { ...dto });
+    await this.em.persistAndFlush(entity);
+
+    return this.toDto(entity, [GROUPS.DETAIL]);
+  }
+}
+````
+
+</Step>
+
+<Step title='Add to module review checklist'>
+  Add entity-specific rules to the module-specific business rules section in the
+  query optimization patterns specification.
+</Step>
+
+<Step title="Verify implementation">
+Run through the review checklists: query optimization, business logic (generic), DTO and serialization, error handling, and code quality.
+</Step>
+</Steps>
+
+<CardGroup cols={2}>
+<Card title="Access control system" icon="shield" href="/backend/access-control">
+  Endpoint protection decorators, resource permissions, and bulk access patterns.
+</Card>
+
+<Card title='CRM module' icon='address-book' href='/backend/crm-module'>
+  Entity relationships, stakeholder system, and business rules.
+</Card>
+
+<Card title='DTO serialization' icon='code' href='/backend/dto-serialization'>
+  Class-transformer patterns, serialization groups, and response formatting.
+</Card>
+
+<Card title="Kanban and list API" icon="table-columns" href="/backend/kanban-list-api">
+  Tab architecture, parallel fetching, and pagination for board and list views.
+</Card>
+</CardGroup>

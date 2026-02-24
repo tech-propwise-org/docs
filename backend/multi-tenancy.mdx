@@ -1,0 +1,1015 @@
+---
+title: "Multi-tenancy & RLS"
+description: "How tenant isolation works with PostgreSQL Row-Level Security, the TenantContext service, two-token authentication, and transaction-first design patterns."
+---
+
+This document explains how tenant isolation works in the PropWise CRM backend.
+
+## Overview
+
+We use **PostgreSQL Row-Level Security (RLS)** for tenant data isolation. The **Organization entity** (located at `/modules/organization/`) serves as the **tenant boundary**. The architecture uses **explicit transactions** with **`SET LOCAL`** to guarantee tenant isolation with connection pooling.
+
+<Note>
+Organization is a top-level module (peer to User), not part of RBAC. It represents the tenant boundary for multi-tenancy and is referenced by all tenant-scoped entities.
+</Note>
+
+## Architecture principles
+
+### 1. Transaction-first design
+
+Every tenant-scoped operation runs inside an explicit transaction:
+
+```typescript
+await tenantContext.executeInOrg(organizationId, async (em) => {
+  const lead = await em.findOne(Lead, id);
+  lead.status = 'qualified';
+  await em.flush();
+});
+```
+
+### 2. SET LOCAL only
+
+Only `SET LOCAL` inside transactions — context is automatically cleared on COMMIT/ROLLBACK:
+
+```sql
+BEGIN;
+SET LOCAL app.organization_id = 'uuid';
+SET LOCAL app.user_id = 'uuid';
+SET LOCAL app.bypass_rls = 'false';
+-- All queries here see this context
+-- Context automatically cleared on COMMIT/ROLLBACK
+COMMIT;
+```
+
+### 3. Database-level audit triggers
+
+Audit logging happens via PostgreSQL triggers, not application code:
+
+- **Atomic**: Same transaction as the data change
+- **Automatic**: Can't forget to audit
+- **Complete**: Captures all changes, even raw SQL
+- **Performant**: No extra round-trips
+
+### 4. No middleware/interceptor RLS logic
+
+Context is managed explicitly via the `TenantContext` service. There are no middleware or interceptors involved in RLS context management.
+
+## Two-token authentication system
+
+The system uses two distinct JWT token types to separate user identity from organization context:
+
+<Tabs>
+<Tab title="Identity token">
+Issued on login/register. Contains user identity only (no organization context):
+
+```typescript
+{
+  sub: userId,
+  email: user.email,
+  tokenVersion: user.tokenVersion,
+}
+```
+
+- Verified using `jwt.accessToken.secret`
+- Used for pre-org-selection endpoints (list orgs, select org, refresh tokens)
+- Validated by `IdentityTokenGuard`
+</Tab>
+
+<Tab title="Tenant token">
+Issued when the user selects an organization via `POST /auth/tenant-token`. Contains organization context:
+
+```typescript
+{
+  sub: userId,
+  org: organizationId,
+  orgName: organization.name,
+  type: 'tenant',
+  tokenVersion: user.tokenVersion,
+}
+```
+
+- Verified using `jwt.tenantToken.secret`
+- Used for all org-scoped data API endpoints
+- Validated by `AuthGuard`
+- A per-organization session is created when this token is issued (see [session system](/backend/session-system))
+</Tab>
+</Tabs>
+
+### Token flow
+
+<Steps>
+<Step title="Login">
+User logs in and receives an identity token + refresh token.
+</Step>
+
+<Step title="List organizations">
+User calls `GET /me/organizations` (identity token) to get their list of organizations.
+</Step>
+
+<Step title="Select organization">
+User calls `POST /auth/tenant-token` (identity token + orgId) to receive a tenant token. A session is created for this user+org combination.
+</Step>
+
+<Step title="Use data APIs">
+User calls data APIs (tenant token) and receives org-scoped data.
+</Step>
+
+<Step title="Refresh">
+Tenant token expires. User refreshes via `POST /auth/tenant-token/refresh`. The session is validated on refresh.
+</Step>
+</Steps>
+
+## Components
+
+### TenantContext service
+
+The core service for executing tenant-scoped operations. Provided globally via `TenantContextModule`:
+
+```typescript
+@Injectable()
+export class TenantContext {
+  async executeInOrg<T>(
+    orgId: string,
+    operation: (em: EntityManager) => Promise<T>,
+    options?: { userId?: string; isolationLevel?: IsolationLevel },
+  ): Promise<T>;
+
+  async executeWithBypass<T>(
+    operation: (em: EntityManager) => Promise<T>,
+  ): Promise<T>;
+
+  async executeReadOnly<T>(
+    orgId: string,
+    operation: (em: EntityManager) => Promise<T>,
+  ): Promise<T>;
+
+  async executeReadOnlyWithBypass<T>(
+    operation: (em: EntityManager) => Promise<T>,
+  ): Promise<T>;
+
+  async executeForEachOrg<T>(
+    organizationIds: string[],
+    operation: (em: EntityManager, orgId: string) => Promise<T>,
+    options?: { continueOnError?: boolean },
+  ): Promise<{ orgId: string; result?: T; error?: Error }[]>;
+
+  async getCurrentContext(em: EntityManager): Promise<TenantContextInfo | null>;
+}
+```
+
+### Auth guards
+
+Three guards handle different authentication scenarios:
+
+| Guard | Token type | Use case |
+|-------|-----------|----------|
+| `AuthGuard` | Tenant token | Org-scoped data API endpoints (default) |
+| `IdentityTokenGuard` | Identity token | Pre-org-selection endpoints (list/select orgs) |
+| `EitherAuthGuard` | Tenant OR Developer token | Shared data endpoints (reference data) |
+
+<AccordionGroup>
+<Accordion title="AuthGuard (default, applied globally)">
+Validates tenant tokens for all org-scoped data endpoints. The guard:
+
+1. Checks `@PublicEndpoint()` metadata — skips if public
+2. Checks `@IdentityTokenOnly()` metadata — skips if identity-token-only
+3. Verifies JWT is a tenant token (rejects identity tokens)
+4. Checks token version against the user entity for logout invalidation
+5. Loads RBAC data using `tenantContext.executeInOrg()` within the guard
+6. Loads organizations list using `tenantContext.executeWithBypass()`
+7. Caches RBAC data via `PermissionCacheService`
+8. Stores user info in CLS and builds `RequestUser` object
+</Accordion>
+
+<Accordion title="IdentityTokenGuard">
+Validates identity tokens for endpoints that don't need org context:
+
+```typescript
+@Get('organizations')
+@IdentityTokenOnly()
+@UseGuards(IdentityTokenGuard)
+async getMyOrganizations() { ... }
+```
+
+This guard rejects tenant tokens and stores minimal user info (`id`, `email`, `tokenVersion`) in the request.
+</Accordion>
+
+<Accordion title="EitherAuthGuard">
+Accepts either CRM tenant tokens or developer portal tokens. Used for shared reference data endpoints:
+
+```typescript
+@UseGuards(EitherAuthGuard)
+@Controller('reference-data')
+export class ReferenceDataController { ... }
+```
+
+This guard only validates the JWT signature and type — it does NOT load user entities or RBAC data.
+</Accordion>
+</AccordionGroup>
+
+### RLS policies
+
+CASE-based policies that handle all scenarios:
+
+```sql
+CREATE POLICY "tenant_isolation" ON leads FOR ALL USING (
+  CASE
+    WHEN current_setting('app.bypass_rls', true) = 'true' THEN true
+    WHEN current_setting('app.organization_id', true) = '' THEN false
+    WHEN current_setting('app.organization_id', true) IS NULL THEN false
+    ELSE organization_id = current_setting('app.organization_id', true)::uuid
+  END
+);
+```
+
+### Audit triggers
+
+Database triggers that automatically log changes:
+
+```sql
+CREATE TRIGGER audit_lead_changes
+AFTER INSERT OR UPDATE OR DELETE ON lead
+FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();
+```
+
+The trigger function is `SECURITY DEFINER` so it bypasses RLS for audit writes while reads remain tenant-isolated.
+
+## Request flow
+
+<Tabs>
+<Tab title="Authenticated (tenant token)">
+```
+1. Request arrives with tenant token in Authorization header
+2. AuthGuard verifies JWT signature and checks type === 'tenant'
+3. AuthGuard validates token version against user entity
+4. AuthGuard loads RBAC data via tenantContext.executeInOrg()
+5. AuthGuard caches RBAC data and stores user+org in CLS
+6. Controller extracts orgId from request.user.organizationId
+7. Service calls tenantContext.executeInOrg(orgId, async (em) => { ... })
+8. Transaction starts, SET LOCAL sets context
+9. All queries in operation use same connection with RLS filtering
+10. Audit trigger fires on any changes
+11. Transaction commits, context auto-cleared
+12. Response sent
+```
+</Tab>
+
+<Tab title="Identity token (pre-org-selection)">
+```
+1. Request arrives with identity token in Authorization header
+2. AuthGuard sees @IdentityTokenOnly() metadata and skips
+3. IdentityTokenGuard verifies JWT with access token secret
+4. IdentityTokenGuard rejects tenant tokens
+5. Minimal user info stored in request (id, email)
+6. Controller handles the request (e.g., list orgs, select org)
+```
+</Tab>
+
+<Tab title="Public endpoint (login, register)">
+```
+1. Request arrives
+2. AuthGuard sees @PublicEndpoint() and skips
+3. Controller/Service calls tenantContext.executeWithBypass(async (em) => { ... })
+4. Transaction starts, SET LOCAL app.bypass_rls = 'true'
+5. Queries can access all data
+6. Transaction commits
+7. Response sent
+```
+</Tab>
+
+<Tab title="Cron job / background task">
+```
+1. Scheduler triggers job
+2. Job calls tenantContext.executeForEachOrg(orgIds, async (em, orgId) => { ... })
+   OR tenantContext.executeWithBypass(async (em) => { ... }) for cross-org
+3. Each operation is isolated in its own transaction
+4. No cleanup needed - SET LOCAL auto-expires
+```
+</Tab>
+
+<Tab title="WebSocket handler">
+```
+1. Message received with client.organizationId
+2. Handler calls tenantContext.executeInOrg(client.organizationId, async (em) => { ... })
+3. Forked EM with isolated transaction
+4. No race conditions - each message gets its own transaction
+```
+</Tab>
+</Tabs>
+
+## How it works in practice
+
+### For authenticated endpoints
+
+Pass `organizationId` to services and use `TenantContext`:
+
+```typescript
+// Controller
+@Get(':id')
+async findOne(@Param('id') id: string, @GetCurrentUser() user: RequestUser) {
+  return this.leadService.findOne(id, user.organizationId);
+}
+
+// Service
+async findOne(id: string, organizationId: string): Promise<LeadDto> {
+  return this.tenantContext.executeInOrg(organizationId, async (em) => {
+    const lead = await em.findOne(Lead, { id });
+    if (!lead) throw new NotFoundException();
+    return this.toDto(lead);
+  });
+}
+```
+
+### For public endpoints
+
+Add the decorator and use bypass:
+
+```typescript
+import { PublicEndpoint } from '@/decorators/rls.decorator';
+
+@Post('login')
+@PublicEndpoint()
+async login(@Body() dto: LoginDto) {
+  return this.authService.login(dto);
+}
+
+// In service
+async login(dto: LoginDto) {
+  return this.tenantContext.executeWithBypass(async (em) => {
+    const user = await em.findOne(User, { email: dto.email });
+    // ... authentication logic
+  });
+}
+```
+
+### For identity-token-only endpoints
+
+Use `@IdentityTokenOnly()` and `@UseGuards(IdentityTokenGuard)`:
+
+```typescript
+import { IdentityTokenOnly } from '@/decorators/rls.decorator';
+import { IdentityTokenGuard } from '@/modules/auth/guards/identity-token.guard';
+
+@Get('organizations')
+@IdentityTokenOnly()
+@UseGuards(IdentityTokenGuard)
+async getMyOrganizations(@GetCurrentUser() user: { id: string }) {
+  return this.organizationService.findUserOrganizations(user.id);
+}
+```
+
+## TenantContext method patterns
+
+### When to use each method
+
+| Method | Use case | Transaction | RLS context |
+|--------|----------|-------------|-------------|
+| `executeInOrg` | Read/write operations with org context | Yes | Sets org_id |
+| `executeReadOnly` | Read-only operations with org context | Yes (READ ONLY, READ COMMITTED) | Sets org_id |
+| `executeWithBypass` | Cross-org or system operations | Yes | Bypasses RLS |
+| `executeReadOnlyWithBypass` | Read-only cross-org queries | Yes (READ ONLY, READ COMMITTED) | Bypasses RLS |
+| `executeForEachOrg` | Process multiple orgs sequentially | Yes (per org) | Sets org_id per iteration |
+| `getCurrentContext` | Debug current tenant context | N/A (requires active txn) | Reads current |
+
+<AccordionGroup>
+<Accordion title="executeInOrg — for org-scoped operations">
+Use for operations that read or modify data within an organization. Accepts optional `userId` (for audit triggers) and `isolationLevel`:
+
+```typescript
+async updateLead(id: string, dto: UpdateLeadDto, organizationId: string, userId: string) {
+  return this.tenantContext.executeInOrg(organizationId, async (em) => {
+    const lead = await em.findOne(Lead, { id });
+    // ... update logic
+    await em.flush();
+  }, { userId });
+}
+```
+</Accordion>
+
+<Accordion title="executeReadOnly — for read-only org-scoped queries">
+Uses `READ COMMITTED` isolation and `SET TRANSACTION READ ONLY` for performance hints:
+
+```typescript
+async findLeads(organizationId: string, filters: FilterDto) {
+  return this.tenantContext.executeReadOnly(organizationId, async (em) => {
+    return em.find(Lead, { status: filters.status });
+  });
+}
+```
+
+Benefits:
+- Optimized for reads (READ COMMITTED + read-only hints)
+- Still sets RLS context
+- Prevents accidental writes
+</Accordion>
+
+<Accordion title="executeWithBypass — for cross-org operations">
+Use when you need to query across organizations or access global data:
+
+```typescript
+async findUserOrganizations(userId: string) {
+  return this.tenantContext.executeWithBypass(async (em) => {
+    return em.find(Organization, { users: userId });
+  });
+}
+```
+</Accordion>
+
+<Accordion title="executeReadOnlyWithBypass — for read-only cross-org queries">
+Combines RLS bypass with read-only optimization. Used by webhook services (WhatsApp, Instagram) that need to read across tenants:
+
+```typescript
+async findOrgByPhoneNumber(phoneNumber: string) {
+  return this.tenantContext.executeReadOnlyWithBypass(async (em) => {
+    return em.findOne(WhatsAppAccount, { phoneNumber });
+  });
+}
+```
+</Accordion>
+
+<Accordion title="executeForEachOrg — for multi-tenant batch processing">
+Processes each organization in its own isolated transaction. Designed for cron jobs:
+
+```typescript
+await this.tenantContext.executeForEachOrg(orgIds, async (em, orgId) => {
+  const expiredLeads = await em.find(Lead, { expiresAt: { $lt: new Date() } });
+  // Process expired leads...
+}, { continueOnError: true });
+```
+
+Returns an array of `{ orgId, result?, error? }` for each org. With `continueOnError: true` (default), failures in one org don't stop processing of others.
+</Accordion>
+
+<Accordion title="getCurrentContext — for debugging">
+Reads the current PostgreSQL session variables. Only useful within an active transaction:
+
+```typescript
+const context = await this.tenantContext.getCurrentContext(em);
+// { organizationId: '...', userId: '...' } or null if bypassed
+```
+</Accordion>
+</AccordionGroup>
+
+### Code organization patterns
+
+#### Pattern 1: simple method (most common)
+
+For standalone operations, inline the implementation directly:
+
+```typescript
+async createTeam(dto: CreateTeamDto, organizationId: string) {
+  return this.tenantContext.executeInOrg(organizationId, async (em) => {
+    const existingTeam = await em.findOne(Team, { name: dto.name });
+    if (existingTeam) throw new BadRequestException('Team exists');
+    
+    const team = em.create(Team, { ...dto, organization: organizationId });
+    await em.persistAndFlush(team);
+    
+    return { success: true };
+  });
+}
+```
+
+#### Pattern 2: composable method (when needed by other methods)
+
+For methods that need to be called from within existing transactions:
+
+```typescript
+// Public API - wraps in TenantContext
+async batchAssignRole(roleId: string, userIds: string[], orgId: string) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    return this.batchAssignRoleInTransaction(em, roleId, userIds, orgId);
+  });
+}
+
+// For composition - accepts EntityManager
+async batchAssignRoleInTransaction(
+  em: EntityManager,
+  roleId: string,
+  userIds: string[],
+  organizationId: string,
+) {
+  const role = await em.findOne(Role, { id: roleId });
+  // ... validation and assignment logic
+}
+
+// Another method that composes
+async setRoleUsers(roleId: string, userIds: string[], orgId: string) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    await this.batchAssignRoleInTransaction(em, roleId, usersToAdd, orgId);
+    await this.batchRemoveRoleInTransaction(em, roleId, usersToRemove, orgId);
+  });
+}
+```
+
+**When to use `*InTransaction` methods:**
+- Method is called by other service methods within the same transaction
+- Method performs a distinct operation that's part of a larger workflow
+- You need transaction composition (multiple operations must succeed/fail together)
+
+**When NOT to use `*InTransaction` methods:**
+- Method is only called from controllers (use Pattern 1)
+- Method is a one-off operation (use Pattern 1)
+- Adding unnecessary verbosity
+
+### Method naming convention
+
+| Pattern | Method name | Purpose |
+|---------|-------------|---------|
+| Simple | `createTeam` | Public API, contains implementation |
+| Composable (public) | `batchAssignRole` | Public API, wraps InTransaction version |
+| Composable (internal) | `batchAssignRoleInTransaction` | For composition, contains implementation |
+
+### Anti-patterns to avoid
+
+<Warning>
+**Never** create `*Impl` methods. They add unnecessary verbosity and confusion. Use either the simple inline pattern or the `*InTransaction` composable pattern.
+</Warning>
+
+<Tabs>
+<Tab title="Bad: *Impl pattern">
+```typescript
+async create(...) {
+  return this.tenantContext.executeInOrg(orgId, (em) => 
+    this.createImpl(em, ...)
+  );
+}
+private async createImpl(em, ...) {
+  // Implementation
+}
+```
+</Tab>
+
+<Tab title="Good: simple pattern">
+```typescript
+async create(...) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    // Implementation directly here
+  });
+}
+```
+</Tab>
+
+<Tab title="Good: composable pattern">
+```typescript
+async create(...) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    return this.createInTransaction(em, ...);
+  });
+}
+
+async createInTransaction(em: EntityManager, ...) {
+  // Implementation here
+}
+```
+</Tab>
+</Tabs>
+
+#### Private helper methods
+
+If you need private helper methods for code organization, that's fine — but do not use `Impl` suffix:
+
+```typescript
+async batchAssign(...) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    const role = await this.validateRole(em, roleId);
+    const users = await this.loadUsers(em, userIds);
+    // ... assignment logic
+  });
+}
+
+private async validateRole(em: EntityManager, roleId: string) {
+  // Validation logic
+}
+
+private async loadUsers(em: EntityManager, userIds: string[]) {
+  // User loading logic
+}
+```
+
+#### Nested TenantContext calls
+
+<Warning>
+**Never** nest TenantContext calls. If a method is called from within a TenantContext callback, it must accept an `EntityManager` parameter instead of wrapping in its own `executeInOrg`.
+</Warning>
+
+<Tabs>
+<Tab title="Bad: nested calls">
+```typescript
+async compositeOperation(...) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    await this.someOtherMethod(); // This calls executeInOrg again!
+  });
+}
+```
+</Tab>
+
+<Tab title="Good: shares transaction">
+```typescript
+async compositeOperation(...) {
+  return this.tenantContext.executeInOrg(orgId, async (em) => {
+    await this.someMethodInTransaction(em, ...);
+  });
+}
+```
+</Tab>
+</Tabs>
+
+### Decision tree: which pattern to use?
+
+```
+Is the method called by other service methods within a transaction?
+├─ YES → Use Pattern 2 (Composable with *InTransaction)
+│  └─ Create public method that wraps tenantContext
+│  └─ Create *InTransaction method that accepts EntityManager
+│
+└─ NO → Use Pattern 1 (Simple inline)
+   └─ Implement directly in tenantContext callback
+   └─ Use private helper methods if needed (NOT *Impl!)
+```
+
+### Rules summary
+
+| Rule | Status | Notes |
+|------|--------|-------|
+| Use `tenantContext.executeInOrg` for writes | Required | Always wrap in TenantContext |
+| Use `tenantContext.executeReadOnly` for reads | Recommended | Optimized for queries |
+| Use `*InTransaction` for composition | Allowed | When method called from transactions |
+| Use `*Impl` methods | Forbidden | Creates unnecessary abstraction |
+| Nested TenantContext calls | Forbidden | Breaks transaction composition |
+| Private helper methods | Allowed | For code organization, not `*Impl` |
+
+## Decorators
+
+### `@PublicEndpoint()`
+
+Use when the endpoint **doesn't require authentication**. This decorator:
+
+- Marks the endpoint as public (skips AuthGuard)
+- Does **not** bypass RLS by itself
+- Service must use `executeWithBypass()` for database operations
+
+```typescript
+@Post('login')
+@PublicEndpoint()
+async login(@Body() dto: LoginDto) {
+  return this.authService.login(dto);
+}
+```
+
+### `@IdentityTokenOnly()`
+
+Use for endpoints that require authentication but **no organization context**. This decorator:
+
+- Tells AuthGuard to skip (it defers to `IdentityTokenGuard`)
+- Must be paired with `@UseGuards(IdentityTokenGuard)` on the route or controller
+- Used for pre-org-selection endpoints (listing organizations, issuing tenant tokens)
+
+```typescript
+@Get('organizations')
+@IdentityTokenOnly()
+@UseGuards(IdentityTokenGuard)
+async getMyOrganizations() { ... }
+```
+
+## Special cases
+
+<Tabs>
+<Tab title="OAuth callbacks">
+OAuth callbacks are public but need to set context from the state parameter:
+
+```typescript
+@Get('callback')
+@PublicEndpoint()
+async callback(@Query('state') state: string) {
+  const { organizationId } = JSON.parse(decodeState(state));
+
+  return this.tenantContext.executeInOrg(organizationId, async (em) => {
+    // Now queries work within that org
+  });
+}
+```
+</Tab>
+
+<Tab title="WebSocket handlers">
+WebSocket gateways are **singletons**. Always use `TenantContext`:
+
+```typescript
+@Injectable()
+@WebSocketGateway({ namespace: '/my-namespace' })
+export class MyGateway {
+  constructor(private readonly tenantContext: TenantContext) {}
+
+  @SubscribeMessage('some-event')
+  async handleEvent(@ConnectedSocket() client: AuthenticatedSocket) {
+    return this.tenantContext.executeInOrg(client.organizationId, async (em) => {
+      return em.find(SomeEntity, {});
+    });
+  }
+}
+```
+</Tab>
+
+<Tab title="Cron jobs">
+```typescript
+@Injectable()
+export class MyScheduler {
+  constructor(private readonly tenantContext: TenantContext) {}
+
+  @Cron('0 * * * *')
+  async hourlyTask() {
+    // Option 1: Bypass for cross-org operations
+    await this.tenantContext.executeWithBypass(async (em) => {
+      const orgs = await em.find(Organization, { isDeleted: false });
+      // Process each org...
+    });
+
+    // Option 2: Per-org processing with executeForEachOrg
+    await this.tenantContext.executeForEachOrg(orgIds, async (em, orgId) => {
+      // Process data for this org
+    });
+  }
+}
+```
+</Tab>
+
+<Tab title="Cross-org operations">
+When an authenticated user needs to access a different org (e.g., accepting invitation):
+
+```typescript
+async acceptInvitation(token: string, currentUserId: string) {
+  return this.tenantContext.executeWithBypass(async (em) => {
+    const invitation = await em.findOne(Invitation, { token });
+
+    // IMPORTANT: Pass the bypassed `em` to any helper methods that
+    // query RLS-protected tables (team, user_org_roles, team_membership, etc.).
+    // Using `this.em` or injected repositories inside bypass callbacks
+    // would use the request-scoped EM which has NO RLS context,
+    // causing silent query failures on RLS-protected tables.
+    await this.applyInvitationRbacAssignments(em, user, invitation);
+  });
+}
+```
+</Tab>
+
+<Tab title="Webhook with org lookup">
+For external webhooks (WhatsApp, Instagram) that need to look up the target org first:
+
+```typescript
+@Post('webhook')
+@PublicEndpoint()
+async handleWebhook(@Body() body: WebhookPayload) {
+  // Step 1: Find the org (read-only, bypass RLS)
+  const account = await this.tenantContext.executeReadOnlyWithBypass(async (em) => {
+    return em.findOne(WhatsAppAccount, { phoneNumber: body.from });
+  });
+
+  // Step 2: Process within the org
+  return this.tenantContext.executeInOrg(account.organization.id, async (em) => {
+    // Process webhook data within org context
+  });
+}
+```
+</Tab>
+</Tabs>
+
+## Quick reference
+
+| Scenario | Approach |
+| ---- | ---- |
+| Normal authenticated endpoint | `tenantContext.executeInOrg(orgId, ...)` |
+| Pre-org-selection endpoint | `@IdentityTokenOnly()` + `@UseGuards(IdentityTokenGuard)` |
+| Shared data endpoint (CRM + developer) | `@UseGuards(EitherAuthGuard)` |
+| Public + no org context | `@PublicEndpoint()` + `tenantContext.executeWithBypass()` |
+| OAuth callback with org | `@PublicEndpoint()` + `tenantContext.executeInOrg(orgId)` |
+| Webhook with org in payload | `@PublicEndpoint()` + `tenantContext.executeInOrg(orgId)` |
+| Webhook with org lookup first | `@PublicEndpoint()` + `executeReadOnlyWithBypass()` then `executeInOrg()` |
+| Cron job (cross-org) | `tenantContext.executeWithBypass()` |
+| Cron job (per-org) | `tenantContext.executeForEachOrg(orgIds, ...)` |
+| WebSocket handler | `tenantContext.executeInOrg(client.organizationId)` |
+
+## Tables configuration
+
+### No RLS (global/cross-tenant)
+
+| Table | Reason |
+| ---- | ---- |
+| user | Users belong to multiple orgs |
+| permission | Global permission registry |
+| role | System roles are global (org-specific have org_id but filtered in app) |
+| organization | Tenant table itself |
+
+### RLS enabled (tenant-scoped)
+
+All tables with `organization_id NOT NULL`:
+
+- CRM: person, lead, contact, company, deal, etc.
+- RBAC: team, team_membership, user_org_roles, team_membership_roles, etc.
+- Communication: activity, call_log, email_log, etc.
+- Real Estate: area, development, unit, etc.
+- Audit: audit_log
+
+## Audit log special handling
+
+The audit_log table has RLS but audit triggers bypass it:
+
+```sql
+CREATE OR REPLACE FUNCTION audit_trigger_func()
+RETURNS TRIGGER
+SECURITY DEFINER  -- Runs as table owner, bypasses RLS
+AS $$ ... $$;
+```
+
+This ensures:
+
+- Audit writes always succeed
+- Audit reads respect tenant isolation
+- No application code needed for audit writes
+
+## Error handling
+
+### Transaction rollback
+
+If any operation fails, the entire transaction rolls back:
+
+```typescript
+await tenantContext.executeInOrg(orgId, async (em) => {
+  await em.findOne(Lead, id); // Works
+  throw new Error('Something failed'); // Transaction rolls back
+  // SET LOCAL context is automatically cleared
+});
+```
+
+### No connection pool pollution
+
+Because we use `SET LOCAL`:
+
+- Context only exists within the transaction
+- On commit/rollback, context is automatically cleared
+- Connection returns to pool in clean state
+- No cleanup interceptor needed
+
+## Organization as the tenant boundary
+
+### Module structure
+
+The **Organization module** is at `/modules/organization/` as a top-level module, separate from RBAC:
+
+```
+src/modules/
+├── organization/           ← Tenant Boundary
+│   ├── organization.entity.ts
+│   ├── organization.service.ts
+│   ├── organization.controller.ts
+│   └── organization.module.ts
+├── user/                   ← User Identity
+├── rbac/                   ← Authorization
+└── crm/                    ← Business Logic
+```
+
+### Organization's role in multi-tenancy
+
+1. **Tenant isolation**: All tenant-scoped entities have `organization_id` foreign key
+2. **RLS context**: The `organization_id` is used to set PostgreSQL RLS context
+3. **Access control**: Combined with RBAC to determine what users can see/do
+4. **Data partitioning**: Organization boundaries enforce strict data separation
+
+### Import organization
+
+```typescript
+import { Organization } from '@modules/organization/organization.entity';
+import { OrganizationDto } from '@modules/organization/organization.dto';
+```
+
+### Tenant-scoped entity pattern
+
+All entities that belong to an organization should:
+
+1. Have `organization` field as ManyToOne relationship
+2. Include `organization_id` in RLS policies
+3. Filter by organization in queries (automatic with RLS)
+
+```typescript
+import { Organization } from '@modules/organization/organization.entity';
+
+@Entity()
+export class Lead {
+  @ManyToOne(() => Organization)
+  organization!: Organization;
+
+  // ... other fields
+}
+```
+
+## Performance considerations
+
+### Transaction overhead
+
+There is overhead for explicit transactions. Mitigations:
+
+1. **Read-only shortcut**: Use `executeReadOnly` for queries that don't need writes
+2. **Batch operations**: Multiple operations in one transaction
+3. **Connection pooling**: Still fully utilized
+
+### Audit trigger performance
+
+Triggers add ~1-2ms per write. Acceptable for:
+
+- Data integrity guarantee
+- Compliance requirements
+- Debugging capability
+
+## Common mistakes to avoid
+
+<Warning>
+**Don't use the injected `this.em` inside TenantContext callbacks.** Use the provided transactional `em` parameter.
+
+```typescript
+// WRONG - this.em has no RLS context inside the callback
+return this.tenantContext.executeInOrg(orgId, async (em) => {
+  return this.em.findOne(Lead, { id }); // Uses wrong EM!
+});
+
+// CORRECT - use the provided transactional em
+return this.tenantContext.executeInOrg(orgId, async (em) => {
+  return em.findOne(Lead, { id });
+});
+```
+</Warning>
+
+<Warning>
+**Don't nest TenantContext calls.** Use the `*InTransaction` pattern for composition.
+
+```typescript
+// WRONG - creates nested transactions
+return this.tenantContext.executeInOrg(orgId, async (em) => {
+  await this.someMethod(); // This calls executeInOrg internally!
+});
+
+// CORRECT - use *InTransaction pattern
+return this.tenantContext.executeInOrg(orgId, async (em) => {
+  await this.someMethodInTransaction(em, ...);
+});
+```
+</Warning>
+
+<Warning>
+**Don't forget `@PublicEndpoint` on public endpoints.** AuthGuard will reject the request otherwise.
+
+```typescript
+// WRONG - AuthGuard will reject the request
+@Post('login')
+async login() { }
+
+// CORRECT
+@Post('login')
+@PublicEndpoint()
+async login() { }
+```
+</Warning>
+
+<Warning>
+**Don't use `executeWithBypass` when you have an org context.** Use `executeInOrg` for org-scoped operations.
+
+```typescript
+// WRONG - bypasses all tenant isolation unnecessarily
+return this.tenantContext.executeWithBypass(async (em) => {
+  return em.find(Lead, { organization: orgId });
+});
+
+// CORRECT - use executeInOrg for org-scoped operations
+return this.tenantContext.executeInOrg(orgId, async (em) => {
+  return em.find(Lead, {});
+});
+```
+</Warning>
+
+## Files reference
+
+| File | Purpose |
+| ---- | ---- |
+| `src/common/tenant/tenant-context.service.ts` | TenantContext service |
+| `src/common/tenant/tenant-context.module.ts` | Global module definition |
+| `src/common/tenant/index.ts` | Barrel exports (TenantContext, TenantContextInfo, TenantContextModule) |
+| `src/decorators/rls.decorator.ts` | `@PublicEndpoint()` and `@IdentityTokenOnly()` decorators |
+| `src/modules/auth/auth.guard.ts` | AuthGuard (validates tenant tokens, loads RBAC) |
+| `src/modules/auth/guards/identity-token.guard.ts` | IdentityTokenGuard (validates identity tokens) |
+| `src/common/guards/either-auth.guard.ts` | EitherAuthGuard (accepts CRM or developer tokens) |
+| `src/modules/auth/auth.service.ts` | Token issuance (identity, tenant, refresh) |
+
+## Summary
+
+| Aspect | Implementation |
+| ---- | ---- |
+| **Tenant boundary** | Organization entity (`/modules/organization/`) |
+| **Isolation mechanism** | PostgreSQL RLS policies |
+| **Context service** | TenantContext |
+| **Transaction model** | Explicit transactions with SET LOCAL |
+| **Auth tokens** | Identity token (user) + Tenant token (user+org) |
+| **Auth guards** | AuthGuard, IdentityTokenGuard, EitherAuthGuard |
+| **Audit logging** | Database triggers (automatic, atomic) |
+| **Public endpoints** | `@PublicEndpoint()` + `executeWithBypass()` |
+| **Pre-org endpoints** | `@IdentityTokenOnly()` + `IdentityTokenGuard` |
+| **WebSocket handlers** | `executeInOrg()` per message |
+| **Cron jobs** | `executeWithBypass()` or `executeForEachOrg()` |
+| **Session integration** | Sessions created per-org on tenant token issuance (see [session system](/backend/session-system)) |

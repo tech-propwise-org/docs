@@ -1,0 +1,847 @@
+---
+title: "Archive system"
+description: "Two-tier archive and delete system for CRM business entities, including pre-archive validations, cascade behavior, and entity-specific implementation details."
+---
+
+## Overview
+
+The archive system provides a **two-tier removal model** for CRM business entities. Instead of immediately deleting records, entities go through an archive phase first, giving users a reversible option before permanent removal.
+
+<Tabs>
+<Tab title="Archive (tier 1)">
+- **Purpose:** Make an entity inactive while preserving data for reporting, auditing, and relationship integrity
+- **Visibility:** Hidden from active views, accessible via filters/toggles
+- **Data:** Preserved completely — all relationships and history remain intact
+- **Reversible:** Yes — unarchive restores the entity to active state
+- **Operations:** Most operations are blocked on archived entities
+- **Permission:** `crm.manage`
+</Tab>
+
+<Tab title="Soft delete (tier 2)">
+- **Purpose:** Remove archived business entities that are no longer needed
+- **Requirement:** Entity must be archived for at least **30 days**
+- **Confirmation:** User must type the full entity name to confirm
+- **Cascade:** Soft-deletes all related records (stakeholders, history, activities, notes)
+- **Visibility:** Completely hidden from all views
+- **Data:** Soft-deleted (`isDeleted = true`) — not physically removed
+- **Reversible:** No standard undelete flow (requires manual database intervention)
+- **Permission:** `system.admin`
+</Tab>
+
+<Tab title="Delete (config entities)">
+- **Purpose:** Remove configuration items that are no longer needed
+- **Visibility:** Completely hidden from all views
+- **Data:** Soft-deleted (`isDeleted = true`) — not physically removed
+- **Reversible:** No standard undelete flow (requires manual intervention)
+</Tab>
+</Tabs>
+
+<Warning>
+The two-tier system exists for safety. Tier 1 (archive) is quick and reversible. Tier 2 (soft delete) requires a 30-day cooling-off period, `system.admin` permission, and explicit name confirmation. You cannot skip tier 1.
+</Warning>
+
+---
+
+## Entity classification
+
+### Business entities (use archive)
+
+These represent core business data that should be preserved:
+
+| Entity | Archive? | Notes |
+|--------|----------|-------|
+| Lead | Yes | Use as reference implementation |
+| Contact | Yes | Similar pattern to Lead |
+| Deal | Yes | Additional complexity with commissions |
+| Company | Yes | No blocking dependencies — flexible archive |
+| Person | No | Shared across Lead/Contact — never archive directly |
+
+### Configuration entities (use delete)
+
+These are settings/configuration that can be removed directly:
+
+| Entity | Notes |
+|--------|-------|
+| LeadStage | Validate no active leads in stage before delete |
+| DealStage | Validate no active deals in stage before delete |
+| Tags | Remove tag associations or block if in use |
+| Custom Fields | Handle existing data appropriately |
+
+---
+
+## Archive implementation pattern
+
+### Entity fields
+
+Add these three fields to any entity that supports archiving:
+
+```typescript
+@Property({ type: 'boolean', default: false })
+@Index()
+isArchived: boolean = false;
+
+@Property({ nullable: true })
+archivedAt?: Date;
+
+@ManyToOne(() => User, { nullable: true })
+archivedBy?: User;
+```
+
+### Entity filter update
+
+Update the default `active` filter to exclude both deleted and archived records:
+
+```typescript
+@Filter({
+  name: 'active',
+  default: true,
+  cond: { isDeleted: false, isArchived: false }
+})
+```
+
+### Index updates
+
+Update existing indexes and add a dedicated archive index for query performance:
+
+```typescript
+@Index({
+  name: 'idx_lead_pipeline',
+  properties: ['organization', 'stage', 'isDeleted', 'isArchived']
+})
+
+@Index({
+  name: 'idx_lead_archived',
+  properties: ['organization', 'isArchived', 'archivedAt']
+})
+```
+
+---
+
+## Pre-archive validations
+
+Before archiving an entity, validate these business rules:
+
+1. **Blocking dependencies** — What related entities would make archiving invalid?
+2. **Cascading updates** — What related records need status updates?
+3. **Status restrictions** — Can entities in any status be archived?
+
+<Tabs>
+<Tab title="Lead">
+```typescript
+// VALIDATION: Check for active deals (BLOCK)
+const activeDealCount = await em
+  .createQueryBuilder('Deal', 'd')
+  .select('COUNT(*)')
+  .where({
+    originatingLead: leadId,
+    isClosed: false,
+    isArchived: false,
+    isDeleted: false,
+  })
+  .execute('get', false);
+
+if (parseInt(activeDealCount[0]?.count || '0') > 0) {
+  throw new BadRequestException(
+    `Cannot archive lead: ${count} active deal(s) originated from this lead. ` +
+      'Close or archive the deals first.',
+  );
+}
+
+// ACTION: Cancel pending transfers
+await em.nativeUpdate(
+  'entity_transfer',
+  {
+    entity_type: StakeholderEntityType.LEAD,
+    entity_id: leadId,
+    status: 'pending',
+  },
+  {
+    status: 'cancelled',
+    reject_reason: 'Lead archived',
+    rejected_at: new Date(),
+    rejected_by_id: userId,
+  },
+);
+```
+</Tab>
+
+<Tab title="Contact">
+Blocks if the contact has active deals via `DealContact`. No cascading updates needed since contacts do not have transfers.
+</Tab>
+
+<Tab title="Deal">
+Blocks if the deal has unpaid commissions. Cancels any pending `EntityTransfer` records on archive.
+</Tab>
+
+<Tab title="Company">
+No blocking dependencies. Companies can be archived freely regardless of active contacts or deals.
+</Tab>
+</Tabs>
+
+---
+
+## Actions on archive
+
+When an entity is archived, related records are preserved — not deleted or cascaded:
+
+| Related entity | Action | Reason |
+|---------------|--------|--------|
+| EntityStakeholder | Keep as-is | Historical assignment records |
+| Stage History | Keep as-is | Timeline/audit purposes |
+| Activities | Keep as-is | Historical communication records |
+| Property Interests | Keep visible | Property interest data is valuable |
+| Child Entity References | Maintain reference | Lineage for reporting (e.g., `Deal.originatingLead`) |
+
+<Note>
+The archive operation only changes the entity's own `isArchived`, `archivedAt`, and `archivedBy` fields. All related records remain untouched and visible in the archived entity's detail view.
+</Note>
+
+---
+
+## Edge cases
+
+### Create from archived entity
+
+You cannot create child entities from an archived parent. For example, creating a deal from an archived lead is blocked:
+
+```typescript
+if (originatingLead && originatingLead.isArchived) {
+  throw new BadRequestException(
+    'Cannot create deal from an archived lead. Please unarchive the lead first.',
+  );
+}
+```
+
+### Bulk archive
+
+Bulk operations use a **partial success** strategy — valid items are archived and failures are reported individually:
+
+```typescript
+async bulkArchiveLeads(
+  leadIds: string[],
+  userId: string,
+  organizationId: string,
+): Promise<{
+  success: string[];
+  failed: { id: string; reason: string }[];
+}> {
+  const results = { success: [], failed: [] };
+
+  for (const leadId of leadIds) {
+    try {
+      await this.archiveLead(leadId, userId, organizationId);
+      results.success.push(leadId);
+    } catch (error) {
+      results.failed.push({ id: leadId, reason: error.message });
+    }
+  }
+
+  return results;
+}
+```
+
+### Unarchive with deleted dependencies
+
+If a required dependency was deleted while the entity was archived (e.g., the assigned stage), the system recovers by assigning to the "New" system stage:
+
+```typescript
+if (!entity.stage || entity.stage.isDeleted) {
+  const newStage = await this.stageService.getNewStageInTransaction(em);
+  entity.stage = newStage;
+  entity.stageEnteredAt = new Date();
+}
+```
+
+### Operations blocked on archived entities
+
+All of the following operations throw `BadRequestException` with a message guiding the user to unarchive first:
+
+| Operation | Reason |
+|-----------|--------|
+| Update entity | Prevents accidental modifications to historical records |
+| Create activities | Activities should only be added to active entities |
+| Create notes | Notes should only be added to active entities |
+| Create/update calls | Communication logs should only be added to active entities |
+| Create/update meetings | Meeting records should only be added to active entities |
+| Create/update emails | Email logs should only be added to active entities |
+| Create/update SMS | SMS logs should only be added to active entities |
+| Create/update site visits | Site visit records should only be added to active entities |
+| Request transfers | Transfers should only apply to active entities in the workflow |
+| Create child entities | New child entities should only originate from active parents |
+
+<Tip>
+Users must unarchive the entity first to perform any blocked operation, then can re-archive if needed.
+</Tip>
+
+### Person entity exception
+
+Person does **not** have archive functionality because it is shared between Lead and Contact. Archiving a Person would affect multiple business entities unexpectedly. Instead, archive the Lead or Contact that references the Person.
+
+---
+
+## Permanent delete (tier 2)
+
+Permanent delete is available only for entities that are already archived and have been archived for at least 30 days.
+
+### Pre-conditions
+
+| Condition | Requirement |
+|-----------|-------------|
+| Entity state | Must be archived (`isArchived = true`) |
+| Archive duration | Must be archived for at least **30 days** |
+| Permission | Requires `system.admin` (elevated access) |
+| Confirmation | User must type the full entity name |
+| Bulk operations | Allowed for Lead, Contact, Deal (partial success); not allowed for Company |
+
+### Cascade behavior
+
+All related records are soft-deleted (`isDeleted = true`), not physically removed:
+
+| Related entity | Action |
+|---------------|--------|
+| EntityStakeholder | Soft delete all records |
+| Stage History | Soft delete all records |
+| EntityTransfer | Soft delete all records |
+| Activities | Soft delete all records (includes notes — notes are activities) |
+| Related Interests | Soft delete all records |
+| Child Entity References | Set foreign key to `NULL` (e.g., `Deal.originatingLead`) |
+| Person | **Never delete** — keep intact |
+
+```typescript
+entity.isDeleted = true;
+entity.updatedAt = new Date();
+entity.updatedBy = user;
+```
+
+<Note>
+The current implementation uses `isDeleted` + `updatedAt`/`updatedBy` for soft deletes. Dedicated `deletedAt`/`deletedBy` fields are not present on CRM business entities. The `updatedAt`/`updatedBy` fields serve as the audit trail for the delete operation.
+</Note>
+
+### Why soft delete instead of hard delete
+
+| Factor | Benefit |
+|--------|---------|
+| Audit trail | Complete history preserved for compliance |
+| Accidental recovery | Can be manually restored if needed |
+| Reporting | Can analyze deleted data patterns |
+| Foreign keys | No cascade constraint issues |
+| Safety | Less destructive than physical removal |
+
+<Info>
+For true GDPR "right to be forgotten" compliance, a hard delete option may be needed in the future with proper data purging from all systems.
+</Info>
+
+### Validation flow
+
+<Steps>
+<Step title="Verify entity state">
+Check the entity exists and is archived (`isArchived = true`, `isDeleted = false`).
+</Step>
+
+<Step title="Check archive duration">
+Verify the entity has been archived for at least 30 days (`archivedAt <= now - 30 days`).
+</Step>
+
+<Step title="Verify permissions">
+Confirm the user has `system.admin` permission.
+</Step>
+
+<Step title="Require confirmation">
+Match the provided `confirmName` against the entity's actual name.
+</Step>
+
+<Step title="Cascade soft-delete">
+Soft-delete all related records (stakeholders, history, transfers, activities, interests).
+</Step>
+
+<Step title="Nullify child references">
+Set child entity foreign keys to `NULL` (e.g., `Deal.originatingLead`).
+</Step>
+
+<Step title="Soft-delete the entity">
+Set `isDeleted = true` on the entity itself.
+</Step>
+
+<Step title="Return summary">
+Return a summary of all affected records.
+</Step>
+</Steps>
+
+---
+
+## Database schema changes
+
+### Migration template
+
+Use this template when adding archive support to a new entity:
+
+```typescript
+import { Migration } from '@mikro-orm/migrations';
+
+export class Migration_add_[entity]_archive extends Migration {
+  async up(): Promise<void> {
+    this.addSql(`
+      ALTER TABLE "[entity]"
+      ADD COLUMN IF NOT EXISTS "is_archived" boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS "archived_at" timestamptz,
+      ADD COLUMN IF NOT EXISTS "archived_by_id" uuid REFERENCES "user"(id);
+    `);
+
+    this.addSql(`
+      CREATE INDEX IF NOT EXISTS "idx_[entity]_archived"
+      ON "[entity]" ("organization_id", "is_archived", "archived_at");
+    `);
+
+    this.addSql(`DROP INDEX IF EXISTS "idx_[entity]_pipeline";`);
+    this.addSql(`
+      CREATE INDEX "idx_[entity]_pipeline"
+      ON "[entity]" ("organization_id", "stage_id", "is_deleted", "is_archived");
+    `);
+  }
+
+  async down(): Promise<void> {
+    this.addSql(`ALTER TABLE "[entity]" DROP COLUMN IF EXISTS "is_archived";`);
+    this.addSql(`ALTER TABLE "[entity]" DROP COLUMN IF EXISTS "archived_at";`);
+    this.addSql(`ALTER TABLE "[entity]" DROP COLUMN IF EXISTS "archived_by_id";`);
+    this.addSql(`DROP INDEX IF EXISTS "idx_[entity]_archived";`);
+  }
+}
+```
+
+---
+
+## API endpoints
+
+### Archive endpoints
+
+```typescript
+// Archive single entity
+@Post(':id/archive')
+async archive(@Param('id') id: string): Promise<{ success: boolean; archivedAt: Date }>
+
+// Unarchive single entity
+@Post(':id/unarchive')
+async unarchive(@Param('id') id: string): Promise<{ success: boolean }>
+
+// Bulk archive
+@Post('bulk-archive')
+async bulkArchive(@Body() dto: { ids: string[] }): Promise<{
+  success: boolean;
+  archivedCount: number;
+  failedCount: number;
+  failures: Array<{ id: string; reason: string }>;
+}>
+
+// Bulk unarchive
+@Post('bulk-unarchive')
+async bulkUnarchive(@Body() dto: { ids: string[] }): Promise<{
+  success: boolean;
+  unarchivedCount: number;
+  failedCount: number;
+  failures: Array<{ id: string; reason: string }>;
+}>
+```
+
+### Delete endpoints
+
+```typescript
+// Soft delete with cascade (requires 30-day archive + name confirmation)
+@Delete(':id')
+async delete(
+  @Param('id') id: string,
+  @Body() body: { confirmName: string }
+): Promise<{
+  success: boolean;
+  deletedAt: Date;
+  relatedRecordsDeleted: { /* entity-specific counts */ };
+}>
+
+// Bulk soft delete (requires 30-day archive for all)
+@Post('bulk-delete')
+async bulkDelete(@Body() dto: { ids: string[] }): Promise<{
+  success: boolean;
+  deletedCount: number;
+  failedCount: number;
+  failures: Array<{ id: string; reason: string }>;
+}>
+```
+
+<Warning>
+Delete requirements: entity must be archived (`isArchived = true`) for at least 30 days, user must have `system.admin` permission, and explicit name confirmation is required. Cascade soft-deletes all related records and nullifies child entity references. The Person entity is never deleted.
+</Warning>
+
+### List view with archive filter
+
+Add `showArchived` query parameter to list endpoints:
+
+```typescript
+@ApiQuery({
+  name: 'showArchived',
+  required: false,
+  type: Boolean,
+  description: 'If true, show only archived; if false/undefined (default), show only active',
+})
+async getList(
+  @Query('showArchived') showArchived?: boolean,
+): Promise<ListResponse> {
+  // In service: filter by isArchived = showArchived === true
+}
+```
+
+### Kanban view with archive column
+
+Support `stageId='archived'` for infinite scroll on the archived column:
+
+```typescript
+@ApiQuery({
+  name: 'stageId',
+  description: 'Stage UUID for regular stages, or "archived" for archived column',
+})
+```
+
+---
+
+## Query patterns
+
+### List view query
+
+```typescript
+qb.andWhere({ isArchived: query.showArchived === true });
+
+const defaultSort = query.showArchived === true ? 'archivedAt' : 'createdAt';
+```
+
+### Kanban view query
+
+```typescript
+const targetStages = query.stageId
+  ? query.stageId === 'archived'
+    ? []
+    : allStages.filter((s) => s.id === query.stageId)
+  : allStages;
+
+if (!query.stageId || query.stageId === 'archived') {
+  const archivedQb = this.buildQueryForType(em, user, query.type, query.teamId);
+  archivedQb.andWhere({ isArchived: true });
+  // pagination, sorting by archivedAt DESC
+}
+
+// Regular stages exclude archived
+qb.andWhere({ stage: stage.id, isArchived: false });
+```
+
+### Joins for archive metadata
+
+```typescript
+queryBuilder.leftJoinAndSelect('entity.archivedBy', 'archivedBy');
+
+populate: ['archivedBy', /* other fields */];
+```
+
+---
+
+## Implementation checklist
+
+Use this checklist when adding archive support to a new entity.
+
+<AccordionGroup>
+<Accordion title="Planning phase">
+- Identify blocking dependencies (what prevents archive?)
+- Identify cascading updates (what records need updating?)
+- Define status restrictions (which statuses can be archived?)
+- Define related entity behavior (keep/archive/update?)
+- Define edge cases (create from archived, bulk, unarchive scenarios)
+</Accordion>
+
+<Accordion title="Implementation phase">
+- **Entity:** Add `isArchived`, `archivedAt`, `archivedBy` fields
+- **Entity:** Update `@Filter` to exclude archived from active
+- **Entity:** Add/update indexes for `isArchived`
+- **Migration:** Create migration for schema changes
+- **Service:** Implement `archive[Entity]()` with validations
+- **Service:** Implement `unarchive[Entity]()` with recovery logic
+- **Service:** Implement `bulkArchive[Entity]()` with partial success
+- **Service:** Implement `bulkUnarchive[Entity]()` with partial success
+- **Service:** Update `update[Entity]()` to block archived entities
+- **Service:** Update `delete[Entity]()` to require 30-day archive
+- **Service:** Update `bulkDelete[Entity]()` to require 30-day archive with partial success
+- **Service:** Update list queries to support `showArchived` filter
+- **Service:** Update kanban queries to support `stageId='archived'`
+- **Service:** Add guard in transfer request to block archived entities
+- **Controller:** Add archive/unarchive/bulk-archive/bulk-unarchive endpoints
+- **Controller:** Add `showArchived` query param to list endpoint
+- **Controller:** Update delete endpoint docs with 30-day requirement
+- **Controller:** Update Swagger documentation
+- **DTO:** Add `isArchived`, `archivedAt`, `archivedBy` to response DTO
+- **Activity Service:** Add validation to block activity creation on archived entities
+- **Related Services:** Add guards to prevent invalid operations on archived entities
+</Accordion>
+
+<Accordion title="Validation phase">
+- Run migration successfully
+- TypeScript compiles without errors
+- Linter passes
+- Test archive flow
+- Test unarchive flow
+- Test bulk archive
+- Test list view with `showArchived` filter
+- Test kanban view with archived column pagination
+- Test edge cases (create from archived, deleted dependencies)
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Entity-specific implementation
+
+<Tabs>
+<Tab title="Lead">
+### Archive decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Blocking dependencies | Active deals — block |
+| Cascading updates | Pending transfers — cancel |
+| Status restrictions | Any status can be archived |
+| Stakeholders | Keep as-is |
+| Stage history | Keep as-is |
+| Activities | Keep as-is (includes notes — notes are activities) |
+| Property interests | Keep visible |
+| Deal references | Maintain `originatingLead` reference |
+| Create deal from archived | Block |
+| Unarchive with deleted stage | Assign to "New" stage |
+| Update archived lead | Block |
+| Create activities/notes | Block |
+| Create transfers | Block |
+
+### Soft delete decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Pre-condition | Must be archived for >= 30 days |
+| Permission required | `system.admin` |
+| Confirmation | Must type full lead name |
+| Bulk delete | Allowed with partial success |
+| EntityStakeholder | Cascade soft-delete |
+| LeadStageHistory | Cascade soft-delete |
+| EntityTransfer | Cascade soft-delete |
+| Activities | Cascade soft-delete (includes notes) |
+| LeadPropertyInterest | Cascade soft-delete |
+| Deals.originatingLead | Set to `NULL` |
+| Person | Keep (never delete) |
+
+### Blocked operations
+
+| Operation | Error message |
+|-----------|--------------|
+| Update lead | "Cannot update archived lead. Please unarchive it first." |
+| Create activities | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create notes | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create calls | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create meetings | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create emails | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create SMS | "Cannot create activities for archived lead. Please unarchive it first." |
+| Create site visits | "Cannot create activities for archived lead. Please unarchive it first." |
+| Request transfer | "Cannot request transfer for archived lead. Please unarchive it first." |
+| Create deal | "Cannot create deal from an archived lead. Please unarchive the lead first." |
+</Tab>
+
+<Tab title="Contact">
+### Archive decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Blocking dependencies | Active deals (via DealContact) — block |
+| Cascading updates | None (no transfers for Contact) |
+| DealContact | Keep as-is |
+| ContactCompanyRole | Keep as-is |
+| Activities | Keep as-is (includes notes — notes are activities) |
+| Person/Leads | No check — Person is separate layer |
+| Create deal with archived contact | Block |
+| Convert lead (Person's contact archived) | Auto-unarchive contact during conversion |
+| Create activity on archived contact | Block |
+
+### Soft delete decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Pre-condition | Must be archived for >= 30 days |
+| Permission required | `system.admin` |
+| Confirmation | Must type full contact name |
+| Bulk delete | Allowed with partial success |
+| DealContact | Cascade soft-delete |
+| ContactCompanyRole | Cascade soft-delete |
+| Activities | Cascade soft-delete (includes notes) |
+| Person | Keep (never delete) |
+</Tab>
+
+<Tab title="Deal">
+### Archive decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Blocking dependencies | Unpaid commissions — block |
+| Pending EntityTransfers | Cancel on archive |
+| Status restrictions | Any deal can be archived (open, won, or lost) |
+| EntityStakeholders | Keep as-is |
+| DealStageHistory | Keep as-is |
+| DealContacts | Keep as-is |
+| DealPropertyInterest | Keep as-is |
+| CommissionPayments | Keep as-is |
+| Activities | Keep as-is (includes notes) |
+| Create activity on archived deal | Block |
+| Transfer request on archived deal | Block |
+| Process new commissions | Block (`CommissionPaymentService` validates `deal.isArchived`) |
+| Stage changes | Block |
+| UI display | Virtual "Archived" column in Kanban + `showArchived` filter in List |
+
+### Soft delete decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Pre-condition | Must be archived for >= 30 days |
+| Permission required | `system.admin` |
+| Confirmation | Must type deal title (single delete only) |
+| Bulk delete | Allowed with partial success |
+| EntityStakeholders | Cascade soft-delete |
+| DealStageHistory | Cascade soft-delete |
+| EntityTransfers | Cascade soft-delete |
+| DealContacts | Cascade soft-delete |
+| DealPropertyInterest | Cascade soft-delete |
+| Activities | Cascade soft-delete (includes notes) |
+| CommissionPayments | Cascade soft-delete |
+| Contact/Lead | Keep (never delete) |
+</Tab>
+
+<Tab title="Company">
+### Archive decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Blocking dependencies | None — companies can be archived with active contacts or deals |
+| ContactCompanyRole | Keep as-is (contacts maintain link to archived company) |
+| CompanyEmail/Phone/Address | Keep as-is |
+| Development associations | Keep as-is (development still shows company) |
+| Activities | Keep as-is |
+| Notes | Keep as-is (notes are activities, managed via Activity system) |
+| Create ContactCompanyRole on archived company | Block |
+| Create activity on archived company | Block |
+| Update company details | Block |
+| UI display | `showArchived` filter in List view |
+
+### Soft delete decisions
+
+| Aspect | Decision |
+|--------|----------|
+| Pre-condition | Must be archived for >= 30 days |
+| Permission required | `system.admin` |
+| Confirmation | Must type company name |
+| Bulk delete | Not allowed |
+| ContactCompanyRole | Cascade soft-delete |
+| CompanyEmail | Cascade soft-delete |
+| CompanyPhone | Cascade soft-delete |
+| CompanyAddress | Cascade soft-delete |
+| Activities | Cascade soft-delete |
+| Contact/Deal | Keep (never delete) |
+| Development associations | Keep (ManyToMany preserved) |
+</Tab>
+</Tabs>
+
+---
+
+## Code references
+
+### Entity archive fields
+
+```typescript
+// src/modules/crm/lead/lead.entity.ts
+@Property({ type: 'boolean', default: false })
+@Index()
+isArchived: boolean = false;
+
+@Property({ nullable: true })
+archivedAt?: Date;
+
+@ManyToOne(() => User, { nullable: true })
+archivedBy?: User;
+```
+
+### Service methods
+
+- `src/modules/crm/lead/lead.service.ts` — `archiveLead()`, `unarchiveLead()`, `bulkArchiveLeads()`, `bulkUnarchiveLeads()`
+- `src/modules/crm/contact/contact.service.ts` — `archiveContact()`, `unarchiveContact()`, `bulkArchiveContacts()`, `bulkUnarchiveContacts()`
+- `src/modules/crm/deal/deal.service.ts` — `archiveDeal()`, `unarchiveDeal()`, `bulkArchiveDeals()`, `bulkUnarchiveDeals()`
+- `src/modules/crm/company/company.service.ts` — `archiveCompany()`, `unarchiveCompany()`
+
+### Controller endpoints
+
+- `POST /:id/archive`, `POST /:id/unarchive`, `POST /bulk-archive`, `POST /bulk-unarchive` on each CRM entity controller
+- `DELETE /:id` with `confirmName` body on each CRM entity controller
+
+---
+
+## Testing checklist
+
+<AccordionGroup>
+<Accordion title="Archive operations">
+- Archive single entity (should succeed)
+- Unarchive single entity (should succeed)
+- Bulk archive multiple entities (should succeed with partial failures)
+- Bulk unarchive multiple entities (should succeed with partial failures)
+- View archived entities with `showArchived=true` filter
+- View archived column in kanban view with infinite scroll
+</Accordion>
+
+<Accordion title="Blocked operations on archived entities">
+- Update archived entity (should fail)
+- Create activity on archived entity (should fail)
+- Create note on archived entity (should fail)
+- Create call on archived entity (should fail)
+- Create meeting on archived entity (should fail)
+- Create email on archived entity (should fail)
+- Create SMS on archived entity (should fail)
+- Create site visit on archived entity (should fail)
+- Request transfer on archived entity (should fail)
+- Create related entity from archived parent (should fail)
+</Accordion>
+
+<Accordion title="Delete operations">
+- Delete entity that is not archived (should fail)
+- Delete entity archived less than 30 days (should fail)
+- Delete entity archived exactly 30 days (should succeed)
+- Delete entity archived more than 30 days (should succeed)
+- Delete without name confirmation (should fail)
+- Delete with wrong name confirmation (should fail)
+- Delete with correct name confirmation after 30 days (should succeed)
+- Verify cascade soft-delete of all related records
+- Verify child entity references set to `NULL`
+- Bulk delete with mixed archive durations (should succeed with partial failures)
+</Accordion>
+
+<Accordion title="Workflow tests">
+- Archive, wait 30 days, delete workflow
+- Archive, unarchive, update, re-archive workflow
+- Archive, attempt operations, receive clear error messages
+- Unarchive with deleted dependencies, recovery to valid state
+</Accordion>
+</AccordionGroup>
+
+---
+
+<CardGroup cols={2}>
+<Card title="CRM module" icon="users" href="/backend/crm-module">
+Core CRM entity architecture, relationships, and business rules.
+</Card>
+
+<Card title="Stakeholder API" icon="people-arrows" href="/backend/stakeholder-api">
+Assignment, commission, and transfer system that interacts with archive validation.
+</Card>
+
+<Card title="Entity views" icon="table-columns" href="/backend/entity-views">
+Kanban and list views that display the archived column and `showArchived` filter.
+</Card>
+
+<Card title="Access control" icon="shield-halved" href="/backend/access-control">
+Endpoint protection and resource permissions that gate archive operations.
+</Card>
+</CardGroup>
