@@ -1,0 +1,477 @@
+---
+title: "Overview"
+description: "Architecture overview of PropWise's role-based access control system with unified roles, permissions, and multi-organization support."
+---
+
+This section covers the RBAC (Role-Based Access Control) system: how permissions, roles, teams, and multi-organization support fit together.
+
+## Design principles
+
+1. **Unified Role & Permission system** — Single `Role` and `Permission` tables with a `scope` field differentiating ORG and TEAM levels.
+2. **System vs custom roles** — System roles have `organization = NULL` (global/seeded). Custom roles belong to a specific organization.
+3. **Explicit junction tables** — `UserOrgRole` and `TeamMembershipRole` enable multi-org support with metadata (`assigned_by`, `created_at`, `organization_id` for RLS).
+4. **Multi-tenancy support** — Users can belong to multiple organizations with different roles per org. RLS enforced at database level.
+5. **Permission inheritance** — Team roles can have both TEAM-scoped and ORG-scoped permissions, controlled via `team_available_permissions`.
+
+## Architecture diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         RBAC SYSTEM                             │
+└─────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+│     USER     │         │ ORGANIZATION │         │     TEAM     │
+│              │◄────────┤              ├────────►│              │
+└──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+       │                        │                        │
+       ▼                        ▼                        ▼
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+│ UserOrgRole  │         │     ROLE     │         │    Team      │
+│ (explicit    │◄────────┤ (unified)    │◄────────┤ Membership   │
+│  junction)   │         │ • scope      │         │              │
+└──────────────┘         │ • org/system │         └──────┬───────┘
+                         └──────┬───────┘                │
+                                │                        ▼
+                                │                 ┌──────────────┐
+                                │                 │TeamMembership│
+                                │                 │    Role      │
+                                │                 │ (explicit    │
+                                │                 │  junction)   │
+                                │                 └──────┬───────┘
+                                │                        │
+                                ▼                        │
+                         ┌──────────────┐                │
+                         │  PERMISSION  │◄───────────────┘
+                         │ (unified)    │
+                         │ • scope      │
+                         │ • key        │
+                         └──────────────┘
+```
+
+---
+
+## Foundational entities
+
+These entities are defined in their own modules but are central to RBAC.
+
+### User
+
+```typescript
+User
+├── id: uuid
+├── first_name, last_name: string
+├── email: string (globally unique among active users)
+├── password: string (hashed)
+├── phone_number?: string
+├── avatar_url?: string (public URL to avatar image, stored as WebP on R2)
+├── languages?: string[] (array of language codes)
+├── preferred_language?: string
+├── is_verified: boolean
+├── is_active: boolean
+├── is_system_admin: boolean (platform-level admin, distinct from RBAC roles)
+├── is_deleted: boolean (soft delete)
+├── selected_organization_id?: uuid → Organization
+├── Auth Fields:
+│   ├── refresh_token?: string
+│   ├── token_version: number (default: 1, incremented on token invalidation)
+│   ├── verification_code?: string
+│   ├── verification_code_expires?: timestamp
+│   ├── verification_email_attempts: number (default: 0)
+│   ├── last_verification_email_sent_at?: timestamp
+│   ├── reset_password_code?: string
+│   └── reset_password_code_expires?: timestamp
+├── Relationships:
+│   ├── organizations → Organization[] (via organization_users)
+│   ├── orgRoles → UserOrgRole[] (roles in orgs)
+│   └── teamMemberships → TeamMembership[]
+└── Timestamps: created_at, updated_at
+
+Indexes:
+├── (first_name, last_name) [composite]
+└── (email, is_deleted) [unique, where: is_deleted = false]
+```
+
+- User can belong to multiple organizations
+- Email is globally unique among non-deleted users (enforced by unique index on `[email, is_deleted]` where `is_deleted = false`)
+- `selected_organization_id` tracks current org context
+- Access roles via `orgRoles` collection (not direct `roles`)
+- `is_system_admin` is a platform-level flag independent of per-org RBAC roles
+
+### Organization
+
+**Module location:** `/modules/organization/` (separate from RBAC)
+
+Organization serves as the **tenant boundary** for multi-tenancy and is conceptually a peer to User, not a component of RBAC.
+
+```typescript
+Organization
+├── id: uuid
+├── name: string
+├── website?: string
+├── email?: string
+├── vat?: string
+├── avatar_url?: string (public URL to org logo, stored as WebP on R2)
+├── address?: jsonb (embedded Address object)
+├── owner_id: uuid → User (organization owner)
+├── Relationships:
+│   ├── users → User[] (ManyToMany, owner side, via organization_users)
+│   ├── owner → User (ManyToOne)
+│   ├── leads → Lead[] (OneToMany)
+│   ├── contacts → Contact[] (OneToMany)
+│   ├── deals → Deal[] (OneToMany)
+│   └── companies → Company[] (OneToMany)
+└── Timestamps: created_at, updated_at, is_deleted
+```
+
+<Note>
+Teams, Roles, and Invitations each reference Organization via their own `@ManyToOne` relationships, but Organization does not declare inverse `@OneToMany` collections for these. CRM entities (Lead, Contact, Deal, Company) do have inverse relationships on Organization.
+</Note>
+
+- Each organization has exactly one owner
+- Owner is automatically assigned "Owner" role on creation
+- System roles (`organization = NULL`) are shared across all orgs
+- Soft delete via `isDeleted` flag with `@Filter` decorator
+
+---
+
+## Permission resolution
+
+This is the core mechanism that ties roles, permissions, and teams together.
+
+```
+User requesting action
+        │
+        ├─── Resolve ORG permissions
+        │    └─── Via UserOrgRole → Role → Permission (scope=ORG)
+        │
+        └─── Resolve TEAM permissions
+             └─── Via TeamMembership → TeamMembershipRole → Role → Permission
+                  ├─── TEAM-scoped permissions (always allowed)
+                  └─── ORG-scoped permissions (must be in team_available_permissions)
+```
+
+### Effective permissions calculation
+
+```typescript typescript
+interface EffectivePermissions {
+  orgPermissions: string[];
+  teamPermissions: string[];
+  allPermissions: string[];
+}
+
+async function getUserEffectivePermissions(
+  userId: string,
+  organizationId: string,
+): Promise<EffectivePermissions> {
+  const orgPermissionKeys = new Set<string>();
+  const teamPermissionKeys = new Set<string>();
+
+  const userOrgRoles = await em.find(
+    UserOrgRole,
+    { user: userId, organization: organizationId, isDeleted: false },
+    { populate: ['role.permissions'] },
+  );
+
+  for (const userOrgRole of userOrgRoles) {
+    if (userOrgRole.role.scope === RoleScope.ORG) {
+      for (const permission of userOrgRole.role.permissions) {
+        orgPermissionKeys.add(permission.key);
+      }
+    }
+  }
+
+  const teamMemberships = await em.find(
+    TeamMembership,
+    { user: userId, organization: organizationId, isDeleted: false },
+    { populate: ['teamMembershipRoles.role.permissions'] },
+  );
+
+  for (const membership of teamMemberships) {
+    for (const teamMembershipRole of membership.teamMembershipRoles) {
+      if (teamMembershipRole.role.scope === RoleScope.TEAM) {
+        for (const permission of teamMembershipRole.role.permissions) {
+          teamPermissionKeys.add(permission.key);
+        }
+      } else {
+        orgPermissionKeys.add(permission.key);
+      }
+    }
+  }
+
+  return {
+    orgPermissions: Array.from(orgPermissionKeys),
+    teamPermissions: Array.from(teamPermissionKeys),
+    allPermissions: Array.from(new Set([...orgPermissionKeys, ...teamPermissionKeys])),
+  };
+}
+```
+
+---
+
+## Endpoints
+
+### Organization management
+
+**`/organizations`** — `organization/organization.controller.ts` (separate module)
+
+| Method | Endpoint | Access | Description |
+| --- | --- | --- | --- |
+| POST | `/organizations` | IdentityToken | Create organization (user becomes owner) |
+| PUT | `/organizations/:id` | `system.admin` | Update organization (owner check in service) |
+| PUT | `/organizations/:id/avatar` | `system.admin` | Upload org avatar (WebP, 256x256, max 2MB) |
+| DELETE | `/organizations/:id` | Authenticated | Delete organization (owner check in service) |
+
+<Note>
+Listing user's organizations is handled by `OrganizationService.findByUser()` which is called from the auth flow, not from a dedicated organization endpoint.
+</Note>
+
+### User RBAC management
+
+**`/users`** — `user/user.controller.ts` (separate module)
+
+| Method | Endpoint | Access | Description |
+| --- | --- | --- | --- |
+| GET | `/users/:userId/permissions` | `system.admin` | Get user's effective permissions |
+| GET | `/users/:userId/teams` | `system.admin` | Get user's teams |
+| GET | `/users/:userId/team-memberships` | `system.admin` | Get user's team memberships with roles |
+| GET | `/users/:userId/team-roles` | `system.admin` | Get user's team roles |
+| POST | `/users/:userId/roles` | `system.admin` | Assign roles to user |
+| PUT | `/users/:userId/roles` | `system.admin` | Replace user's roles |
+| DELETE | `/users/:userId/roles` | `system.admin` | Remove roles from user |
+
+---
+
+## Module structure
+
+### File locations
+
+```
+src/modules/
+├── organization/           ← Tenant Boundary
+│   ├── organization.entity.ts
+│   ├── organization.service.ts
+│   ├── organization.controller.ts
+│   ├── organization.module.ts
+│   ├── organization.dto.ts
+│   └── index.ts
+│
+├── user/                   ← User Identity
+│   ├── user.entity.ts
+│   ├── user.service.ts
+│   ├── user.controller.ts   (includes RBAC endpoints: roles, permissions, teams)
+│   ├── user.module.ts
+│   ├── user.dto.ts
+│   └── index.ts
+│
+├── rbac/                   ← Authorization (Roles & Permissions)
+│   ├── rbac.module.ts
+│   ├── rbac.controller.ts   (permissions listing, reseed endpoint)
+│   ├── role-assignment-validation.service.ts  ← Validation business rules
+│   ├── role/
+│   │   ├── role.entity.ts
+│   │   ├── role.service.ts
+│   │   ├── role.controller.ts  (org role CRUD + bulk assign/remove/set)
+│   │   └── role.dto.ts
+│   ├── permission/
+│   │   ├── permission.entity.ts
+│   │   ├── permission.service.ts
+│   │   ├── permission-seeder.service.ts  ← Seeding & sync lifecycle
+│   │   ├── permission-definitions.ts     ← Permission & role config source of truth
+│   │   └── permission.dto.ts
+│   ├── team/
+│   │   ├── team.entity.ts
+│   │   ├── team.service.ts
+│   │   ├── team.controller.ts  (team CRUD, members, roles, commission payments)
+│   │   └── team.dto.ts
+│   ├── team-membership/
+│   │   ├── team-membership.entity.ts
+│   │   ├── team-membership.service.ts
+│   │   └── team-membership.dto.ts
+│   ├── user-org-role/      ← Explicit junction
+│   │   ├── user-org-role.entity.ts
+│   │   └── user-org-role.dto.ts
+│   ├── team-membership-role/ ← Explicit junction
+│   │   ├── team-membership-role.entity.ts
+│   │   └── team-membership-role.dto.ts
+│   └── invitation/
+│       ├── invitation.entity.ts
+│       ├── invitation.service.ts
+│       ├── invitation.controller.ts  (accept/reject for new + existing users)
+│       └── invitation.dto.ts
+│
+├── shared/                 ← Shared enums & helpers
+│   ├── permission-key.enum.ts   (OrgPermissionKey, TeamPermissionKey)
+│   └── system-role.enum.ts      (SystemOrgRole, SystemTeamRole)
+│
+└── auth/                   ← Authentication
+    ├── auth.service.ts
+    └── provisioning.service.ts
+```
+
+### Module dependency graph
+
+```
+OrganizationModule (independent tenant boundary)
+       ↓
+   UserModule (depends on Organization)
+       ↓
+   AuthModule (depends on User + Organization)
+       ↓
+   RbacModule (depends on Auth + Organization)
+       ↓
+   CrmModule (depends on RBAC + Organization)
+```
+
+- **Organization is a peer, not a child** — conceptually at the same level as User, not nested within RBAC
+- **RBAC depends on Organization** — RBAC imports `OrganizationModule`, not vice versa
+- **Tenant boundary** — Organization defines the multi-tenancy boundary; all tenant-scoped entities reference it
+
+### Import patterns
+
+```typescript typescript
+import { Organization } from '@modules/organization/organization.entity';
+import { OrganizationDto } from '@modules/organization/organization.dto';
+
+// Within RBAC module
+import { Organization } from '../../organization/organization.entity';
+```
+
+### API organization
+
+**Organization endpoints:**
+- Tag: `Organizations`
+- Base Path: `/organizations`
+- Module: `OrganizationModule`
+
+**RBAC endpoints:**
+- Tags: `RBAC`, `Roles`, `Teams`, `Invitations`
+- Base Paths: `/rbac`, `/roles`, `/teams`, `/invitations`
+- Module: `RbacModule`
+
+**User RBAC endpoints:**
+- Tag: `Users`
+- Base Path: `/users/:userId/roles`, `/users/:userId/permissions`, `/users/:userId/teams`
+- Module: `UserModule`
+
+### User-centric API design
+
+The system follows a **user-centric API design philosophy**:
+
+1. **Default scope = user's data** — All default endpoints return only data the current user has access to
+2. **Security by default** — Users cannot accidentally access data outside their scope
+3. **Explicit admin access** — Administrative/global endpoints are separate (under `/admin` routes)
+4. **Least privilege** — Users only see what they need, admins explicitly request broader access
+
+```typescript typescript
+// ✅ User-centric default
+GET /organizations      → User's organizations only
+GET /leads             → User's leads only (or team's based on permissions)
+GET /deals             → User's deals only
+
+// ✅ Admin endpoints (separate controller)
+GET /admin/organizations → All organizations (requires permission)
+GET /admin/leads         → All leads (requires permission)
+GET /admin/deals         → All deals (requires permission)
+```
+
+**Benefits:**
+
+- **Security** — Reduces risk of data leakage
+- **Performance** — Smaller result sets by default
+- **UX** — Users see only relevant data
+- **RBAC alignment** — Matches RLS and permission model
+- **API clarity** — Clear distinction between user and admin access
+
+**Implementation notes:**
+
+- User context is always available via `@GetCurrentUser()` decorator
+- Admin endpoints require explicit permission checks
+- Services receive user context for access control
+- RLS automatically filters queries to user's organization
+
+---
+
+## Entity relationship diagram
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         RBAC SYSTEM                              │
+└──────────────────────────────────────────────────────────────────┘
+
+        ┌──────────────┐
+        │     USER     │
+        │ • email      │
+        │ • password   │
+        └──────┬───────┘
+               │
+               │ 1:N
+               ▼
+        ┌──────────────┐         ┌──────────────┐
+        │ UserOrgRole  │◄────────┤     ROLE     │
+        │ • user_id    │   N:1   │ • name       │
+        │ • role_id    │         │ • scope      │
+        │ • org_id     │         │ • is_system  │
+        │ • assigned_by│         │ • org_id     │
+        └──────┬───────┘         │ • team_id    │
+               │                 └──────┬───────┘
+               │ N:1                    │
+               ▼                        │ N:M
+        ┌──────────────┐                │
+        │ ORGANIZATION │                │
+        │ • name       │                │
+        │ • owner_id   │                ▼
+        └──────┬───────┘         ┌──────────────┐
+               │                 │ PERMISSION   │
+               │ 1:N             │ • key        │
+               ▼                 │ • scope      │
+        ┌──────────────┐         │ • group      │
+        │     TEAM     │         └──────────────┘
+        │ • name       │
+        │ • org_id     │
+        └──────┬───────┘
+               │
+               │ 1:N
+               ▼
+        ┌──────────────┐
+        │    Team      │
+        │  Membership  │
+        │ • user_id    │
+        │ • team_id    │
+        │ • org_id     │
+        └──────┬───────┘
+               │
+               │ 1:N
+               ▼
+        ┌──────────────┐         ┌──────────────┐
+        │TeamMembership│◄────────┤     ROLE     │
+        │    Role      │   N:1   │ (team scope) │
+        │ • membership │         └──────────────┘
+        │ • role_id    │
+        │ • org_id     │
+        │ • assigned_by│
+        └──────────────┘
+```
+
+---
+
+<CardGroup cols={3}>
+<Card title="Permissions" icon="key" href="/backend/rbac/permissions">
+  Permission entity, scopes, flags, and the complete registry.
+</Card>
+<Card title="Roles" icon="user-tag" href="/backend/rbac/roles">
+  System and custom roles, seeding, and organization provisioning.
+</Card>
+<Card title="Teams" icon="users" href="/backend/rbac/teams">
+  Team structure, membership, and available permissions.
+</Card>
+<Card title="Junction tables" icon="table" href="/backend/rbac/junction-tables">
+  UserOrgRole, TeamMembershipRole, RLS integration, and query patterns.
+</Card>
+<Card title="Invitations" icon="envelope" href="/backend/rbac/invitations">
+  Invitation system with pre-configured RBAC assignments.
+</Card>
+<Card title="Access control" icon="shield" href="/backend/rbac/access-control/overview">
+  Endpoint protection with `@CheckAccess` and resource permissions.
+</Card>
+</CardGroup>

@@ -1,0 +1,259 @@
+---
+title: "Overview"
+description: "How tenant isolation works with PostgreSQL Row-Level Security, transaction-first design, audit triggers, and the Organization boundary."
+---
+
+We use **PostgreSQL Row-Level Security (RLS)** for tenant data isolation. The **Organization entity** (located at `/modules/organization/`) serves as the **tenant boundary**. The architecture uses **explicit transactions** with **`SET LOCAL`** to guarantee tenant isolation with connection pooling.
+
+<Note>
+Organization is a top-level module (peer to User), not part of RBAC. It represents the tenant boundary for multi-tenancy and is referenced by all tenant-scoped entities.
+</Note>
+
+## Architecture principles
+
+### 1. Transaction-first design
+
+Every tenant-scoped operation runs inside an explicit transaction:
+
+```typescript typescript
+await tenantContext.executeInOrg(organizationId, async (em) => {
+  const lead = await em.findOne(Lead, id);
+  lead.status = 'qualified';
+  await em.flush();
+});
+```
+
+### 2. SET LOCAL only
+
+Only `SET LOCAL` inside transactions — context is automatically cleared on COMMIT/ROLLBACK:
+
+```sql sql
+BEGIN;
+SET LOCAL app.organization_id = 'uuid';
+SET LOCAL app.user_id = 'uuid';
+SET LOCAL app.bypass_rls = 'false';
+-- All queries here see this context
+-- Context automatically cleared on COMMIT/ROLLBACK
+COMMIT;
+```
+
+### 3. Database-level audit triggers
+
+Audit logging happens via PostgreSQL triggers, not application code:
+
+- **Atomic**: Same transaction as the data change
+- **Automatic**: Can't forget to audit
+- **Complete**: Captures all changes, even raw SQL
+- **Performant**: No extra round-trips
+
+### 4. No middleware/interceptor RLS logic
+
+Context is managed explicitly via the `TenantContext` service. There are no middleware or interceptors involved in RLS context management.
+
+---
+
+## RLS policies
+
+CASE-based policies that handle all scenarios:
+
+```sql sql
+CREATE POLICY "tenant_isolation" ON leads FOR ALL USING (
+  CASE
+    WHEN current_setting('app.bypass_rls', true) = 'true' THEN true
+    WHEN current_setting('app.organization_id', true) = '' THEN false
+    WHEN current_setting('app.organization_id', true) IS NULL THEN false
+    ELSE organization_id = current_setting('app.organization_id', true)::uuid
+  END
+);
+```
+
+---
+
+## Table configuration
+
+### No RLS (global/cross-tenant)
+
+| Table | Reason |
+| --- | --- |
+| user | Users belong to multiple orgs |
+| permission | Global permission registry |
+| role | System roles are global (org-specific have org_id but filtered in app) |
+| organization | Tenant table itself |
+
+### RLS enabled (tenant-scoped)
+
+All tables with `organization_id NOT NULL`:
+
+- CRM: person, lead, contact, company, deal, etc.
+- RBAC: team, team_membership, user_org_roles, team_membership_roles, etc.
+- Communication: activity, call_log, email_log, etc.
+- Real Estate: area, development, unit, etc.
+- Audit: audit_log
+
+---
+
+## Audit triggers
+
+Database triggers that automatically log changes:
+
+```sql sql
+CREATE TRIGGER audit_lead_changes
+AFTER INSERT OR UPDATE OR DELETE ON lead
+FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();
+```
+
+The trigger function is `SECURITY DEFINER` so it bypasses RLS for audit writes while reads remain tenant-isolated.
+
+### Audit log special handling
+
+The audit_log table has RLS but audit triggers bypass it:
+
+```sql sql
+CREATE OR REPLACE FUNCTION audit_trigger_func()
+RETURNS TRIGGER
+SECURITY DEFINER  -- Runs as table owner, bypasses RLS
+AS $$ ... $$;
+```
+
+This ensures:
+
+- Audit writes always succeed
+- Audit reads respect tenant isolation
+- No application code needed for audit writes
+
+---
+
+## Error handling
+
+### Transaction rollback
+
+If any operation fails, the entire transaction rolls back:
+
+```typescript typescript
+await tenantContext.executeInOrg(orgId, async (em) => {
+  await em.findOne(Lead, id); // Works
+  throw new Error('Something failed'); // Transaction rolls back
+  // SET LOCAL context is automatically cleared
+});
+```
+
+### No connection pool pollution
+
+Because we use `SET LOCAL`:
+
+- Context only exists within the transaction
+- On commit/rollback, context is automatically cleared
+- Connection returns to pool in clean state
+- No cleanup interceptor needed
+
+---
+
+## Organization as the tenant boundary
+
+### Module structure
+
+The **Organization module** is at `/modules/organization/` as a top-level module, separate from RBAC:
+
+```
+src/modules/
+├── organization/           ← Tenant Boundary
+│   ├── organization.entity.ts
+│   ├── organization.service.ts
+│   ├── organization.controller.ts
+│   └── organization.module.ts
+├── user/                   ← User Identity
+├── rbac/                   ← Authorization
+└── crm/                    ← Business Logic
+```
+
+### Organization's role in multi-tenancy
+
+1. **Tenant isolation**: All tenant-scoped entities have `organization_id` foreign key
+2. **RLS context**: The `organization_id` is used to set PostgreSQL RLS context
+3. **Access control**: Combined with RBAC to determine what users can see/do
+4. **Data partitioning**: Organization boundaries enforce strict data separation
+
+### Tenant-scoped entity pattern
+
+All entities that belong to an organization should:
+
+1. Have `organization` field as ManyToOne relationship
+2. Include `organization_id` in RLS policies
+3. Filter by organization in queries (automatic with RLS)
+
+```typescript typescript
+import { Organization } from '@modules/organization/organization.entity';
+
+@Entity()
+export class Lead {
+  @ManyToOne(() => Organization)
+  organization!: Organization;
+
+  // ... other fields
+}
+```
+
+---
+
+## Performance considerations
+
+### Transaction overhead
+
+There is overhead for explicit transactions. Mitigations:
+
+1. **Read-only shortcut**: Use `executeReadOnly` for queries that don't need writes
+2. **Batch operations**: Multiple operations in one transaction
+3. **Connection pooling**: Still fully utilized
+
+### Audit trigger performance
+
+Triggers add ~1-2ms per write. Acceptable for:
+
+- Data integrity guarantee
+- Compliance requirements
+- Debugging capability
+
+---
+
+## Files reference
+
+| File | Purpose |
+| --- | --- |
+| `src/common/tenant/tenant-context.service.ts` | TenantContext service |
+| `src/common/tenant/tenant-context.module.ts` | Global module definition |
+| `src/common/tenant/index.ts` | Barrel exports (TenantContext, TenantContextInfo, TenantContextModule) |
+| `src/decorators/rls.decorator.ts` | `@PublicEndpoint()` and `@IdentityTokenOnly()` decorators |
+| `src/modules/auth/auth.guard.ts` | AuthGuard (validates tenant tokens, loads RBAC) |
+| `src/modules/auth/guards/identity-token.guard.ts` | IdentityTokenGuard (validates identity tokens) |
+| `src/common/guards/either-auth.guard.ts` | EitherAuthGuard (accepts CRM or developer tokens) |
+| `src/modules/auth/auth.service.ts` | Token issuance (identity, tenant, refresh) |
+
+---
+
+## Summary
+
+| Aspect | Implementation |
+| --- | --- |
+| **Tenant boundary** | Organization entity (`/modules/organization/`) |
+| **Isolation mechanism** | PostgreSQL RLS policies |
+| **Context service** | TenantContext |
+| **Transaction model** | Explicit transactions with SET LOCAL |
+| **Auth tokens** | Identity token (user) + Tenant token (user+org) |
+| **Auth guards** | AuthGuard, IdentityTokenGuard, EitherAuthGuard |
+| **Audit logging** | Database triggers (automatic, atomic) |
+| **Public endpoints** | `@PublicEndpoint()` + `executeWithBypass()` |
+| **Pre-org endpoints** | `@IdentityTokenOnly()` + `IdentityTokenGuard` |
+| **WebSocket handlers** | `executeInOrg()` per message |
+| **Cron jobs** | `executeWithBypass()` or `executeForEachOrg()` |
+| **Session integration** | Sessions created per-org on tenant token issuance (see [session system](/backend/session-system)) |
+
+---
+
+<CardGroup cols={2}>
+<Card title="Authentication" icon="key" href="/backend/multi-tenancy/authentication">
+  Two-token system, auth guards, request flow, and decorators.
+</Card>
+<Card title="TenantContext patterns" icon="code" href="/backend/multi-tenancy/tenant-context">
+  TenantContext API, code patterns, special cases, and anti-patterns.
+</Card>
+</CardGroup>
