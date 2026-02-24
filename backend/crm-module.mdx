@@ -134,6 +134,41 @@ person_not_duplicate
 
 The relationship is symmetric — if (A, B) is marked as not-duplicate, (B, A) is treated equivalently. Each organization maintains its own override decisions.
 
+### Person merge system
+
+Consolidates duplicate persons into a single primary record, reassigning all related data.
+
+**API endpoint:** `POST /persons/:primaryPersonId/merge`
+
+<Steps>
+<Step title="Validation">
+Verify the primary person and all secondary persons exist, are not deleted, and belong to the same organization.
+</Step>
+<Step title="Field selection">
+Accept `fieldSelections: Record<string, string>` (e.g., `{ "firstName": "primary", "lastName": "person-B-id" }`). For each field, pick the value from the specified source person. Fields not listed default to the primary person's values.
+</Step>
+<Step title="Contact info merge (opt-in per type)">
+Three boolean flags control which contact info is reassigned from secondary persons to the primary:
+
+- `mergeAllEmails` — reassign all secondary emails (`isPrimary` reset to `false`)
+- `mergeAllPhones` — reassign all secondary phones (`isPrimary` reset to `false`)
+- `mergeAllAddresses` — reassign all secondary addresses (`isPrimary` reset to `false`)
+</Step>
+<Step title="Channel merge (always)">
+All channels from secondary persons are reassigned to the primary person (`isPrimary` reset to `false`). This is not optional since channels represent unique identities.
+</Step>
+<Step title="Lead and ownership reassignment">
+All leads pointing to secondary persons are bulk-reassigned to the primary person via `nativeUpdate`. All `InventoryUnitOwnership` records are similarly reassigned.
+</Step>
+<Step title="Mark secondaries">
+Each secondary person is marked with `mergedIntoId`, `mergedAt`, `mergedBy`, and soft-deleted (`isDeleted = true`).
+</Step>
+</Steps>
+
+<Warning>
+Merge is **irreversible** — secondary persons are soft-deleted. Contact entities are NOT directly reassigned; since Contact has a `OneToOne` to Person, the primary person retains its contact if one exists.
+</Warning>
+
 ### Lead and contact import services
 
 The CRM includes import functionality for bulk data ingestion:
@@ -173,6 +208,26 @@ Lead
 - Stage changes recorded in `lead_stage_history`
 - `leadSource` and `sourceDetail` track lead origin separately from Person's `originalSource`
 - `temperature` (cold/warm/hot) complements numeric `score`
+
+**Lead creation behavior:**
+
+<AccordionGroup>
+<Accordion title="Person resolution">
+If `personId` is provided, the system uses that existing person. Otherwise it searches by email/phone via `PersonService.findOrCreatePerson`, or creates a new person (requires at least `firstName`).
+</Accordion>
+<Accordion title="Deduplication">
+If both `referenceId` and `leadSource` are provided, the system checks for an existing lead with the same combination to prevent duplicate imports from external sources (e.g., Bayut, PropertyFinder). A unique DB constraint (error code 23505) catches race conditions.
+</Accordion>
+<Accordion title="Stage assignment">
+New leads are assigned to the "New" stage by default. A custom `stageId` can override this.
+</Accordion>
+<Accordion title="Stakeholder assignment">
+If `assignedUserId` is provided, a primary stakeholder is created with 100% commission. If `teamId` is also provided, the stakeholder is linked to that team. If no `assignedUserId`, the lead goes to the Pool (no stakeholders = unassigned).
+</Accordion>
+<Accordion title="Property interests">
+Optional property interests can be attached at creation. At least one must be marked `isPrimary`. If none is marked primary, the first one is auto-set as primary.
+</Accordion>
+</AccordionGroup>
 
 ### Contact (CRM business record)
 
@@ -284,10 +339,23 @@ Deal
 - Closure uses `isClosed` (boolean) + `isWon` (boolean) + `closedAt` (date) + `closedBy` (user)
 - `commissionRate` stored on deal (default 2%); `totalCommission` calculated on close as `value × (commissionRate / 100)`
 
+**Deal creation behavior:**
+
+- **Contact required** — Deals require a Contact (not a Person directly). Deals are for converted contacts only.
+- **Archived entities block creation** — Cannot create a deal from an archived Lead or with an archived Contact.
+- **Duplicate prevention** — Checks for an existing deal with the same `lead + title + value` or `contact + title + value`. A unique DB constraint catches race conditions.
+- **DealContact** — A primary `DealContact` record is created with `role = BUYER` by default.
+- **Stakeholder inheritance** — If the deal originates from a lead, all lead stakeholders are inherited. If no lead, a primary stakeholder is created for the assigned user with 100% commission.
+
+**Deal update behavior:**
+
+- Cannot update an archived deal or a deal in team pool (team-only primary, no user).
+- If `assignedToId` is provided and the user is not already a stakeholder, a new primary stakeholder is created with 100% commission.
+
 **Property interest rules (1:1 relationship):**
 
 - One deal = one property = one transaction. If a client buys multiple units, create multiple deals.
-- If created from lead: copy `LeadPropertyInterest` → `DealPropertyInterest` using explicit selection (`propertyInterestId`) or auto-selection (primary/first non-deleted).
+- If created from lead: copy `LeadPropertyInterest` → `DealPropertyInterest` using explicit selection (`propertyInterestId`) or auto-selection (**primary** interest first, then **first non-deleted** as fallback).
 - If created directly (walk-in): create `DealPropertyInterest` with no originating interest.
 - If a lead has multiple property interests, create separate deals (one per interest).
 
@@ -467,6 +535,10 @@ commission_payment
 <Note>
 Either `user_id` OR `team_id` must be set (validated in service). If a team stakeholder has remaining `commissionPercentage > 0` when a deal closes, the commission is paid to the **team**, representing unallocated budget.
 </Note>
+
+<Warning>
+**Recipient-only approval:** Only the payment recipient (the user whose `user_id` matches the payment) can approve their own `PENDING → APPROVED` transition. Other status transitions are not restricted to the recipient.
+</Warning>
 
 **Status transitions:**
 
@@ -868,6 +940,51 @@ get isContacted(): boolean { return this.systemType === SystemLeadStageType.CONT
 - Custom stages can only be placed between CONTACTED and QUALIFIED
 - Organizations can rename system stages but cannot delete them
 
+#### Terminal stage behaviors
+
+When a lead's stage changes, the service checks the new stage's `systemType` and triggers side effects:
+
+<Tabs>
+<Tab title="Conversion">
+When a lead moves to the **Converted** stage (`isConverted = true`) and `convertedAt` is not already set:
+
+1. Check if a Contact already exists for `lead.person` in this organization
+2. If the Contact exists but is **archived**, auto-unarchive it (clear `isArchived`, `archivedAt`, `archivedBy`)
+3. If no Contact exists, create one with `customerSince = NOW()` and `customerType = 'lead_conversion'`
+4. Set `lead.convertedAt = NOW()`
+
+<Note>
+The idempotency check prevents duplicate contacts when a lead is moved to Converted multiple times or when the person already has a contact from a different lead. If the existing Contact is archived, the system auto-unarchives it rather than blocking conversion.
+</Note>
+</Tab>
+<Tab title="Disqualification">
+When a lead moves to the **Disqualified** stage (`isDisqualified = true`) and `disqualifiedAt` is not already set:
+
+- Set `lead.disqualifiedAt = NOW()`
+- If `stageChangeReason` is provided, store it in `lead.disqualificationNotes`
+
+Setting `disqualificationReason` directly on the update DTO (without a stage change) also triggers `disqualifiedAt = NOW()` if it was previously null.
+</Tab>
+<Tab title="Auto-requalify">
+When a lead moves **out of** a disqualified stage to any non-disqualified stage, and `disqualifiedAt` is set:
+
+- Clear `lead.disqualifiedAt`
+- Clear `lead.disqualificationReason`
+- Clear `lead.disqualificationNotes`
+
+This ensures that returning a lead to the pipeline automatically clears all disqualification data. No manual reset is needed.
+</Tab>
+</Tabs>
+
+#### Stage change reason (`stageChangeReason`)
+
+Both lead and deal update DTOs accept an optional `stageChangeReason` field. When a stage transition occurs:
+
+1. The reason is stored as `notes` in the `lead_stage_history` / `deal_stage_history` record
+2. For lead disqualification specifically, the reason is also stored in `lead.disqualificationNotes`
+
+This enables audit trails and analytics on why stage transitions occurred.
+
 ### Deal stage system
 
 Deal stages also use a `systemType` enum. There are 5 system stages:
@@ -893,6 +1010,66 @@ get isTerminal(): boolean { return this.isClosedWon || this.isClosedLost; }
 - System stages maintain relative order: NEW < PROPOSAL < NEGOTIATION < CLOSED_WON < CLOSED_LOST
 - Custom stages can only be placed between NEGOTIATION and CLOSED_WON
 - Organizations can rename system stages but cannot delete them
+
+#### Terminal stage behaviors
+
+When a deal's stage changes, the service checks the new stage's `systemType` and triggers side effects:
+
+<Tabs>
+<Tab title="Closing">
+When a deal moves to a **terminal stage** (`isTerminal = true`):
+
+1. Set `deal.isClosed = true`, `deal.isWon = newStage.isClosedWon`
+2. Set `deal.closedAt = NOW()`, `deal.closedBy = currentUser`
+3. If `isClosedWon`: calculate `deal.totalCommission = deal.value × (deal.commissionRate / 100)` and create `commission_payment` records for each deal stakeholder
+</Tab>
+<Tab title="Reopening">
+When a deal moves from a **terminal** stage back to a **non-terminal** stage:
+
+1. Cancel all non-PAID commission payments (`PENDING` or `APPROVED` → `CANCELLED`)
+2. If any payments are already `PAID`, throw an error — the deal cannot be reopened
+3. Clear all closure fields: `isClosed = false`, `isWon = false`, `closedAt`, `closedBy`, `totalCommission`
+
+<Warning>
+Reopening a deal fully reverses the closure. If any commission payments have already been marked as PAID, the reopen is blocked because the financial transaction cannot be reversed from within the CRM.
+</Warning>
+</Tab>
+</Tabs>
+
+### Two-tier stage architecture
+
+Both lead and deal stages use a global-plus-override architecture:
+
+1. **Global stages** (`organization = NULL`) — System-defined stages shared across all organizations, seeded on startup.
+2. **Organization-specific stages** (`organization = org_id`) — Custom stages created by the org, or overrides of global stages (e.g., changing the color of "New").
+
+**Lookup priority:** Organization-specific → Global. When resolving a stage by `systemType`, the service checks org-specific first, then falls back to global.
+
+<Tabs>
+<Tab title="Update rules">
+| Stage type | Name | Color | Order |
+| --- | --- | --- | --- |
+| Global (`org = NULL`) | Cannot modify directly | Cannot modify directly | Cannot modify directly |
+| System override (org stage with `systemType`) | Cannot change | Can change | Cannot change |
+| Custom stage (no `systemType`) | Can change | Can change | Via reorder API |
+
+<Note>
+Updating a global stage auto-creates an org-specific override instead of modifying the global record (lead stages). Deal stages throw an error suggesting the user create an override.
+</Note>
+</Tab>
+<Tab title="Deletion rules">
+- **Global system stages** — Cannot be deleted
+- **Organization system overrides** — Cannot be deleted
+- **Custom stages with active leads/deals** — Cannot be deleted until entities are moved to another stage
+- **Custom stages with no active entities** — Can be deleted
+</Tab>
+<Tab title="Reordering">
+- All visible stages must be included in the reorder operation
+- System stages act as **anchor points** with canonical order values (1000, 2000, 3000, ...)
+- Custom stages receive interpolated order values between surrounding anchors
+- All ordering constraints are validated before applying (e.g., NEW before CONTACTED)
+</Tab>
+</Tabs>
 
 ### History design principle
 
@@ -1462,8 +1639,23 @@ Person now has: Lead (converted) + Contact + Deal. A new inquiry creates a new L
 </Step>
 </Steps>
 
+---
+
+## Data consistency guarantees
+
+The CRM module enforces several invariants across all operations:
+
+| Guarantee | Mechanism | Details |
+| --- | --- | --- |
+| Transactional writes | `TenantContext.executeInOrg()` | Every write runs in a database transaction. Any failure rolls back the entire operation. |
+| Soft-delete everywhere | `isDeleted` flag | No entity is hard-deleted. All deletions set `isDeleted = true`. |
+| Unique DB constraints | PostgreSQL unique indexes | Race conditions are caught by database-level constraints (stakeholder uniqueness, transfer uniqueness, lead deduplication). Error code 23505 is handled gracefully. |
+| Commission invariant | `Math.abs(total - 100) > 0.01` | Commission percentages must sum to exactly 0% or 100% with 0.01% floating-point tolerance. Enforced on every stakeholder mutation. |
+| Primary invariant | Pre-delete + post-create checks | At least one `isPrimary = true` stakeholder must exist when stakeholders are present. Observers (0% commission) cannot be primary. |
+| Cascade cleanup | Archive/delete side effects | Archiving cancels pending transfers. Soft-deleting cascades to all child records. Deal `originatingLead` references are set to NULL on lead deletion. |
+
 <CardGroup cols={2}>
-<Card title="Stakeholder API" icon="users" href="/backend/stakeholder-api">
+<Card title="Stakeholder system" icon="users" href="/backend/stakeholder-system">
   Assignment, transfer, and commission management endpoints.
 </Card>
 <Card title="Entity views" icon="columns-3" href="/backend/entity-views">
