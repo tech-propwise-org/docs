@@ -1,0 +1,284 @@
+---
+title: "Stakeholder data model"
+description: "Table schemas for entity_stakeholder, stakeholder history, and commission payments — dual-record model, access levels, inheritance tracking, and commission calculation."
+---
+
+This page documents the **data model** behind stakeholder assignment and commission. For API endpoints and operational details, see the [stakeholder API reference](/backend/stakeholder-api).
+
+## entity_stakeholder
+
+```
+entity_stakeholder
+├── entity_type (lead | deal)
+├── entity_id
+├── user_id → User (nullable — null for team-only stakeholders)
+├── team_id → Team (nullable)
+├── is_primary (only one per entity)
+├── access_level (READ | WRITE | FULL, default: READ)
+├── Commission:
+│   ├── commission_percentage (e.g., 50.00%)
+│   └── original_team_commission (nullable — records team allocation at time of claim)
+├── Inheritance tracking:
+│   ├── inherited_from_stakeholder_id (nullable)
+│   └── inherited_from_lead_id (nullable)
+├── assigned_at, assigned_by_id
+├── notes
+```
+
+### Access levels
+
+| Level | Description                  | Typical use                         |
+| ----- | ---------------------------- | ----------------------------------- |
+| READ  | View only                    | Observers, auto-synced stakeholders |
+| WRITE | View and edit                | Collaborating agents                |
+| FULL  | View, edit, delete, transfer | Primary owner, managers             |
+
+<Note>
+  Primary stakeholders default to FULL access unless explicitly specified. Only
+  one stakeholder can have `is_primary = true` per entity.
+</Note>
+
+---
+
+## Dual-record model
+
+A user can hold **multiple** stakeholder rows on the same entity with different team contexts:
+
+- One row with `team_id = NULL` (personal/global-pool stake)
+- One row per team they claim from (e.g., `team_id = Team A`)
+
+The unique index `uq_stakeholder_user_team_entity` enforces `(entity_type, entity_id, user_id, team_id)`. PostgreSQL treats NULLs as distinct, so `(lead-1, ahmed, NULL)` and `(lead-1, ahmed, team-A)` are both allowed.
+
+At commission payment time, aggregate all rows per user: `SUM(commissionPercentage) WHERE userId = X AND entityId = Y`.
+
+**Primary handling with dual records:**
+
+- Claiming from a team pool while holding a personal stake: personal stake demoted to `isPrimary=false`, new team-scoped claim becomes primary.
+- Team-scoped stakeholder removed and user has a personal stake: personal stake auto-promoted to `isPrimary=true`.
+- Access control resolves the **highest** `accessLevel` across all of a user's stakeholder rows.
+
+---
+
+## entity_stakeholder_history
+
+Tracks COMPLETED stakeholder assignment states. History records represent what a stakeholder **was** (completed states), not what they changed from/to. The current state lives on `EntityStakeholder`.
+
+```
+entity_stakeholder_history (completed states only)
+├── entity_type, entity_id
+├── stakeholder_id (the stakeholder record)
+├── user_id (nullable), team_id
+├── COMPLETED STATE (what they WERE):
+│   ├── commission_percentage
+│   ├── is_primary
+│   └── access_level (READ | WRITE | FULL)
+├── Duration tracking:
+│   ├── started_at (when this state began)
+│   └── duration_seconds (calculated: created_at - started_at)
+├── What ended this state:
+│   ├── action (commission_changed | removed | transferred | inherited | primary_changed)
+│   ├── transfer_id (if from transfer)
+│   └── transferred_to_user_id (if transferred)
+├── notes
+├── performed_by_id, created_at (also = when state ended)
+```
+
+**When to record:**
+
+- Commission change → record the OLD commission state, then update stakeholder
+- Primary change → record the OLD primary state, then update stakeholder
+- Removal → record final state with action: `removed`
+- Transfer → record OLD owner state with action: `transferred`, `transfer_id`, `transferred_to_user_id`
+
+<Accordion title="Worked example: stakeholder history flow">
+```
+User A assigned as primary (50%) at T1:
+  - EntityStakeholder: { user: A, commission: 50%, isPrimary: true, accessLevel: FULL, assignedAt: T1 }
+  - History: (empty — no history for new assignments)
+
+User A's commission changes to 30% at T2:
+
+1. CREATE history: { user: A, commission: 50%, isPrimary: true, accessLevel: FULL,
+   startedAt: T1, durationSeconds: T2-T1, action: COMMISSION_CHANGED }
+2. UPDATE stakeholder: { commission: 30% }
+
+User A is removed at T3:
+
+1. CREATE history: { user: A, commission: 30%, isPrimary: false, accessLevel: FULL,
+   startedAt: T2, durationSeconds: T3-T2, action: REMOVED }
+2. Soft-delete stakeholder
+
+```
+</Accordion>
+
+---
+
+## commission_payment
+
+Tracks actual commission payments when deals close.
+
+```
+
+commission_payment
+├── deal_id → Deal
+├── stakeholder_id → entity_stakeholder
+├── user_id → User (nullable — null for team-only payments)
+├── team_id → Team (nullable — set for team-only payments)
+├── percentage (commission percentage snapshot at close)
+├── base_amount (total commission pool: deal.value × deal.commissionRate / 100)
+├── amount (calculated: base_amount × percentage / 100)
+├── currency (default: USD)
+├── status (pending, approved, paid, cancelled, on_hold)
+├── expected_payment_date
+├── payment_method, payment_reference
+├── paid_at
+├── approved_by, approved_at
+├── notes
+
+````
+
+<Note>
+Either `user_id` OR `team_id` must be set (validated in service). If a team stakeholder has remaining `commissionPercentage > 0` when a deal closes, the commission is paid to the **team**, representing unallocated budget.
+</Note>
+
+<Warning>
+**Recipient-only approval:** Only the payment recipient (the user whose `user_id` matches the payment) can approve their own `PENDING → APPROVED` transition. Other status transitions are not restricted to the recipient.
+</Warning>
+
+### Status transitions
+
+| From | Allowed transitions |
+| --- | --- |
+| PENDING | APPROVED, ON_HOLD, CANCELLED |
+| APPROVED | PAID, ON_HOLD, CANCELLED |
+| ON_HOLD | PENDING, CANCELLED |
+| PAID | (final — cannot change) |
+| CANCELLED | (final — cannot change) |
+
+### Commission calculation
+
+```typescript
+function calculateCommissions(deal: Deal) {
+  const totalCommission = deal.value * (deal.commissionRate / 100);
+
+  const stakeholders = await getStakeholders('deal', deal.id);
+
+  for (const stakeholder of stakeholders) {
+    await createCommissionPayment({
+      dealId: deal.id,
+      stakeholderId: stakeholder.id,
+      user: stakeholder.user?.id,
+      team: stakeholder.team?.id,
+      percentage: stakeholder.commissionPercentage,
+      baseAmount: totalCommission,
+      amount: totalCommission * (stakeholder.commissionPercentage / 100),
+      status: 'pending',
+    });
+  }
+}
+````
+
+If a team stakeholder has unallocated budget (e.g., team has 30% remaining), the commission payment targets the team, not any individual user. This allows organizations to handle team-level commission distribution outside the CRM.
+
+<Accordion title="Worked example: deal closure with $1,000,000 deal">
+```
+Deal #1 moves to closedWon stage:
+├── isClosed = true, isWon = true, closedAt = NOW()
+├── value: $1,000,000
+├── commissionRate: 2% (stored on deal)
+└── totalCommission: $20,000 (calculated)
+
+Stakeholders:
+├── Agent A: 30% → $6,000
+└── Agent B: 70% → $14,000
+
+INSERT INTO commission_payment:
+
+Record 1:
+├── stakeholder_id: Agent A's stakeholder
+├── percentage: 30%
+├── base_amount: $20,000 (the commission pool)
+├── amount: $6,000
+└── status: 'pending'
+
+Record 2:
+├── stakeholder_id: Agent B's stakeholder
+├── percentage: 70%
+├── base_amount: $20,000
+├── amount: $14,000
+└── status: 'pending'
+
+````
+</Accordion>
+
+<Warning>
+When a deal is reopened (terminal → non-terminal stage), all non-PAID commission payments are cancelled (`PENDING` or `APPROVED` → `CANCELLED`). If any payments are already `PAID`, the reopen is blocked.
+</Warning>
+
+---
+
+## Core invariants
+
+These are the foundational data constraints. For per-operation validation rules and transfer-specific rules, see the [stakeholder API reference](/backend/stakeholder-api#business-rules).
+
+| Rule | Description |
+| --- | --- |
+| One primary | Only one stakeholder can have `is_primary=true` per entity |
+| Primary required | At least one primary stakeholder must exist at all times |
+| Commission total | Must sum to exactly 100% (or 0%); strictly enforced on batch update |
+| Observer cannot be primary | Stakeholders with 0% commission cannot be set as `isPrimary=true` |
+| Primary guard | Cannot remove primary stakeholder while others exist |
+| Redistribution on remove | Remaining commissions proportionally scaled: `newPct = oldPct × (100 / sumOfRemainingPcts)` |
+| Permissions only | Stakeholder management requires explicit RBAC permissions, not entity access |
+
+---
+
+## Query patterns
+
+### Assignment queries
+
+| Entity | How to get assignment |
+| --- | --- |
+| **Lead** | `SELECT * FROM entity_stakeholder WHERE entity_type='lead' AND entity_id=:lead_id` |
+| **Deal** | `SELECT * FROM entity_stakeholder WHERE entity_type='deal' AND entity_id=:deal_id` |
+| **Contact** | Via Person's leads: `JOIN lead ON l.person_id = :person_id` then join `entity_stakeholder` |
+| **Person** | No direct assignment — visibility derived from leads |
+
+### Full stakeholder query
+
+```sql
+SELECT es.*, u.name as user_name, t.name as team_name
+FROM entity_stakeholder es
+JOIN user u ON es.user_id = u.id
+LEFT JOIN team t ON es.team_id = t.id
+WHERE es.entity_type = :type AND es.entity_id = :id AND es.is_deleted = false
+ORDER BY es.is_primary DESC, es.commission_percentage DESC;
+````
+
+### Permission-aware lead visibility
+
+```sql
+SELECT l.* FROM lead l
+WHERE EXISTS (
+  SELECT 1 FROM entity_stakeholder es
+  WHERE es.entity_type = 'lead' AND es.entity_id = l.id
+    AND es.user_id = :user_id AND es.is_deleted = false
+) AND l.is_deleted = false AND l.is_archived = false;
+```
+
+<CardGroup cols={2}>
+  <Card
+    title="Stakeholder API reference"
+    icon="arrows-rotate"
+    href="/backend/stakeholder-api"
+  >
+    API endpoints, sync service, and detailed stakeholder operations.
+  </Card>
+  <Card
+    title="Transfers"
+    icon="arrow-right-arrow-left"
+    href="/backend/crm/transfers"
+  >
+    Transfer requests, approval workflow, and auto-cancel.
+  </Card>
+</CardGroup>
