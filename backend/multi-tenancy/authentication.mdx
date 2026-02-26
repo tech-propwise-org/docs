@@ -1,17 +1,68 @@
 ---
-title: "Authentication"
-description: "Two-token authentication system, auth guards, request flow, and endpoint decorators for multi-tenant context."
+title: "Multi-Tenancy & RLS Architecture"
+description: "PostgreSQL Row-Level Security architecture with transaction-first design, TenantContext service, and two-token authentication system."
 ---
 
-The system uses two distinct JWT token types to separate user identity from organization context.
+This document explains how tenant isolation works in the PropWise CRM backend using **PostgreSQL Row-Level Security (RLS)** for tenant data isolation.
 
-## Two-token system
+## Overview
+
+We use **PostgreSQL Row-Level Security (RLS)** for tenant data isolation. The **Organization entity** (located at `/modules/organization/`) serves as the **tenant boundary**. The architecture uses **explicit transactions** with **`SET LOCAL`** to guarantee tenant isolation with connection pooling.
+
+<Note>
+Organization is a top-level module (peer to User), not part of RBAC. It represents the tenant boundary for multi-tenancy and is referenced by all tenant-scoped entities.
+</Note>
+
+## Architecture Principles
+
+### 1. Transaction-First Design
+
+Every tenant-scoped operation runs inside an explicit transaction:
+
+```typescript
+await tenantContext.executeInOrg(organizationId, async (em) => {
+  const lead = await em.findOne(Lead, id);
+  lead.status = 'qualified';
+  await em.flush();
+});
+```
+
+### 2. SET LOCAL Only
+
+Only `SET LOCAL` inside transactions — context is automatically cleared on COMMIT/ROLLBACK:
+
+```sql
+BEGIN;
+SET LOCAL app.organization_id = 'uuid';
+SET LOCAL app.user_id = 'uuid';
+SET LOCAL app.bypass_rls = 'false';
+-- All queries here see this context
+-- Context automatically cleared on COMMIT/ROLLBACK
+COMMIT;
+```
+
+### 3. Database-Level Audit Triggers
+
+Audit logging happens via PostgreSQL triggers, not application code:
+
+- **Atomic**: Same transaction as the data change
+- **Automatic**: Can't forget to audit
+- **Complete**: Captures all changes, even raw SQL
+- **Performant**: No extra round-trips
+
+### 4. No Middleware/Interceptor RLS Logic
+
+Context is managed explicitly via the `TenantContext` service. There are no middleware or interceptors involved in RLS context management.
+
+## Two-Token Authentication System
+
+The system uses two distinct JWT token types to separate user identity from organization context.
 
 <Tabs>
 <Tab title="Identity token">
 Issued on login/register. Contains user identity only (no organization context):
 
-```typescript typescript
+```typescript
 {
   sub: userId,
   email: user.email,
@@ -27,7 +78,7 @@ Issued on login/register. Contains user identity only (no organization context):
 <Tab title="Tenant token">
 Issued when the user selects an organization via `POST /auth/tenant-token`. Contains organization context:
 
-```typescript typescript
+```typescript
 {
   sub: userId,
   org: organizationId,
@@ -68,9 +119,38 @@ Tenant token expires. User refreshes via `POST /auth/tenant-token/refresh`. The 
 </Step>
 </Steps>
 
----
+## Components
 
-## Auth guards
+### TenantContext Service
+
+The core service for executing tenant-scoped operations. Provided globally via `TenantContextModule`:
+
+```typescript
+@Injectable()
+export class TenantContext {
+  async executeInOrg<T>(
+    orgId: string,
+    operation: (em: EntityManager) => Promise<T>,
+    options?: { userId?: string; isolationLevel?: IsolationLevel },
+  ): Promise<T>;
+
+  async executeWithBypass<T>(operation: (em: EntityManager) => Promise<T>): Promise<T>;
+
+  async executeReadOnly<T>(orgId: string, operation: (em: EntityManager) => Promise<T>): Promise<T>;
+
+  async executeReadOnlyWithBypass<T>(operation: (em: EntityManager) => Promise<T>): Promise<T>;
+
+  async executeForEachOrg<T>(
+    organizationIds: string[],
+    operation: (em: EntityManager, orgId: string) => Promise<T>,
+    options?: { continueOnError?: boolean },
+  ): Promise<{ orgId: string; result?: T; error?: Error }[]>;
+
+  async getCurrentContext(em: EntityManager): Promise<TenantContextInfo | null>;
+}
+```
+
+### Auth Guards
 
 Three guards handle different authentication scenarios:
 
@@ -97,7 +177,7 @@ Validates tenant tokens for all org-scoped data endpoints. The guard:
 <Accordion title="IdentityTokenGuard">
 Validates identity tokens for endpoints that don't need org context:
 
-```typescript typescript
+```typescript
 @Get('organizations')
 @IdentityTokenOnly()
 @UseGuards(IdentityTokenGuard)
@@ -110,7 +190,7 @@ This guard rejects tenant tokens and stores minimal user info (`id`, `email`, `t
 <Accordion title="EitherAuthGuard">
 Accepts either CRM tenant tokens or developer portal tokens. Used for shared reference data endpoints:
 
-```typescript typescript
+```typescript
 @UseGuards(EitherAuthGuard)
 @Controller('reference-data')
 export class ReferenceDataController { ... }
@@ -120,9 +200,34 @@ This guard only validates the JWT signature and type — it does NOT load user e
 </Accordion>
 </AccordionGroup>
 
----
+### RLS Policies
 
-## Request flow
+CASE-based policies that handle all scenarios:
+
+```sql
+CREATE POLICY "tenant_isolation" ON leads FOR ALL USING (
+  CASE
+    WHEN current_setting('app.bypass_rls', true) = 'true' THEN true
+    WHEN current_setting('app.organization_id', true) = '' THEN false
+    WHEN current_setting('app.organization_id', true) IS NULL THEN false
+    ELSE organization_id = current_setting('app.organization_id', true)::uuid
+  END
+);
+```
+
+### Audit Triggers
+
+Database triggers that automatically log changes:
+
+```sql
+CREATE TRIGGER audit_lead_changes
+AFTER INSERT OR UPDATE OR DELETE ON lead
+FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();
+```
+
+The trigger function is `SECURITY DEFINER` so it bypasses RLS for audit writes while reads remain tenant-isolated.
+
+## Request Flow
 
 <Tabs>
 <Tab title="Authenticated (tenant token)">
@@ -185,8 +290,6 @@ This guard only validates the JWT signature and type — it does NOT load user e
 </Tab>
 </Tabs>
 
----
-
 ## Decorators
 
 ### `@PublicEndpoint()`
@@ -197,7 +300,7 @@ Use when the endpoint **doesn't require authentication**. This decorator:
 - Does **not** bypass RLS by itself
 - Service must use `executeWithBypass()` for database operations
 
-```typescript typescript
+```typescript
 @Post('login')
 @PublicEndpoint()
 async login(@Body() dto: LoginDto) {
@@ -213,20 +316,18 @@ Use for endpoints that require authentication but **no organization context**. T
 - Must be paired with `@UseGuards(IdentityTokenGuard)` on the route or controller
 - Used for pre-org-selection endpoints (listing organizations, issuing tenant tokens)
 
-```typescript typescript
+```typescript
 @Get('organizations')
 @IdentityTokenOnly()
 @UseGuards(IdentityTokenGuard)
 async getMyOrganizations() { ... }
 ```
 
----
-
 <CardGroup cols={2}>
-<Card title="Multi-tenancy overview" icon="building" href="/backend/multi-tenancy/overview">
-  Architecture principles, RLS policies, and table configuration.
-</Card>
 <Card title="TenantContext patterns" icon="code" href="/backend/multi-tenancy/tenant-context">
   TenantContext API, code patterns, special cases, and anti-patterns.
+</Card>
+<Card title="Session system" icon="key" href="/backend/session-system">
+  Per-organization session management and validation.
 </Card>
 </CardGroup>
