@@ -7,14 +7,14 @@ description: "Per-organization session management with device tracking, geolocat
 
 The session management system tracks user logins with comprehensive device, IP, and location information. Sessions are per-organization — when a user selects an organization, a new session is created for that specific org context. This provides better security and audit capabilities in a multi-tenant environment.
 
-## Design principles
+## Key design decisions
 
 1. **Sessions are per-organization** — each org selection creates a new session
 2. **Sessions are created on org selection, not login** — login establishes identity via `auth.service.login()`; org selection via `auth.controller.getTenantToken()` creates the session
-3. **Automatic session revocation on org removal** — when a user is removed from an organization, all their sessions for that org are revoked via `revokeAllOrgSessions()`
-4. **Three-tier session limits** — per-org total (default 5), per-device per-org (default 1), per-IP per-org (default 3)
-5. **RLS bypass for session operations** — all `SessionService` methods use `tenantContext.executeWithBypass()` because sessions need cross-org visibility. Session creation is the exception — it uses `tenantContext.executeInOrg()` to set the org context
-6. **Three-scope logout** — session-level, organization-level, and global scopes with different side effects
+3. **Automatic session revocation on org removal** — when a user is removed from an organization, all their sessions for that org are automatically revoked via `revokeAllOrgSessions()`
+4. **Session limits are per-org** — three tiers of enforcement — per-org total (default 5), per-device per-org (default 1), per-IP per-org (default 3)
+5. **RLS bypass for session operations** — all `SessionService` methods use `tenantContext.executeWithBypass()` because sessions are authentication infrastructure that needs cross-org visibility. Session creation is the exception — it uses `tenantContext.executeInOrg()` to set the org context
+6. **Three-scope logout** — logout supports session-level, organization-level, and global scopes with different side effects
 
 ## Architecture
 
@@ -91,14 +91,15 @@ The `session` table stores all fields on the `Session` entity.
 
 | Component | File | Responsibility |
 |-----------|------|---------------|
-| Session Entity | `src/modules/auth/entities/session.entity.ts` | MikroORM entity with 5 indexes and unique constraint on `refreshTokenHash` |
-| Session Service | `src/modules/auth/services/session.service.ts` | Creation, validation, revocation, three-tier limits, suspicious login detection, cleanup |
-| Session DTO | `src/modules/auth/session.dto.ts` | Constructor-based DTO with computed `isExpired` and `isActive` fields |
-| Geolocation Service | `src/modules/auth/services/geolocation.service.ts` | IP-to-location via ip-api.com (HTTP, 45 req/min limit), in-memory cache with 24-hour TTL, distance calculation via Haversine formula, private IP detection |
-| Device Parser Service | `src/modules/auth/services/device-parser.service.ts` | User-Agent parsing via `ua-parser-js`, device type classification, IP extraction (`X-Forwarded-For`, `X-Real-IP`, direct) |
-| Activity Interceptor | `src/interceptors/session-activity.interceptor.ts` | Global NestJS interceptor, reads from `req.cookies.refresh_token`, fire-and-forget activity tracking |
+| Session Entity | `src/modules/auth/entities/session.entity.ts` | MikroORM entity with 5 indexed fields for performance, unique constraint on `refreshTokenHash` |
+| Session Service | `src/modules/auth/services/session.service.ts` | Session creation, validation, and revocation, three-tier limit enforcement, suspicious login detection, session activity tracking, expired session cleanup |
+| Session DTO | `src/modules/auth/session.dto.ts` | Constructor-based DTO with computed `isExpired` and `isActive` fields, transforms Session entity to API response format with nested `SimpleUserDto` |
+| Geolocation Service | `src/modules/auth/services/geolocation.service.ts` | IP-to-location lookups using ip-api.com (HTTP, 45 req/min limit), in-memory cache with 24-hour TTL, distance calculation via Haversine formula for impossible travel detection, private IP detection (127.0.0.1, 10.x, 172.16-31.x, 192.168.x) |
+| Device Parser Service | `src/modules/auth/services/device-parser.service.ts` | User-Agent parsing with `ua-parser-js`, generates human-readable device names (e.g., "Chrome 120 on macOS 14.1"), device type classification (`desktop`, `mobile`, `tablet`, `unknown`), IP extraction from requests (handles `X-Forwarded-For`, `X-Real-IP`, direct IP) |
+| Session Activity Interceptor | `src/interceptors/session-activity.interceptor.ts` | Global NestJS interceptor registered in `app.module.ts`, reads refresh token from `req.cookies.refresh_token`, calls `getCurrentSession()` to find session, then fires `updateSessionActivity()` as fire-and-forget, silently fails — session tracking never blocks or breaks API responses |
 | System Admin Service | `src/modules/system-admin/system-admin.service.ts` | Session stats, listing with filters, admin revocation |
-| System Admin Controller | `src/modules/system-admin/system-admin.controller.ts` | Admin-only session management endpoints |
+| System Admin Controller | `src/modules/system-admin/system-admin.controller.ts` | Admin-only endpoints for session management |
+| Admin Session DTO | `src/modules/system-admin/dto/admin-session.dto.ts` | Extends `SessionDto` for admin session views |
 
 ---
 
@@ -106,7 +107,7 @@ The `session` table stores all fields on the `Session` entity.
 
 ### Session creation
 
-- Automatically created when user selects an organization via `auth.controller.getTenantToken()` (not on login)
+- Automatically created when user **selects an organization** via `POST /auth/select-organization` (not on login)
 - `auth.service.login()` explicitly does NOT create a session — device info is passed through to `issueTenantToken()`
 - Each organization has separate sessions
 - Stores device fingerprint (browser, OS, user agent, device type/name)
@@ -129,25 +130,39 @@ Three tiers of enforcement, all invoked after session creation:
 | Tier | Method | Default limit | Behavior |
 |------|--------|---------------|----------|
 | Per-org total | `enforceSessionLimit()` | 5 per user per org | Revokes oldest sessions beyond limit |
-| Per-device per-org | `enforceDeviceLimit()` | 1 per browser+OS combo | Revokes oldest same-device sessions |
-| Per-IP per-org | `enforceIpLimit()` | 3 per IP address | Revokes oldest same-IP sessions |
+| Per-device per-org | `enforceDeviceLimit()` | 1 per browser+OS combo per org | Revokes oldest same-device sessions |
+| Per-IP per-org | `enforceIpLimit()` | 3 per IP address per org | Revokes oldest same-IP sessions |
 
 All enforcement methods sort sessions by `createdAt ASC` and revoke the oldest ones first with reason `session_limit`.
 
 ### Session revocation
 
+<Tabs>
+<Tab title="User-initiated">
 | Scope | Method | Triggered by |
 |-------|--------|-------------|
 | Individual | `revokeSession(sessionId, userId, reason)` | User revokes own session; single-session logout |
 | Per-org bulk | `revokeAllOrgSessions(userId, orgId, reason)` | User removed from org; org-level logout |
 | Cross-org bulk | `revokeAllUserSessions(userId, exceptSessionId?, reason)` | Global logout |
 | Flexible | `revokeAllSessions(userId, orgId?, exceptCurrentId?)` | "Revoke all" endpoint; uses `MANUAL` reason |
-| Admin individual | `SystemAdminService.revokeSession(sessionId)` | System admin; uses `admin_revoked` reason |
-| Admin per-user | `SystemAdminService.revokeUserSessions(userId)` | System admin; uses `admin_revoked_all` reason |
-| Admin per-org | `SystemAdminService.revokeOrganizationSessions(orgId)` | System admin; uses `admin_revoked_org` reason |
-| On org deletion | `SystemAdminService.deleteOrganization()` | Bulk `nativeUpdate` with reason `organization_deleted` |
-| Limit enforcement | `enforceSessionLimit/DeviceLimit/IpLimit` | Automatic on session creation; uses `session_limit` reason |
-| Cleanup | `cleanupExpiredSessions()` | Periodic cleanup; uses `expired` reason |
+</Tab>
+
+<Tab title="System admin">
+| Method | Triggered by | Reason |
+|--------|-------------|--------|
+| `SystemAdminService.revokeSession(sessionId)` | System admin | `admin_revoked` |
+| `SystemAdminService.revokeUserSessions(userId)` | System admin | `admin_revoked_all` |
+| `SystemAdminService.revokeOrganizationSessions(orgId)` | System admin | `admin_revoked_org` |
+</Tab>
+
+<Tab title="Automatic">
+| Method | Triggered by | Reason |
+|--------|-------------|--------|
+| `SystemAdminService.deleteOrganization()` | Org deletion | `organization_deleted` |
+| `enforceSessionLimit/DeviceLimit/IpLimit` | Session creation | `session_limit` |
+| `cleanupExpiredSessions()` | Periodic cleanup | `expired` |
+</Tab>
+</Tabs>
 
 ### Logout system (three scopes)
 
@@ -179,7 +194,7 @@ Flags logins as suspicious when any of these conditions are met:
 
 Returns `{ isSuspicious: boolean; reasons: string[] }`.
 
-### Activity tracking
+### Session activity tracking
 
 - Global `SessionActivityInterceptor` tracks every API call
 - Reads refresh token from `req.cookies.refresh_token` to identify session
