@@ -144,15 +144,64 @@ Transfer events are logged in the activity system, providing a complete audit tr
 
 ---
 
+## Database constraints and indexes
+
+The transfer system uses several database constraints and indexes to maintain data integrity:
+
+<AccordionGroup>
+<Accordion title="Unique partial index">
+**Index:** `UNIQUE (entity_type, entity_id) WHERE status = 'pending'`
+
+**Purpose:** Ensures only one pending transfer can exist per entity at any time. This prevents conflicting transfer requests and race conditions.
+
+**Implementation:** PostgreSQL partial index that only applies to records with `status = 'pending'`, allowing multiple historical transfers (approved/rejected/cancelled) per entity.
+</Accordion>
+
+<Accordion title="Foreign key constraints">
+- `entity_id` → `Lead.id` or `Deal.id` (polymorphic)
+- `from_user_id` → `User.id`
+- `from_team_id` → `Team.id`
+- `to_user_id` → `User.id`
+- `to_team_id` → `Team.id`
+- `requested_by_id` → `User.id`
+- `approved_by` → `User.id`
+- `rejected_by` → `User.id`
+- `organization_id` → `Organization.id`
+</Accordion>
+
+<Accordion title="Check constraints">
+- Either `from_user_id` OR `from_team_id` must be set (not both)
+- Either `to_user_id` OR `to_team_id` must be set (not both)
+- `from_keeps_percentage` must be between 0 and 100
+- `from_commission_total` must be >= 0
+</Accordion>
+</AccordionGroup>
+
+---
+
 ## Auto-cancel triggers and implementation
 
-Pending transfers are automatically cancelled through system triggers when:
+Pending transfers are automatically cancelled through comprehensive system triggers when the underlying commission structure becomes invalid:
 
 <AccordionGroup>
 <Accordion title="Stakeholder removal trigger">
 **When:** Any stakeholder on the entity (lead/deal) is completely removed from the stakeholder list.
 
-**Implementation:** Database trigger on `entity_stakeholder` DELETE operations checks for pending transfers on the same entity and automatically updates their status to 'cancelled'.
+**Implementation:** Database trigger on `entity_stakeholder` DELETE operations:
+```sql
+CREATE OR REPLACE FUNCTION cancel_transfers_on_stakeholder_removal()
+RETURNS trigger AS $$
+BEGIN
+  UPDATE entity_transfer 
+  SET status = 'cancelled', 
+      updated_at = NOW()
+  WHERE entity_type = OLD.entity_type 
+    AND entity_id = OLD.entity_id 
+    AND status = 'pending';
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+```
 
 **Rationale:** The commission split calculation becomes invalid if the transferor is no longer a stakeholder.
 </Accordion>
@@ -160,17 +209,139 @@ Pending transfers are automatically cancelled through system triggers when:
 <Accordion title="Commission reduction trigger">
 **When:** Any stakeholder has their commission percentage reduced below what was captured in `from_commission_total`.
 
-**Implementation:** Database trigger on `entity_stakeholder` UPDATE operations compares new commission percentage against pending transfer `from_commission_total` values.
+**Implementation:** Database trigger on `entity_stakeholder` UPDATE operations:
+```sql
+CREATE OR REPLACE FUNCTION cancel_transfers_on_commission_reduction()
+RETURNS trigger AS $$
+BEGIN
+  UPDATE entity_transfer 
+  SET status = 'cancelled', 
+      updated_at = NOW()
+  WHERE entity_type = NEW.entity_type 
+    AND entity_id = NEW.entity_id 
+    AND status = 'pending'
+    AND from_commission_total > NEW.commission_percentage;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
 
 **Rationale:** The promised commission split can no longer be fulfilled if the source commission is insufficient.
 </Accordion>
 
 <Accordion title="Entity lifecycle triggers">
-**When:** The underlying entity (lead/deal) changes to a status that would invalidate the transfer (e.g., lead converted to deal, deal closed).
+**When:** The underlying entity (lead/deal) changes to a status that would invalidate the transfer.
 
-**Implementation:** Application-level logic in entity status change handlers checks for pending transfers and cancels them when appropriate.
+**Scenarios:**
+- Lead converted to deal (pending lead transfers cancelled)
+- Deal closed/won/lost (pending deal transfers cancelled)
+- Entity soft-deleted or archived
+
+**Implementation:** Application-level logic in entity status change handlers:
+```javascript
+// In LeadService.convertToDeal()
+await this.transferService.cancelPendingTransfers('lead', leadId, {
+  reason: 'Lead converted to deal',
+  cancelledBy: userId
+});
+
+// In DealService.markClosed()
+await this.transferService.cancelPendingTransfers('deal', dealId, {
+  reason: 'Deal closed',
+  cancelledBy: userId
+});
+```
 
 **Rationale:** Transfers become meaningless once the entity has moved beyond the transferable stage.
+</Accordion>
+
+<Accordion title="User/team deactivation triggers">
+**When:** A user or team involved in a pending transfer is deactivated or deleted.
+
+**Implementation:** Application-level cascade operations:
+```javascript
+// In UserService.deactivateUser()
+await this.transferService.cancelTransfersForUser(userId, {
+  reason: 'User deactivated',
+  cancelledBy: adminUserId
+});
+```
+
+**Rationale:** Prevents orphaned transfers and maintains system integrity.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Query patterns
+
+The transfer system supports several key query patterns for efficient data access:
+
+<AccordionGroup>
+<Accordion title="Pending transfers for approval">
+```sql
+-- Get all pending transfers requiring user's approval
+SELECT t.*, 
+       e_from.full_name as from_name,
+       e_to.full_name as to_name,
+       CASE t.entity_type 
+         WHEN 'lead' THEN l.title 
+         WHEN 'deal' THEN d.title 
+       END as entity_title
+FROM entity_transfer t
+LEFT JOIN users e_from ON t.from_user_id = e_from.id
+LEFT JOIN users e_to ON t.to_user_id = e_to.id  
+LEFT JOIN leads l ON t.entity_type = 'lead' AND t.entity_id = l.id
+LEFT JOIN deals d ON t.entity_type = 'deal' AND t.entity_id = d.id
+WHERE t.status = 'pending'
+  AND (t.to_user_id = ? OR t.to_team_id IN (?))
+  AND t.organization_id = ?
+ORDER BY t.requested_at DESC;
+```
+</Accordion>
+
+<Accordion title="Transfer history for entity">
+```sql
+-- Get complete transfer history for a lead/deal
+SELECT t.*, 
+       req.full_name as requested_by_name,
+       app.full_name as approved_by_name,
+       rej.full_name as rejected_by_name
+FROM entity_transfer t
+LEFT JOIN users req ON t.requested_by_id = req.id
+LEFT JOIN users app ON t.approved_by = app.id
+LEFT JOIN users rej ON t.rejected_by = rej.id
+WHERE t.entity_type = ? 
+  AND t.entity_id = ?
+  AND t.organization_id = ?
+ORDER BY t.created_at DESC;
+```
+</Accordion>
+
+<Accordion title="Commission impact analysis">
+```sql
+-- Calculate commission impact of pending transfers
+SELECT t.entity_type,
+       t.entity_id,
+       t.from_commission_total,
+       t.from_keeps_percentage,
+       (t.from_commission_total * (100 - t.from_keeps_percentage) / 100) as transfer_amount
+FROM entity_transfer t
+WHERE t.status = 'pending'
+  AND t.organization_id = ?;
+```
+</Accordion>
+
+<Accordion title="Auto-cancel trigger queries">
+```sql
+-- Find transfers that should be cancelled due to insufficient commission
+SELECT t.id
+FROM entity_transfer t
+JOIN entity_stakeholder es ON t.entity_type = es.entity_type 
+  AND t.entity_id = es.entity_id
+WHERE t.status = 'pending'
+  AND es.commission_percentage < t.from_commission_total;
+```
 </Accordion>
 </AccordionGroup>
 
@@ -201,7 +372,105 @@ Pending transfers are automatically cancelled through system triggers when:
 
 **User deactivation:** If a user involved in a pending transfer is deactivated, the transfer is automatically cancelled.
 </Accordion>
+
+<Accordion title="Commission calculation edge cases">
+**Zero commission transfers:** Allowed when `from_keeps_percentage = 0` and target is already a stakeholder. This transfers primary status without moving commission.
+
+**Insufficient commission:** If stakeholder's commission drops below `from_commission_total` while transfer is pending, the transfer is auto-cancelled.
+
+**Rounding precision:** Commission calculations use decimal precision to avoid floating-point errors in financial calculations.
+</Accordion>
 </AccordionGroup>
+
+---
+
+## Business rules implementation
+
+The transfer system enforces comprehensive business rules through database constraints, application logic, and triggers:
+
+<AccordionGroup>
+<Accordion title="Transfer eligibility rules">
+- **Same organization:** All parties must belong to the same organization
+- **Active entities:** Can only transfer active leads/deals (not archived/deleted)
+- **Stakeholder status:** Transferor must be a current stakeholder with sufficient commission
+- **Target validity:** Target user/team must be active and have appropriate permissions
+</Accordion>
+
+<Accordion title="Commission rules">
+- **Snapshot integrity:** `from_commission_total` preserves the commission amount at request time
+- **Split validation:** `from_keeps_percentage` must be between 0-100%
+- **Minimum thresholds:** Organizations can set minimum commission amounts for transfers
+- **Team distributions:** When transferring to/from teams, commission is distributed according to team rules
+</Accordion>
+
+<Accordion title="Workflow rules">
+- **Approval required:** All transfers require explicit approval from the recipient
+- **Self-approval:** Users cannot approve their own outbound transfer requests
+- **Manager override:** Managers can approve/reject transfers on behalf of their team members
+- **Timeout handling:** Transfers can be configured to auto-expire after a specified period
+</Accordion>
+
+<Accordion title="History and audit rules">
+- **Immutable history:** Transfer records are never deleted, only status-updated
+- **Complete audit trail:** All status changes, approvals, and cancellations are logged
+- **Commission tracking:** Changes to stakeholder records reference the originating transfer
+- **Activity logging:** Transfer events appear in entity activity streams
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Integration with CRM components
+
+The transfer system has deep integration points with other CRM modules:
+
+<Tabs>
+<Tab title="Stakeholder system">
+**Primary Integration:** Transfers directly modify `entity_stakeholder` records
+
+**Key Operations:**
+- Create new stakeholder records for transfer recipients
+- Update commission percentages for transfer senders
+- Manage `isPrimary` flag transitions
+- Generate `entity_stakeholder_history` records
+
+**Data Flow:**
+```
+Transfer Approval → Stakeholder Updates → History Records → Commission Recalculation
+```
+</Tab>
+
+<Tab title="Commission payments">
+**Integration Points:**
+- Commission payment schedules updated when transfers are approved
+- Historical payments remain unchanged (no retroactive adjustments)
+- Future payments calculated using new stakeholder percentages
+
+**Payment Impact:**
+- Pending commission payments may be recalculated
+- Payment recipients updated to reflect new stakeholder ownership
+- Commission splits applied to all future deal milestone payments
+</Tab>
+
+<Tab title="Activity tracking">
+**Logged Events:**
+- Transfer request created
+- Transfer approved/rejected/cancelled
+- Commission percentage changes
+- Primary stakeholder changes
+
+**Activity Stream Integration:**
+Transfer events appear in entity activity feeds with full context and user attribution.
+</Tab>
+
+<Tab title="Real estate module">
+**Property Interest Transfers:**
+When deals with property interests are transferred, the system maintains linkage to `deal_property_interest` records while updating stakeholder ownership.
+
+**Site Visit Attribution:**
+Lead transfers preserve attribution for `site_visit` records linked via the person relationship.
+</Tab>
+</Tabs>
 
 ---
 

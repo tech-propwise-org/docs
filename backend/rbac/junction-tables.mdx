@@ -69,7 +69,7 @@ The RBAC system follows a **unified role & permission architecture** with explic
                          └──────────────┘
 ```
 
-## Core entities context
+## Core entities
 
 ### User entity
 
@@ -112,6 +112,121 @@ User
 <Note>
 Users access roles via `orgRoles` collection (UserOrgRole junction), not direct `roles`. The `is_system_admin` flag is platform-level and independent of per-org RBAC roles.
 </Note>
+
+### Organization entity
+
+The Organization entity serves as the tenant boundary for multi-tenancy:
+
+```typescript
+Organization
+├── id: uuid
+├── name: string
+├── website?: string
+├── email?: string
+├── vat?: string
+├── avatar_url?: string (public URL to org logo, stored as WebP on R2)
+├── address?: jsonb (embedded Address object)
+├── owner_id: uuid → User (organization owner)
+├── Relationships:
+│   ├── users → User[] (ManyToMany, owner side, via organization_users)
+│   ├── owner → User (ManyToOne)
+│   ├── leads → Lead[] (OneToMany)
+│   ├── contacts → Contact[] (OneToMany)
+│   ├── deals → Deal[] (OneToMany)
+│   └── companies → Company[] (OneToMany)
+└── Timestamps: created_at, updated_at, is_deleted
+```
+
+<Note>
+Teams, Roles, and Invitations each reference Organization via their own `@ManyToOne` relationships, but Organization does not declare inverse `@OneToMany` collections for these. CRM entities (Lead, Contact, Deal, Company) do have inverse relationships on Organization.
+</Note>
+
+### Team entity
+
+```typescript
+Team
+├── id: uuid
+├── name: string
+├── description?: string
+├── color?: string
+├── avatar_url?: string
+├── organization_id: uuid → Organization
+├── Relationships:
+│   ├── members → TeamMembership[] (team members)
+│   └── availablePermissions → Permission[] (via team_available_permissions)
+└── Timestamps: created_at, updated_at, is_deleted
+
+Indexes:
+└── (organization_id, name) [unique, where: is_deleted = false]
+```
+
+### TeamMembership entity
+
+```typescript
+TeamMembership
+├── id: uuid
+├── user_id: uuid → User
+├── team_id: uuid → Team
+├── organization_id: uuid → Organization (denormalized for RLS)
+├── joined_at: timestamp
+├── Relationships:
+│   ├── teamMembershipRoles → TeamMembershipRole[] (roles within team)
+│   ├── user → User
+│   ├── team → Team
+│   └── organization → Organization
+└── Timestamps: created_at, updated_at, is_deleted
+
+Indexes:
+└── (user_id, team_id) [unique, where: is_deleted = false]
+```
+
+### Role entity (unified)
+
+```typescript
+Role
+├── id: uuid
+├── name: string
+├── description?: string
+├── color?: string
+├── scope: RoleScope (ORG | TEAM)
+├── is_system: boolean (true for seeded roles)
+├── organization_id?: uuid → Organization (NULL for system roles)
+├── team_id?: uuid → Team (NULL for org roles)
+├── Relationships:
+│   ├── permissions → Permission[] (via role_permissions)
+│   ├── userOrgRoles → UserOrgRole[] (inverse: role)
+│   └── teamMembershipRoles → TeamMembershipRole[] (inverse: role)
+└── Timestamps: created_at, updated_at, is_deleted
+
+Indexes:
+├── (organization_id, name, scope) [unique, where: is_deleted = false]
+└── (scope, is_system)
+
+System Roles:
+├── Owner (ORG scope, organization = NULL)
+├── Admin (ORG scope, organization = NULL)  
+├── Basic (ORG scope, organization = NULL)
+├── Team Leader (TEAM scope, organization = NULL)
+└── Agent (TEAM scope, organization = NULL)
+```
+
+### Permission entity (unified)
+
+```typescript
+Permission
+├── id: uuid
+├── key: string (unique, e.g., "lead.create", "team.manage")
+├── name: string (human-readable)
+├── description?: string
+├── scope: PermissionScope (ORG | TEAM | SYSTEM)
+├── Relationships:
+│   ├── roles → Role[] (via role_permissions)
+│   └── teamAvailablePermissions → Team[] (via team_available_permissions)
+└── Timestamps: created_at, updated_at, is_deleted
+
+Indexes:
+└── key [unique]
+```
 
 ### System vs custom roles
 
@@ -253,6 +368,124 @@ Both junction tables include `organization_id` for RLS compatibility and tenant 
 <Warning>
 The `organization_id` field is critical for RLS policies. Never create junction records without properly setting this field.
 </Warning>
+
+---
+
+## Permission resolution
+
+The RBAC system uses a hierarchical permission resolution system:
+
+<Steps>
+<Step title="Collect org-level roles">
+Query `UserOrgRole` to get all roles assigned to the user in the organization context.
+</Step>
+<Step title="Collect team-level roles">
+Query `TeamMembershipRole` through `TeamMembership` to get all team roles for the user.
+</Step>
+<Step title="Combine permissions">
+Union all permissions from org roles and team roles. Team roles can have both TEAM-scoped and ORG-scoped permissions.
+</Step>
+<Step title="Apply permission hierarchy">
+Owner > Admin > Basic. Team Leader and Agent permissions are additive within team context.
+</Step>
+<Step title="Filter by available permissions">
+For team operations, filter permissions through `team_available_permissions` to ensure the team has access to the permission.
+</Step>
+</Steps>
+
+### Permission resolution service
+
+```typescript
+@Injectable()
+export class PermissionService {
+  async getUserPermissions(userId: string, organizationId: string): Promise<Permission[]> {
+    // Get org-level permissions
+    const orgRoles = await this.em.find(
+      UserOrgRole,
+      { user: userId, organization: organizationId, isDeleted: false },
+      { populate: ['role.permissions'] },
+    );
+    const orgPermissions = orgRoles.flatMap(uor => uor.role.permissions.getItems());
+
+    // Get team-level permissions
+    const teamMemberships = await this.em.find(
+      TeamMembership,
+      { user: userId, organization: organizationId, isDeleted: false },
+      { populate: ['teamMembershipRoles.role.permissions'] },
+    );
+    const teamPermissions = teamMemberships.flatMap(tm =>
+      tm.teamMembershipRoles.getItems().flatMap(tmr =>
+        tmr.role.permissions.getItems()
+      )
+    );
+
+    // Combine and deduplicate
+    const allPermissions = [...orgPermissions, ...teamPermissions];
+    return Array.from(new Set(allPermissions));
+  }
+
+  async hasPermission(
+    userId: string, organizationId: string, permissionKey: string, teamId?: string
+  ): Promise<boolean> {
+    const permissions = await this.getUserPermissions(userId, organizationId);
+    const hasPermission = permissions.some(p => p.key === permissionKey);
+    
+    if (!hasPermission) return false;
+    
+    // For team-scoped operations, check team available permissions
+    if (teamId) {
+      const team = await this.em.findOne(
+        Team,
+        { id: teamId },
+        { populate: ['availablePermissions'] }
+      );
+      return team?.availablePermissions.getItems().some(p => p.key === permissionKey) ?? false;
+    }
+    
+    return true;
+  }
+}
+```
+
+---
+
+## Invitation system
+
+The invitation system integrates with junction tables for seamless role assignment:
+
+```typescript
+Invitation
+├── id: uuid
+├── email: string
+├── role_ids: uuid[] (roles to assign upon acceptance)
+├── team_ids?: uuid[] (teams to join)
+├── organization_id: uuid → Organization
+├── invited_by_id: uuid → User
+├── accepted_by_id?: uuid → User
+├── status: InvitationStatus (PENDING | ACCEPTED | DECLINED | EXPIRED)
+├── expires_at: timestamp
+└── Timestamps: created_at, updated_at, is_deleted
+```
+
+### Invitation acceptance flow
+
+<Steps>
+<Step title="User accepts invitation">
+User clicks invitation link and either logs in or creates account.
+</Step>
+<Step title="Add to organization">
+Create `OrganizationUser` record to establish org membership.
+</Step>
+<Step title="Assign org roles">
+Create `UserOrgRole` records for each role specified in `invitation.role_ids`.
+</Step>
+<Step title="Join teams">
+Create `TeamMembership` records for each team in `invitation.team_ids`.
+</Step>
+<Step title="Update invitation status">
+Mark invitation as `ACCEPTED` and set `accepted_by_id`.
+</Step>
+</Steps>
 
 ---
 
