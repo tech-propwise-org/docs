@@ -23,25 +23,93 @@ Invitation
 ├── email: string
 ├── status: InvitationStatus (pending, completed, expired, cancelled)
 ├── token: string (secure token for acceptance)
-├── expires_at?: timestamp (nullable)
+├── expires_at?: timestamp (default: 7 days from creation)
 ├── invited_by_id: uuid → User (ManyToOne)
 ├── accepted_by_id?: uuid → User (ManyToOne, nullable)
 ├── accepted_at?: timestamp
-├── organization_id: uuid → Organization (ManyToOne)
+├── organization_id: uuid → Organization (ManyToOne, required)
 ├── org_role_assignments: jsonb ({roleId, roleName}[])
-├── team_id?: uuid → Team (ManyToOne, nullable)
+├── team_id?: uuid → Team (ManyToOne, nullable, primary team assignment)
 ├── team_role_assignments: jsonb ({roleId, roleName, teamId, teamName}[])
 ├── welcome_message?: string
+├── Relationships:
+│   ├── organization → Organization (ManyToOne)
+│   ├── invitedBy → User (ManyToOne)
+│   ├── acceptedBy? → User (ManyToOne, nullable)
+│   └── team? → Team (ManyToOne, nullable)
 └── Timestamps: created_at, updated_at
 
 Indexes:
 ├── (invited_by_id)
+├── (organization_id)
+├── (token) [unique]
+├── (status)
 └── (email, organization_id) [unique, where: status = 'pending']
 ```
 
 <Note>
-RBAC assignments are stored in two separate JSONB fields (`org_role_assignments` and `team_role_assignments`) rather than a single field. Each includes the role name alongside the ID for display purposes without requiring a join. The `team` ManyToOne relationship stores the primary team assignment separately.
+RBAC assignments are stored in two separate JSONB fields (`org_role_assignments` and `team_role_assignments`) rather than a single field. Each includes the role name alongside the ID for display purposes without requiring a join. The `team` ManyToOne relationship stores the primary team assignment separately from the detailed team role assignments in the JSONB field.
 </Note>
+
+## Business rules and constraints
+
+### Core invitation constraints
+
+<AccordionGroup>
+<Accordion title="Email and Organization Uniqueness">
+**Rule**: Only one pending invitation per email per organization
+- **Constraint**: Unique index on `(email, organization_id)` where `status = 'pending'`
+- **Business Logic**: Users can have multiple pending invitations across different organizations
+- **Edge Case**: Can re-invite existing organization members (for role updates)
+</Accordion>
+
+<Accordion title="Token Security and Expiration">
+**Token Generation**:
+- 64-character hex string (32 bytes of entropy)
+- Cryptographically secure random generation
+- Globally unique across all invitations
+
+**Expiration Policy**:
+- Default: 7 days from creation (`expires_at = created_at + 7 days`)
+- Configurable per invitation
+- Expired invitations automatically become unusable
+- Can be extended by canceling and creating new invitation
+</Accordion>
+
+<Accordion title="Role Assignment Validation">
+**Organizational Roles**:
+- All `roleIds` must exist in the Role table
+- System roles (`organization = NULL`) can be assigned to any organization
+- Custom roles can only be assigned within their parent organization
+- If no org roles specified, user gets default "Basic" system role
+
+**Team Role Assignments**:
+- All `teamIds` must exist and belong to the target organization
+- Team role `roleIds` must have `scope = 'TEAM'` or be explicitly team-available
+- Team roles cannot have ORG-scoped permissions unless in `team_available_permissions`
+- Missing team roles result in team membership without specific role assignments
+</Accordion>
+
+<Accordion title="Status Transitions">
+**Valid Transitions**:
+- `pending → completed` (via acceptance)
+- `pending → expired` (via timeout or manual expiry)
+- `pending → cancelled` (via admin action)
+
+**Terminal States**:
+- `completed`, `expired`, `cancelled` cannot transition to other states
+- Terminal states prevent further acceptance attempts
+</Accordion>
+</AccordionGroup>
+
+### Organization integration rules
+
+| Rule | Description | Enforcement |
+| --- | --- | --- |
+| **Multi-org isolation** | Users can have different roles across organizations | RLS policies |
+| **Owner role protection** | Only one Owner role per organization allowed | Business logic validation |
+| **Team membership validation** | Team assignments must belong to target organization | Database constraints |
+| **Invitation limits** | Organizations may have invitation quotas | Service layer (configurable) |
 
 ## Invitation flow
 
@@ -57,15 +125,17 @@ POST /invitations
   "teamAssignments": [
     { "teamId": "sales-team-uuid", "roleIds": ["agent-role-uuid"] }
   ],
-  "welcomeMessage": "Welcome to the team!"
+  "welcomeMessage": "Welcome to the team!",
+  "expiresAt": "2026-03-10T10:30:00Z"
 }
 ```
 
 This creates an invitation with:
-- A secure token for acceptance
-- `expires_at = 7 days` from creation
+- A secure 64-character token for acceptance
+- `expires_at` (default: 7 days from creation)
 - `status = 'pending'`
 - RBAC assignment snapshots stored in JSONB fields
+- Validation of all role assignments and team memberships
 </Step>
 
 <Step title="Email sent with invitation link">
@@ -73,7 +143,11 @@ The system automatically sends an email containing a secure invitation link:
 ```
 https://app.propwise.com/accept-invitation?token=xxx
 ```
-The email includes the welcome message and organization details.
+The email includes:
+- Welcome message from the inviter
+- Organization details and context
+- Role and team assignment preview
+- Expiration date and urgency indicators
 </Step>
 
 <Step title="User accepts invitation">
@@ -83,11 +157,17 @@ The invitation can be accepted through two different flows:
 - `POST /invitations/:token/accept` 
 - Requires: `firstName`, `lastName`, `password`, `confirmPassword`
 - Creates new user account, adds to organization, applies RBAC assignments
+- Sets `selected_organization_id` to invitation's organization
 
 **Existing user acceptance** (identity token endpoint):
 - `POST /invitations/:token/accept-existing`
 - Requires: `IdentityTokenGuard` authentication
 - Adds existing user to organization and applies RBAC assignments
+- Preserves existing `selected_organization_id` unless user chooses to switch
+</Step>
+
+<Step title="RBAC assignments applied">
+Upon acceptance, the system applies all pre-configured role and team assignments using the `applyInvitationRbacAssignments` method with RLS bypass context.
 </Step>
 </Steps>
 
@@ -101,24 +181,30 @@ The invitation system tracks the lifecycle through these statuses:
 - Created when invitation is sent
 - User can accept or reject the invitation
 - Can be cancelled by admin before acceptance
+- Subject to expiration timeout
+- Token is valid for acceptance
 </Tab>
 <Tab title="completed">
 **Terminal State**
 - User successfully accepted the invitation
 - RBAC assignments have been applied
 - User is now a member of the organization
+- Token is invalidated and cannot be reused
+- `accepted_by_id` and `accepted_at` are populated
 </Tab>
 <Tab title="expired">
 **Terminal State**
-- Invitation expired after 7 days
-- Can be extended by admin (creates new invitation)
+- Invitation expired after configured timeout (default: 7 days)
+- Can be extended by admin (requires creating new invitation)
 - Token is no longer valid for acceptance
+- Automatic cleanup may remove expired invitations after extended period
 </Tab>
 <Tab title="cancelled">
 **Terminal State**
 - Admin cancelled the invitation before acceptance
 - Token is immediately invalidated
 - User cannot accept the invitation
+- Cancellation is logged for audit purposes
 </Tab>
 </Tabs>
 
@@ -137,9 +223,21 @@ private async applyInvitationRbacAssignments(
   invitation: Invitation,
 ): Promise<void> {
   // Apply organizational role assignments
-  if (invitation.orgRoleAssignments.length > 0) {
+  if (invitation.orgRoleAssignments && invitation.orgRoleAssignments.length > 0) {
     const roleIds = invitation.orgRoleAssignments.map(ra => ra.roleId);
-    const roles = await em.find(Role, { id: { $in: roleIds } });
+    const roles = await em.find(Role, { 
+      id: { $in: roleIds },
+      $or: [
+        { organization: invitation.organization.id },
+        { isSystem: true }
+      ]
+    });
+    
+    // Validate all requested roles were found
+    if (roles.length !== roleIds.length) {
+      throw new BadRequestException('Some assigned roles no longer exist');
+    }
+    
     const userOrgRoles = roles.map((role) =>
       em.create(UserOrgRole, { 
         user, 
@@ -153,7 +251,8 @@ private async applyInvitationRbacAssignments(
     // Default to Basic role if no roles specified
     const basicRole = await em.findOne(Role, { 
       name: 'Basic', 
-      isSystem: true 
+      isSystem: true,
+      scope: RoleScope.ORG
     });
     if (basicRole) {
       em.persist(em.create(UserOrgRole, { 
@@ -162,88 +261,310 @@ private async applyInvitationRbacAssignments(
         organization: invitation.organization, 
         assignedBy: invitation.invitedBy 
       }));
+    } else {
+      throw new InternalServerErrorException('Basic system role not found');
     }
   }
 
   // Apply team role assignments
-  if (invitation.teamRoleAssignments.length > 0) {
-    for (const teamAssignment of invitation.teamRoleAssignments) {
+  if (invitation.teamRoleAssignments && invitation.teamRoleAssignments.length > 0) {
+    // Group assignments by team for efficient processing
+    const assignmentsByTeam = invitation.teamRoleAssignments.reduce((acc, assignment) => {
+      const key = assignment.teamId;
+      if (!acc[key]) {
+        acc[key] = [];
+      }
+      acc[key].push(assignment);
+      return acc;
+    }, {} as Record<string, typeof invitation.teamRoleAssignments>);
+
+    for (const [teamId, assignments] of Object.entries(assignmentsByTeam)) {
       const team = await em.findOne(Team, { 
-        id: teamAssignment.teamId, 
+        id: teamId, 
         organization: invitation.organization.id 
       });
       
-      if (team) {
-        const membership = em.create(TeamMembership, { 
-          user, 
-          team, 
-          organization: invitation.organization 
-        });
-        em.persist(membership);
-
-        const teamRoleIds = teamAssignment.roleIds || [];
-        if (teamRoleIds.length > 0) {
-          const teamRoles = await em.find(Role, { 
-            id: { $in: teamRoleIds }, 
-            scope: 'TEAM' 
-          });
-          
-          const teamMembershipRoles = teamRoles.map((role) =>
-            em.create(TeamMembershipRole, { 
-              teamMembership: membership, 
-              role, 
-              organization: invitation.organization, 
-              assignedBy: invitation.invitedBy 
-            }),
-          );
-          em.persist(teamMembershipRoles);
-        }
+      if (!team) {
+        throw new BadRequestException(`Team ${teamId} no longer exists in this organization`);
       }
+
+      // Create team membership
+      const membership = em.create(TeamMembership, { 
+        user, 
+        team, 
+        organization: invitation.organization 
+      });
+      em.persist(membership);
+
+      // Apply team roles if specified
+      const roleIds = assignments.flatMap(a => a.roleIds || []);
+      if (roleIds.length > 0) {
+        const teamRoles = await em.find(Role, { 
+          id: { $in: roleIds }, 
+          scope: RoleScope.TEAM,
+          $or: [
+            { organization: invitation.organization.id },
+            { isSystem: true }
+          ]
+        });
+        
+        // Validate role-team compatibility
+        await this.validateTeamRoleCompatibility(em, teamRoles, team);
+        
+        const teamMembershipRoles = teamRoles.map((role) =>
+          em.create(TeamMembershipRole, { 
+            teamMembership: membership, 
+            role, 
+            organization: invitation.organization, 
+            assignedBy: invitation.invitedBy 
+          }),
+        );
+        em.persist(teamMembershipRoles);
+      }
+    }
+  }
+
+  // Handle primary team assignment if specified
+  if (invitation.team) {
+    // Ensure primary team membership exists (may already be created above)
+    const existingMembership = await em.findOne(TeamMembership, {
+      user,
+      team: invitation.team,
+      organization: invitation.organization
+    });
+    
+    if (!existingMembership) {
+      const primaryMembership = em.create(TeamMembership, {
+        user,
+        team: invitation.team,
+        organization: invitation.organization
+      });
+      em.persist(primaryMembership);
     }
   }
 
   await em.flush();
 }
+
+private async validateTeamRoleCompatibility(
+  em: EntityManager,
+  roles: Role[],
+  team: Team
+): Promise<void> {
+  for (const role of roles) {
+    // Check if team-scoped role has any ORG permissions not in team_available_permissions
+    const orgPermissions = role.permissions.filter(p => p.scope === PermissionScope.ORG);
+    if (orgPermissions.length > 0) {
+      const teamAvailablePermissions = await em.find(Permission, {
+        id: { $in: team.teamAvailablePermissions?.map(tap => tap.permission.id) || [] }
+      });
+      
+      const unavailablePermissions = orgPermissions.filter(
+        orgPerm => !teamAvailablePermissions.some(tap => tap.id === orgPerm.id)
+      );
+      
+      if (unavailablePermissions.length > 0) {
+        throw new BadRequestException(
+          `Role ${role.name} contains ORG permissions not available to team ${team.name}`
+        );
+      }
+    }
+  }
+}
 ```
 
-## Business rules
+## Query patterns
 
-### Invitation validation rules
+Common query patterns for invitation management:
 
-<AccordionGroup>
-<Accordion title="Expiration Policy">
-- Invitations expire after 7 days by default
-- Expired invitations cannot be accepted
-- Admins can extend expiration by creating new invitations
-</Accordion>
+<CodeGroup>
 
-<Accordion title="Email Uniqueness">
-- Cannot invite an email that already has a pending invitation for the same organization
-- Can invite emails that are already organization members (for role updates)
-- Unique constraint: `(email, organization_id)` where `status = 'pending'`
-</Accordion>
+```typescript Get pending invitations with details
+async getPendingInvitations(
+  organizationId: string,
+  options: PaginationOptions
+): Promise<{ invitations: Invitation[], total: number }> {
+  const [invitations, total] = await this.em.findAndCount(
+    Invitation, 
+    {
+      organization: organizationId,
+      status: InvitationStatus.PENDING,
+      $or: [
+        { expiresAt: null },
+        { expiresAt: { $gte: new Date() } }
+      ]
+    }, 
+    {
+      populate: ['invitedBy', 'organization', 'team'],
+      orderBy: { createdAt: 'DESC' },
+      limit: options.limit,
+      offset: options.offset
+    }
+  );
+  
+  return { invitations, total };
+}
+```
 
-<Accordion title="Token Security">
-- Invitation tokens are cryptographically secure
-- One-time use only - token is invalidated after acceptance/rejection
-- Tokens are long enough to prevent brute force attacks
-</Accordion>
+```typescript Get invitation with full details
+async getInvitationByToken(token: string): Promise<Invitation | null> {
+  return this.em.findOne(
+    Invitation, 
+    { token, status: InvitationStatus.PENDING },
+    { 
+      populate: [
+        'organization', 
+        'invitedBy:firstName,lastName,email', 
+        'team:name,description', 
+        'acceptedBy:firstName,lastName,email'
+      ] 
+    }
+  );
+}
+```
 
-<Accordion title="Role Validation">
-- All `roleIds` in invitation must exist and be valid for the organization
-- System roles can be assigned to any organization
-- Custom roles can only be assigned within their parent organization
-</Accordion>
-</AccordionGroup>
+```typescript Get user's invitation history across organizations
+async getUserInvitationHistory(
+  email: string, 
+  organizationId?: string
+): Promise<Invitation[]> {
+  const where: any = { email };
+  if (organizationId) {
+    where.organization = organizationId;
+  }
+  
+  return this.em.find(
+    Invitation, 
+    where,
+    {
+      populate: ['organization:name', 'invitedBy:firstName,lastName', 'team:name'],
+      orderBy: { createdAt: 'DESC' }
+    }
+  );
+}
+```
 
-### RBAC assignment rules
+```typescript Get expiring invitations for cleanup/reminder
+async getExpiringInvitations(daysUntilExpiry: number = 1): Promise<Invitation[]> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() + daysUntilExpiry);
+  
+  return this.em.find(
+    Invitation,
+    {
+      status: InvitationStatus.PENDING,
+      expiresAt: { 
+        $lte: cutoffDate,
+        $gte: new Date()
+      }
+    },
+    {
+      populate: ['organization:name', 'invitedBy:firstName,lastName,email']
+    }
+  );
+}
+```
 
-| Rule | Description | Enforcement |
-| --- | --- | --- |
-| **Default role assignment** | Users without explicit role assignments get "Basic" role | Service layer |
-| **Team validation** | `teamId` in invitation must exist in target organization | Database constraint |
-| **Permission scope validation** | Team roles cannot have ORG-scoped permissions unless explicitly allowed | Service layer |
-| **Multi-org isolation** | Role assignments are scoped to the invitation's organization | RLS policies |
+```typescript Bulk operations for organization cleanup
+async getInvitationsByStatus(
+  organizationId: string,
+  status: InvitationStatus,
+  createdBefore?: Date
+): Promise<Invitation[]> {
+  const where: any = { organization: organizationId, status };
+  if (createdBefore) {
+    where.createdAt = { $lt: createdBefore };
+  }
+  
+  return this.em.find(Invitation, where, {
+    populate: ['invitedBy:firstName,lastName']
+  });
+}
+```
+
+</CodeGroup>
+
+## RLS integration details
+
+The invitation system must carefully handle Row-Level Security (RLS) policies:
+
+<Steps>
+<Step title="Organization context isolation">
+All invitation queries within an authenticated context automatically filter by the current organization through RLS policies. This ensures users can only see invitations for their current organization context.
+</Step>
+
+<Step title="Public endpoint RLS bypass">
+Invitation acceptance endpoints (`/accept` and `/accept-existing`) run without organization context and must use `TenantContext.executeWithBypass()` to apply RBAC assignments.
+
+```typescript
+// In invitation acceptance flow
+await this.tenantContext.executeWithBypass(async (bypassEm) => {
+  await this.applyInvitationRbacAssignments(bypassEm, user, invitation);
+  
+  // Update invitation status
+  invitation.status = InvitationStatus.COMPLETED;
+  invitation.acceptedBy = user;
+  invitation.acceptedAt = new Date();
+  bypassEm.persist(invitation);
+  
+  await bypassEm.flush();
+});
+```
+</Step>
+
+<Step title="Cross-organization invitation validation">
+When creating invitations, the system validates that referenced entities (teams, roles) belong to the current organization context, enforced by RLS policies on the underlying queries.
+</Step>
+
+<Step title="Audit trail preservation">
+All invitation operations maintain proper audit trails while respecting RLS boundaries. Administrative actions are logged within the organization context, while acceptance actions are logged at the system level.
+</Step>
+</Steps>
+
+## System roles integration
+
+The invitation system leverages the complete system role hierarchy:
+
+<Tabs>
+<Tab title="Owner Role">
+- **Assignment**: Typically assigned only during organization creation
+- **Invitation Context**: Can invite users and assign any role including Owner
+- **Restrictions**: Organizations should have exactly one Owner (business rule)
+- **Default Permissions**: Full organization access including billing and settings
+</Tab>
+
+<Tab title="Admin Role">
+- **Assignment**: Can be assigned through invitations by Owner or other Admins
+- **Invitation Context**: Can invite users and assign Admin, Basic, Team Leader, Agent roles
+- **Restrictions**: Cannot assign Owner role (requires Owner privileges)
+- **Default Permissions**: User management, team management, most organizational features
+</Tab>
+
+<Tab title="Basic Role">
+- **Assignment**: Default role when no explicit org roles specified in invitation
+- **Invitation Context**: Cannot send invitations (lacks user management permissions)
+- **Use Case**: Standard organization members without administrative privileges
+- **Default Permissions**: Read access to organization data, basic CRM operations
+</Tab>
+
+<Tab title="Team Leader Role">
+- **Assignment**: Typically assigned at team level through team role assignments
+- **Invitation Context**: Can invite users to their teams with Agent or lower roles
+- **Scope**: Team-specific leadership and management capabilities
+- **Default Permissions**: Team member management, team-scoped data access
+</Tab>
+
+<Tab title="Agent Role">
+- **Assignment**: Common team-level role for operational users
+- **Invitation Context**: Cannot send invitations
+- **Use Case**: Frontline users performing core business operations
+- **Default Permissions**: CRM operations within assigned teams
+</Tab>
+</Tabs>
+
+<Info>
+System roles (`isSystem: true, organization: NULL`) can be assigned to users in any organization, while custom roles are restricted to their parent organization. The invitation system validates this during role assignment processing.
+</Info>
 
 ## Service implementation
 
@@ -257,64 +578,136 @@ The `InvitationService` manages the complete invitation lifecycle:
 <Tab title="Core Methods">
 ```typescript
 class InvitationService {
-  // Create new invitation
+  // Create new invitation with full validation
   async createInvitation(dto: CreateInvitationDto): Promise<Invitation>
   
-  // Find invitation by token (public access)
+  // Find invitation by token (public access, bypasses RLS)
   async findByToken(token: string): Promise<Invitation>
   
-  // Accept invitation for new users
+  // Accept invitation for new users (creates account + applies RBAC)
   async acceptInvitation(token: string, userData: AcceptInvitationDto): Promise<User>
   
-  // Accept invitation for existing users
+  // Accept invitation for existing users (applies RBAC only)
   async acceptInvitationExisting(token: string, user: User): Promise<void>
   
-  // Reject invitation
+  // Reject invitation (marks as cancelled)
   async rejectInvitation(token: string): Promise<void>
   
   // Cancel invitation (admin action)
   async cancelInvitation(id: string): Promise<void>
   
-  // List organization invitations (paginated)
-  async getInvitations(organizationId: string, options: PaginationOptions): Promise<Invitation[]>
+  // List organization invitations (paginated, RLS-filtered)
+  async getInvitations(
+    organizationId: string, 
+    options: PaginationOptions
+  ): Promise<{ invitations: Invitation[], total: number }>
+  
+  // Bulk operations for cleanup
+  async cleanupExpiredInvitations(organizationId?: string): Promise<number>
+  async getExpiringInvitations(daysUntilExpiry: number): Promise<Invitation[]>
 }
 ```
 </Tab>
 
-<Tab title="Token Management">
+<Tab title="Advanced Validation">
 ```typescript
-// Generate secure invitation token
-private generateInvitationToken(): string {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-// Validate token and check expiration
-private validateInvitationToken(invitation: Invitation): void {
-  if (invitation.status !== InvitationStatus.PENDING) {
-    throw new BadRequestException('Invitation is no longer valid');
+// Comprehensive invitation validation
+private async validateInvitationRequest(dto: CreateInvitationDto): Promise<void> {
+  // Check for existing pending invitation
+  const existingInvitation = await this.em.findOne(Invitation, {
+    email: dto.email,
+    organization: this.tenantContext.organization.id,
+    status: InvitationStatus.PENDING
+  });
+  
+  if (existingInvitation) {
+    throw new ConflictException(
+      'A pending invitation already exists for this email address'
+    );
   }
   
-  if (invitation.expiresAt && invitation.expiresAt < new Date()) {
-    throw new BadRequestException('Invitation has expired');
+  // Validate organization role assignments
+  if (dto.orgRoles?.length) {
+    await this.validateOrgRoles(dto.orgRoles);
+  }
+  
+  // Validate team assignments
+  if (dto.teamAssignments?.length) {
+    await this.validateTeamAssignments(dto.teamAssignments);
+  }
+  
+  // Check invitation limits (if configured)
+  await this.checkInvitationLimits();
+}
+
+private async validateOrgRoles(roleIds: string[]): Promise<void> {
+  const roles = await this.em.find(Role, {
+    id: { $in: roleIds },
+    scope: RoleScope.ORG,
+    $or: [
+      { organization: this.tenantContext.organization.id },
+      { isSystem: true }
+    ]
+  });
+  
+  if (roles.length !== roleIds.length) {
+    throw new BadRequestException('Some organizational roles are invalid');
+  }
+  
+  // Additional business rule validations (e.g., Owner role restrictions)
+  const ownerRole = roles.find(r => r.name === 'Owner' && r.isSystem);
+  if (ownerRole) {
+    await this.validateOwnerAssignment();
   }
 }
 ```
 </Tab>
 
-<Tab title="Email Integration">
+<Tab title="Email and Notification Integration">
 ```typescript
-// Send invitation email
+// Enhanced email sending with template support
 private async sendInvitationEmail(invitation: Invitation): Promise<void> {
   const invitationLink = `${this.configService.get('FRONTEND_URL')}/accept-invitation?token=${invitation.token}`;
   
+  // Prepare role and team context for email template
+  const roleNames = invitation.orgRoleAssignments.map(ra => ra.roleName);
+  const teamInfo = invitation.teamRoleAssignments.map(tra => ({
+    teamName: tra.teamName,
+    roleName: tra.roleName
+  }));
+  
   await this.emailService.sendInvitationEmail({
     to: invitation.email,
-    organizationName: invitation.organization.name,
-    inviterName: `${invitation.invitedBy.firstName} ${invitation.invitedBy.lastName}`,
-    invitationLink,
-    welcomeMessage: invitation.welcomeMessage,
-    expiresAt: invitation.expiresAt,
+    template: 'user-invitation',
+    context: {
+      organizationName: invitation.organization.name,
+      inviterName: `${invitation.invitedBy.firstName} ${invitation.invitedBy.lastName}`,
+      inviterEmail: invitation.invitedBy.email,
+      invitationLink,
+      welcomeMessage: invitation.welcomeMessage,
+      expiresAt: invitation.expiresAt,
+      organizationalRoles: roleNames,
+      teamAssignments: teamInfo,
+      isNewUserInvite: await this.isEmailNewUser(invitation.email)
+    }
   });
+  
+  // Log email sending for audit trail
+  this.logger.log(`Invitation email sent`, {
+    invitationId: invitation.id,
+    email: invitation.email,
+    organizationId: invitation.organization.id,
+    invitedBy: invitation.invitedBy.id
+  });
+}
+
+// Check if email corresponds to existing user
+private async isEmailNewUser(email: string): Promise<boolean> {
+  const existingUser = await this.em.findOne(User, { 
+    email, 
+    isDeleted: false 
+  });
+  return !existingUser;
 }
 ```
 </Tab>
@@ -324,17 +717,20 @@ private async sendInvitationEmail(invitation: Invitation): Promise<void> {
 
 ### Invitation management endpoints
 
-| Method | Endpoint | Auth | Description |
-| --- | --- | --- | --- |
-| POST | `/invitations` | `system.admin` | Create new invitation |
-| GET | `/invitations` | `system.admin` | List invitations (paginated) |
-| GET | `/invitations/:token` | Public | Get invitation details by token |
-| DELETE | `/invitations/:id` | `system.admin` | Cancel pending invitation |
+| Method | Endpoint | Auth | Permission | Description |
+| --- | --- | --- | --- | --- |
+| POST | `/invitations` | JWT | `system.admin` | Create new invitation |
+| GET | `/invitations` | JWT | `system.admin` | List invitations (paginated, RLS-filtered) |
+| GET | `/invitations/:id` | JWT | `system.admin` | Get invitation details |
+| DELETE | `/invitations/:id` | JWT | `system.admin` | Cancel pending invitation |
+| POST | `/invitations/:id/extend` | JWT | `system.admin` | Extend invitation expiry |
+| POST | `/invitations/bulk-cleanup` | JWT | `system.admin` | Clean up expired invitations |
 
 ### Invitation acceptance endpoints
 
 | Method | Endpoint | Auth | Description |
 | --- | --- | --- | --- |
+| GET | `/invitations/:token` | Public | Get invitation details by token (no RLS) |
 | POST | `/invitations/:token/accept` | Public | Accept invitation (new user) |
 | POST | `/invitations/:token/reject` | Public | Reject invitation (new user) |
 | POST | `/invitations/:token/accept-existing` | IdentityToken | Accept invitation (existing user) |
@@ -355,7 +751,9 @@ POST /invitations
       "roleIds": ["550e8400-e29b-41d4-a716-446655440003"]
     }
   ],
-  "welcomeMessage": "Welcome to our sales team! We're excited to have you join us."
+  "teamId": "550e8400-e29b-41d4-a716-446655440002",
+  "welcomeMessage": "Welcome to our sales team! We're excited to have you join us.",
+  "expiresAt": "2026-03-10T10:30:00Z"
 }
 ```
 
@@ -364,7 +762,7 @@ POST /invitations
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "email": "john.doe@example.com",
   "status": "pending",
-  "token": "a1b2c3d4e5f6...",
+  "token": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
   "expiresAt": "2026-03-03T10:30:00Z",
   "orgRoleAssignments": [
     {
@@ -377,15 +775,27 @@ POST /invitations
       "roleId": "550e8400-e29b-41d4-a716-446655440003",
       "roleName": "Team Leader",
       "teamId": "550e8400-e29b-41d4-a716-446655440002",
-      "teamName": "West Coast Sales"
+      "teamName": "West Coast Sales",
+      "roleIds": ["550e8400-e29b-41d4-a716-446655440003"]
     }
   ],
-  "welcomeMessage": "Welcome to our sales team!",
+  "welcomeMessage": "Welcome to our sales team! We're excited to have you join us.",
   "invitedBy": {
     "id": "550e8400-e29b-41d4-a716-446655440004",
     "firstName": "Sarah",
-    "lastName": "Johnson"
-  }
+    "lastName": "Johnson",
+    "email": "sarah.johnson@company.com"
+  },
+  "organization": {
+    "id": "550e8400-e29b-41d4-a716-446655440005",
+    "name": "Acme Corp"
+  },
+  "team": {
+    "id": "550e8400-e29b-41d4-a716-446655440002",
+    "name": "West Coast Sales"
+  },
+  "createdAt": "2026-02-24T10:30:00Z",
+  "updatedAt": "2026-02-24T10:30:00Z"
 }
 ```
 
@@ -397,53 +807,40 @@ POST /invitations/:token/accept
   "password": "SecurePassword123!",
   "confirmPassword": "SecurePassword123!"
 }
-```
 
-</CodeGroup>
-
-## Query patterns
-
-Common query patterns for invitation management:
-
-<CodeGroup>
-
-```typescript Get pending invitations
-async getPendingInvitations(organizationId: string): Promise<Invitation[]> {
-  return this.em.find(Invitation, {
-    organization: organizationId,
-    status: InvitationStatus.PENDING,
-    expiresAt: { $gte: new Date() }
-  }, {
-    populate: ['invitedBy', 'organization', 'team']
-  });
+Response:
+{
+  "user": {
+    "id": "550e8400-e29b-41d4-a716-446655440006",
+    "firstName": "John",
+    "lastName": "Doe",
+    "email": "john.doe@example.com",
+    "selectedOrganizationId": "550e8400-e29b-41d4-a716-446655440005"
+  },
+  "organization": {
+    "id": "550e8400-e29b-41d4-a716-446655440005",
+    "name": "Acme Corp"
+  },
+  "accessToken": "...",
+  "refreshToken": "..."
 }
 ```
 
-```typescript Get invitation with full details
-async getInvitationByToken(token: string): Promise<Invitation | null> {
-  return this.em.findOne(Invitation, 
-    { token },
-    { 
-      populate: [
-        'organization', 
-        'invitedBy', 
-        'team', 
-        'acceptedBy'
-      ] 
-    }
-  );
-}
-```
+```json List Invitations Response
+GET /invitations?page=1&limit=10&status=pending
 
-```typescript Get user's invitation history
-async getUserInvitationHistory(email: string): Promise<Invitation[]> {
-  return this.em.find(Invitation, 
-    { email },
-    {
-      populate: ['organization', 'invitedBy'],
-      orderBy: { createdAt: 'DESC' }
-    }
-  );
+{
+  "invitations": [...],
+  "pagination": {
+    "total": 25,
+    "page": 1,
+    "limit": 10,
+    "totalPages": 3
+  },
+  "filters": {
+    "status": "pending",
+    "organizationId": "550e8400-e29b-41d4-a716-446655440005"
+  }
 }
 ```
 
@@ -454,51 +851,74 @@ async getUserInvitationHistory(email: string): Promise<Invitation[]> {
 The invitation system is tightly integrated with the broader RBAC system:
 
 <Steps>
-<Step title="Role validation">
-When creating invitations, the system validates that all specified roles exist and are appropriate for the target organization and teams.
+<Step title="Role validation and compatibility">
+When creating invitations, the system validates that all specified roles exist and are appropriate for the target organization and teams. This includes checking system vs. custom role boundaries and ensuring team roles don't contain incompatible ORG-scoped permissions.
 </Step>
-<Step title="Permission preview">
-The invitation can optionally include a preview of permissions that will be granted, helping users understand their future access levels.
+
+<Step title="Permission preview and transparency">
+The invitation can optionally include a preview of permissions that will be granted, helping users understand their future access levels before accepting. This builds trust and reduces post-acceptance confusion.
 </Step>
-<Step title="Audit trail">
-All invitation activities (creation, acceptance, cancellation) are logged for security and compliance purposes.
+
+<Step title="Comprehensive audit trail">
+All invitation activities (creation, acceptance, rejection, cancellation, expiration) are logged with full context for security and compliance purposes. This includes tracking who invited whom, when assignments were applied, and any changes to role configurations.
 </Step>
-<Step title="RLS bypass">
-Invitation acceptance requires bypassing Row-Level Security policies since the user doesn't yet have organization context.
+
+<Step title="RLS bypass with security controls">
+Invitation acceptance requires bypassing Row-Level Security policies since the user doesn't yet have organization context. This is handled securely through `TenantContext.executeWithBypass()` with proper validation and audit logging.
+</Step>
+
+<Step title="Multi-organization consistency">
+The invitation system maintains consistency across multiple organizations, ensuring users can have different roles in different contexts while preventing cross-organization data leakage.
 </Step>
 </Steps>
 
 <Warning>
-Always use `TenantContext.executeWithBypass()` when applying RBAC assignments during invitation acceptance. Direct use of `this.em` or injected repositories will fail due to RLS policies.
+Always use `TenantContext.executeWithBypass()` when applying RBAC assignments during invitation acceptance. Direct use of `this.em` or injected repositories will fail due to RLS policies. All bypass operations must include comprehensive validation and audit logging.
 </Warning>
 
 ## Security considerations
 
 <AccordionGroup>
-<Accordion title="Token Security">
-- Invitation tokens use cryptographically secure random generation
-- Tokens are long enough (32 bytes hex-encoded) to prevent brute force attacks
-- One-time use policy prevents token reuse
-- Tokens are invalidated immediately upon use or cancellation
+<Accordion title="Token Security and Cryptographic Strength">
+- Invitation tokens use 32 bytes of cryptographically secure entropy (64 hex characters)
+- Tokens are generated using Node.js `crypto.randomBytes()` for maximum entropy
+- Global uniqueness enforced by database constraints
+- One-time use policy prevents token reuse attacks
+- Tokens are invalidated immediately upon use, cancellation, or expiration
+- No token pattern that could be exploited through enumeration attacks
 </Accordion>
 
-<Accordion title="Email Verification">
-- Invitations are sent to the specified email address
-- Email ownership is implicitly verified through invitation acceptance
-- No additional email verification required for invited users
+<Accordion title="Email Verification and Identity Validation">
+- Invitations are sent to the specified email address with secure delivery
+- Email ownership is implicitly verified through invitation acceptance workflow
+- No additional email verification required for invited users (streamlined onboarding)
+- Email uniqueness constraints prevent duplicate pending invitations
+- Support for both new user registration and existing user integration
 </Accordion>
 
-<Accordion title="Organization Isolation">
-- RLS policies ensure invitations are isolated by organization
+<Accordion title="Organization Isolation and Multi-Tenancy">
+- RLS policies ensure invitations are isolated by organization context
 - Users can only see/manage invitations for their current organization
-- Cross-organization invitation access is prevented
+- Cross-organization invitation access is prevented at the database level
+- Invitation acceptance creates proper organization membership boundaries
+- All RBAC assignments respect multi-tenant isolation principles
 </Accordion>
 
-<Accordion title="Role Assignment Validation">
-- All role assignments are validated against organization membership
-- System roles can be assigned across organizations
-- Custom roles are restricted to their parent organization
-- Team roles require valid team membership
+<Accordion title="Role Assignment Security and Validation">
+- All role assignments are validated against organization membership rules
+- System roles can be assigned across organizations (with proper permissions)
+- Custom roles are strictly restricted to their parent organization
+- Team roles require valid team membership and permission compatibility
+- Owner role assignments include additional business rule validation
+- Permission escalation attacks are prevented through comprehensive validation
+</Accordion>
+
+<Accordion title="Rate Limiting and Abuse Prevention">
+- Invitation creation may be rate-limited per user/organization
+- Email sending includes exponential backoff and failure handling
+- Expired invitation cleanup prevents database bloat
+- Audit logging enables detection of suspicious invitation patterns
+- Configurable invitation quotas for organizations
 </Accordion>
 </AccordionGroup>
 
@@ -508,5 +928,11 @@ Always use `TenantContext.executeWithBypass()` when applying RBAC assignments du
 </Card>
 <Card title="Teams" icon="users" href="/backend/rbac/teams">
   Team structure and membership management within the RBAC system.
+</Card>
+<Card title="System Roles" icon="user-shield" href="/backend/rbac/system-roles">
+  Built-in system roles and their permission assignments.
+</Card>
+<Card title="RLS Integration" icon="lock" href="/backend/rbac/rls-integration">
+  Row-Level Security implementation for multi-tenant data access.
 </Card>
 </CardGroup>
