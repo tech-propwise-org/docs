@@ -30,7 +30,15 @@ An external **reference database** (Neon "propwise-lab") stores **all property d
 ```
 src/modules/real-estate/
 ├── reference-data/        # Second DB — ALL property data (structural + enrichment)
+│   ├── reference-data.controller.ts       # /reference — areas, cities, communities, developers, property types, units/:id
+│   ├── reference-projects.controller.ts   # /reference/projects — search (?type=off-plan), map, counts, detail, nested buildings/units
+│   └── reference-buildings.controller.ts  # /reference/buildings — search (?type=off-plan), detail, nested units
 ├── developer-portal/      # Separate auth + project management (writes via ReferenceDataService)
+│   ├── auth/developer-auth.controller.ts  # /developer-portal/auth — signup (with agent card), login, refresh, logout, password
+│   ├── profile/developer-profile.controller.ts # /developer-portal/me — profile GET/PATCH, agent-card upload
+│   └── project-management/
+│       ├── dev-projects.controller.ts     # /developer-portal/projects — project CRUD, collections, nested building create/list
+│       └── dev-buildings.controller.ts    # /developer-portal/buildings — building CRUD (flat), collections, nested unit CRUD
 ├── map/                   # MapService (2GIS geocoding utility — shared across modules)
 ├── inventory/             # Org-scoped secondary units (standard RLS)
 ├── shared-marketplace/    # Cross-org listings + deals (custom RLS)
@@ -139,12 +147,11 @@ The `PropertyMatchService` generates matches when a LeadPropertyInterest is crea
 
 <Steps>
 <Step title="Query sources in parallel">
-
 - Internal inventory (SecondaryUnit) — org-scoped via TenantContext
 - Off-plan directory (RefProject/RefUnit) — via `ReferenceDataService`
 - Shared marketplace (SharedListing) — global via bypass
-
 </Step>
+
 <Step title="Score each candidate (0-100)">
 
 | Criterion | Points | Scoring |
@@ -156,6 +163,7 @@ The `PropertyMatchService` generates matches when a LeadPropertyInterest is crea
 | Type match | 0-10 | exact=10 |
 
 </Step>
+
 <Step title="Persist matches">
 Save matches with score greater than 20, sorted by score descending.
 </Step>
@@ -165,18 +173,660 @@ Save matches with score greater than 20, sorted by score descending.
 The `PropertyMatchService` avoids nested TenantContext calls by running off-plan queries (via `ReferenceDataService`) and shared listing queries (global, `executeWithBypass`) **first**, then entering `executeInOrg` for org-scoped secondary unit queries + match persistence.
 </Tip>
 
-## Response and input DTOs
+## Implementation details
 
-Constructor-based DTOs: `LeadPropertyInterestDto`, `PropertyMatchDto`.
+### Service layer
 
-Input DTOs use `@IsInt()` for `refProjectId`/`refUnitId` and `@IsUUID()` for `secondaryUnitId`/`sharedListingId`.
+The property-interest module consists of three primary services that handle different aspects of the functionality:
 
-## Access control
+<AccordionGroup>
+<Accordion title="PropertyInterestService">
 
-Property interest is **org-scoped** and uses `@UseGuards(AuthGuard, AccessGuard)` with `@CheckAccess`:
+Handles CRUD operations for both lead and deal property interests:
 
-- **List/Create/Match**: `permissions: ['crm.view', 'crm.manage']`
-- **Update/Delete**: `permissions: ['crm.manage']`
+```typescript
+@Injectable()
+export class PropertyInterestService {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly tenantContext: TenantContext,
+    private readonly propertyMatchService: PropertyMatchService,
+  ) {}
+
+  // Lead property interests
+  async createLeadInterest(
+    leadId: string,
+    data: CreateLeadPropertyInterestDto,
+  ): Promise<LeadPropertyInterest> {
+    const interest = this.em.create(LeadPropertyInterest, {
+      ...data,
+      lead: leadId,
+      orgId: this.tenantContext.currentOrgId,
+    });
+    
+    await this.em.persistAndFlush(interest);
+    
+    // Auto-generate matches
+    await this.propertyMatchService.generateMatches(interest.id);
+    
+    return interest;
+  }
+
+  async getLeadInterests(leadId: string): Promise<LeadPropertyInterest[]> {
+    return this.em.find(LeadPropertyInterest, { lead: leadId });
+  }
+
+  // Deal property interests
+  async createOrUpdateDealInterest(
+    dealId: string,
+    data: CreateDealPropertyInterestDto,
+  ): Promise<DealPropertyInterest> {
+    const existing = await this.em.findOne(DealPropertyInterest, { deal: dealId });
+    
+    if (existing) {
+      this.em.assign(existing, data);
+      await this.em.flush();
+      return existing;
+    }
+    
+    const interest = this.em.create(DealPropertyInterest, {
+      ...data,
+      deal: dealId,
+      orgId: this.tenantContext.currentOrgId,
+    });
+    
+    await this.em.persistAndFlush(interest);
+    return interest;
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="PropertyMatchService">
+
+Core matching engine that orchestrates property matching across data sources:
+
+```typescript
+@Injectable()
+export class PropertyMatchService {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly tenantContext: TenantContext,
+    private readonly referenceDataService: ReferenceDataService,
+  ) {}
+
+  async generateMatches(leadInterestId: string): Promise<PropertyMatch[]> {
+    const interest = await this.em.findOneOrFail(LeadPropertyInterest, leadInterestId);
+    
+    // Query all sources in parallel (outside org context)
+    const [offPlanProperties, sharedListings] = await Promise.all([
+      this.getOffPlanMatches(interest),
+      this.getSharedListingMatches(interest),
+    ]);
+    
+    // Enter org context for internal inventory and match persistence
+    return this.tenantContext.executeInOrg(interest.orgId, async () => {
+      const secondaryUnits = await this.getSecondaryUnitMatches(interest);
+      
+      const allCandidates = [
+        ...offPlanProperties.map(p => ({ type: 'off-plan', data: p })),
+        ...secondaryUnits.map(u => ({ type: 'secondary', data: u })),
+        ...sharedListings.map(l => ({ type: 'shared', data: l })),
+      ];
+      
+      const matches: PropertyMatch[] = [];
+      
+      for (const candidate of allCandidates) {
+        const score = this.calculateMatchScore(interest, candidate);
+        if (score > 20) {
+          const match = this.em.create(PropertyMatch, {
+            leadInterest: interest,
+            matchScore: score,
+            matchBreakdown: this.getMatchBreakdown(interest, candidate),
+            status: MatchStatus.NEW,
+            orgId: interest.orgId,
+            ...this.getMatchedEntityIds(candidate),
+          });
+          matches.push(match);
+        }
+      }
+      
+      // Sort by score descending
+      matches.sort((a, b) => b.matchScore - a.matchScore);
+      
+      await this.em.persistAndFlush(matches);
+      return matches;
+    });
+  }
+
+  private calculateMatchScore(interest: LeadPropertyInterest, candidate: any): number {
+    let score = 0;
+    
+    // Budget match (0-30 points)
+    if (this.isBudgetMatch(interest, candidate)) {
+      score += this.getBudgetScore(interest, candidate);
+    }
+    
+    // Bedroom match (0-25 points)
+    if (this.isBedroomMatch(interest, candidate)) {
+      score += this.getBedroomScore(interest, candidate);
+    }
+    
+    // Area/location match (0-20 points)
+    score += this.getLocationScore(interest, candidate);
+    
+    // Size match (0-15 points)
+    if (this.isSizeMatch(interest, candidate)) {
+      score += this.getSizeScore(interest, candidate);
+    }
+    
+    // Property type match (0-10 points)
+    if (interest.propertyType === candidate.data.propertyType) {
+      score += 10;
+    }
+    
+    return Math.min(score, 100);
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="PropertyAnalyticsService">
+
+Provides analytics and reporting for property interest performance:
+
+```typescript
+@Injectable()
+export class PropertyAnalyticsService {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly tenantContext: TenantContext,
+  ) {}
+
+  async getMatchPerformance(
+    orgId: string,
+    filters: AnalyticsFilters,
+  ): Promise<MatchPerformanceDto> {
+    return this.tenantContext.executeInOrg(orgId, async () => {
+      const qb = this.em.createQueryBuilder(PropertyMatch, 'm')
+        .select([
+          'COUNT(*) as total_matches',
+          'AVG(m.match_score) as avg_score',
+          'COUNT(CASE WHEN m.status = ? THEN 1 END) as contacted',
+          'COUNT(CASE WHEN m.status = ? THEN 1 END) as shortlisted',
+        ])
+        .where('m.created_at >= ? AND m.created_at <= ?')
+        .setParameters([
+          MatchStatus.CONTACTED,
+          MatchStatus.SHORTLISTED,
+          filters.from,
+          filters.to,
+        ]);
+
+      if (filters.leadId) {
+        qb.andWhere('m.lead_interest IN (SELECT id FROM lead_property_interests WHERE lead_id = ?)')
+          .setParameter(2, filters.leadId);
+      }
+
+      const result = await qb.getSingleResult();
+      
+      return {
+        totalMatches: parseInt(result.total_matches),
+        averageScore: parseFloat(result.avg_score) || 0,
+        contactedCount: parseInt(result.contacted),
+        shortlistedCount: parseInt(result.shortlisted),
+        conversionRate: result.total_matches > 0 
+          ? (result.contacted / result.total_matches) * 100 
+          : 0,
+      };
+    });
+  }
+
+  async getInterestDistribution(
+    orgId: string,
+    filters: AnalyticsFilters,
+  ): Promise<InterestDistributionDto[]> {
+    return this.tenantContext.executeInOrg(orgId, async () => {
+      const interests = await this.em.find(LeadPropertyInterest, {
+        createdAt: { $gte: filters.from, $lte: filters.to },
+      });
+      
+      const distribution = new Map<string, number>();
+      
+      interests.forEach(interest => {
+        const key = `${interest.propertyType}-${interest.bedrooms}BR`;
+        distribution.set(key, (distribution.get(key) || 0) + 1);
+      });
+      
+      return Array.from(distribution.entries()).map(([category, count]) => ({
+        category,
+        count,
+        percentage: (count / interests.length) * 100,
+      }));
+    });
+  }
+
+  async getConversionFunnel(
+    orgId: string,
+    filters: AnalyticsFilters,
+  ): Promise<ConversionFunnelDto> {
+    return this.tenantContext.executeInOrg(orgId, async () => {
+      const interests = await this.em.count(LeadPropertyInterest, {
+        createdAt: { $gte: filters.from, $lte: filters.to },
+      });
+      
+      const matches = await this.em.count(PropertyMatch, {
+        createdAt: { $gte: filters.from, $lte: filters.to },
+      });
+      
+      const contacted = await this.em.count(PropertyMatch, {
+        status: MatchStatus.CONTACTED,
+        updatedAt: { $gte: filters.from, $lte: filters.to },
+      });
+      
+      // Count deals created from property interests
+      const deals = await this.em.count(DealPropertyInterest, {
+        createdAt: { $gte: filters.from, $lte: filters.to },
+        originatingInterest: { $ne: null },
+      });
+      
+      return {
+        interests,
+        matches,
+        contacted,
+        deals,
+        matchRate: interests > 0 ? (matches / interests) * 100 : 0,
+        contactRate: matches > 0 ? (contacted / matches) * 100 : 0,
+        conversionRate: contacted > 0 ? (deals / contacted) * 100 : 0,
+      };
+    });
+  }
+}
+```
+
+</Accordion>
+</AccordionGroup>
+
+### Controllers
+
+The module exposes three controllers that handle different aspects of the property interest functionality:
+
+<AccordionGroup>
+<Accordion title="LeadPropertyInterestController">
+
+```typescript
+@Controller('property-interests/leads')
+@UseGuards(AuthGuard, AccessGuard)
+export class LeadPropertyInterestController {
+  constructor(
+    private readonly propertyInterestService: PropertyInterestService,
+    private readonly propertyMatchService: PropertyMatchService,
+  ) {}
+
+  @Post(':leadId')
+  @CheckAccess({ permissions: ['crm.view', 'crm.manage'] })
+  async createLeadInterest(
+    @Param('leadId') leadId: string,
+    @Body() data: CreateLeadPropertyInterestDto,
+  ): Promise<LeadPropertyInterestDto> {
+    const interest = await this.propertyInterestService.createLeadInterest(leadId, data);
+    return new LeadPropertyInterestDto(interest);
+  }
+
+  @Get(':leadId')
+  @CheckAccess({ permissions: ['crm.view', 'crm.manage'] })
+  async getLeadInterests(
+    @Param('leadId') leadId: string,
+  ): Promise<LeadPropertyInterestDto[]> {
+    const interests = await this.propertyInterestService.getLeadInterests(leadId);
+    return interests.map(interest => new LeadPropertyInterestDto(interest));
+  }
+
+  @Get(':leadId/matches')
+  @CheckAccess({ permissions: ['crm.view', 'crm.manage'] })
+  async getLeadMatches(
+    @Param('leadId') leadId: string,
+  ): Promise<PropertyMatchDto[]> {
+    const matches = await this.propertyMatchService.getMatchesForLead(leadId);
+    return matches.map(match => new PropertyMatchDto(match));
+  }
+
+  @Post(':leadId/regenerate-matches')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async regenerateMatches(
+    @Param('leadId') leadId: string,
+  ): Promise<PropertyMatchDto[]> {
+    const matches = await this.propertyMatchService.regenerateMatchesForLead(leadId);
+    return matches.map(match => new PropertyMatchDto(match));
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="PropertyInterestController">
+
+```typescript
+@Controller('property-interests')
+@UseGuards(AuthGuard, AccessGuard)
+export class PropertyInterestController {
+  constructor(
+    private readonly propertyInterestService: PropertyInterestService,
+    private readonly propertyMatchService: PropertyMatchService,
+  ) {}
+
+  @Patch(':id')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async updateInterest(
+    @Param('id') id: string,
+    @Body() data: UpdateLeadPropertyInterestDto,
+  ): Promise<LeadPropertyInterestDto> {
+    const interest = await this.propertyInterestService.updateLeadInterest(id, data);
+    return new LeadPropertyInterestDto(interest);
+  }
+
+  @Delete(':id')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async deleteInterest(@Param('id') id: string): Promise<void> {
+    await this.propertyInterestService.deleteLeadInterest(id);
+  }
+
+  @Patch('matches/:id/status')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async updateMatchStatus(
+    @Param('id') matchId: string,
+    @Body() body: { status: MatchStatus },
+  ): Promise<PropertyMatchDto> {
+    const match = await this.propertyMatchService.updateMatchStatus(matchId, body.status);
+    return new PropertyMatchDto(match);
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="DealPropertyInterestController">
+
+```typescript
+@Controller('property-interests/deals')
+@UseGuards(AuthGuard, AccessGuard)
+export class DealPropertyInterestController {
+  constructor(private readonly propertyInterestService: PropertyInterestService) {}
+
+  @Post(':dealId')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async createOrUpdateDealInterest(
+    @Param('dealId') dealId: string,
+    @Body() data: CreateDealPropertyInterestDto,
+  ): Promise<DealPropertyInterestDto> {
+    const interest = await this.propertyInterestService.createOrUpdateDealInterest(dealId, data);
+    return new DealPropertyInterestDto(interest);
+  }
+
+  @Get(':dealId')
+  @CheckAccess({ permissions: ['crm.view', 'crm.manage'] })
+  async getDealInterest(
+    @Param('dealId') dealId: string,
+  ): Promise<DealPropertyInterestDto | null> {
+    const interest = await this.propertyInterestService.getDealInterest(dealId);
+    return interest ? new DealPropertyInterestDto(interest) : null;
+  }
+
+  @Patch(':dealId')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async updateDealInterest(
+    @Param('dealId') dealId: string,
+    @Body() data: UpdateDealPropertyInterestDto,
+  ): Promise<DealPropertyInterestDto> {
+    const interest = await this.propertyInterestService.updateDealInterest(dealId, data);
+    return new DealPropertyInterestDto(interest);
+  }
+
+  @Delete(':dealId')
+  @CheckAccess({ permissions: ['crm.manage'] })
+  async deleteDealInterest(@Param('dealId') dealId: string): Promise<void> {
+    await this.propertyInterestService.deleteDealInterest(dealId);
+  }
+}
+```
+
+</Accordion>
+</AccordionGroup>
+
+### DTOs and validation
+
+<AccordionGroup>
+<Accordion title="Input DTOs">
+
+```typescript
+export class CreateLeadPropertyInterestDto {
+  @IsOptional()
+  @IsInt()
+  refProjectId?: number;
+
+  @IsOptional()
+  @IsInt()
+  refUnitId?: number;
+
+  @IsOptional()
+  @IsUUID()
+  secondaryUnitId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  sharedListingId?: string;
+
+  @IsOptional()
+  @IsEnum(PropertyType)
+  propertyType?: PropertyType;
+
+  @IsOptional()
+  @IsEnum(LayoutType)
+  layoutType?: LayoutType;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  bedrooms?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  budgetMin?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  budgetMax?: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  preferredAreas?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  preferredCommunities?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  isPrimary?: boolean;
+
+  @IsOptional()
+  @IsEnum(Priority)
+  priority?: Priority;
+
+  @IsOptional()
+  @IsString()
+  notes?: string;
+}
+
+export class CreateDealPropertyInterestDto {
+  @IsOptional()
+  @IsInt()
+  refProjectId?: number;
+
+  @IsOptional()
+  @IsInt()
+  refUnitId?: number;
+
+  @IsOptional()
+  @IsUUID()
+  secondaryUnitId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  sharedListingId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  originatingInterestId?: string;
+
+  @IsEnum(InterestType)
+  interestType!: InterestType;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  budgetMin?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  budgetMax?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  agreedPrice?: number;
+
+  @IsOptional()
+  @IsEnum(DealInterestStatus)
+  status?: DealInterestStatus;
+}
+```
+
+</Accordion>
+
+<Accordion title="Response DTOs">
+
+```typescript
+export class LeadPropertyInterestDto {
+  id: string;
+  leadId: string;
+  refProjectId?: number;
+  refUnitId?: number;
+  secondaryUnitId?: string;
+  sharedListingId?: string;
+  propertyType?: PropertyType;
+  layoutType?: LayoutType;
+  bedrooms?: number;
+  budgetMin?: number;
+  budgetMax?: number;
+  sizeMin?: number;
+  sizeMax?: number;
+  preferredAreas: string[];
+  preferredCommunities: string[];
+  isPrimary: boolean;
+  priority: Priority;
+  notes?: string;
+  createdAt: Date;
+  updatedAt: Date;
+
+  constructor(interest: LeadPropertyInterest) {
+    this.id = interest.id;
+    this.leadId = interest.lead.id;
+    this.refProjectId = interest.refProjectId;
+    this.refUnitId = interest.refUnitId;
+    this.secondaryUnitId = interest.secondaryUnit?.id;
+    this.sharedListingId = interest.sharedListing?.id;
+    this.propertyType = interest.propertyType;
+    this.layoutType = interest.layoutType;
+    this.bedrooms = interest.bedrooms;
+    this.budgetMin = interest.budgetMin;
+    this.budgetMax = interest.budgetMax;
+    this.sizeMin = interest.sizeMin;
+    this.sizeMax = interest.sizeMax;
+    this.preferredAreas = interest.preferredAreas || [];
+    this.preferredCommunities = interest.preferredCommunities || [];
+    this.isPrimary = interest.isPrimary;
+    this.priority = interest.priority;
+    this.notes = interest.notes;
+    this.createdAt = interest.createdAt;
+    this.updatedAt = interest.updatedAt;
+  }
+}
+
+export class PropertyMatchDto {
+  id: string;
+  leadInterestId: string;
+  matchedRefProjectId?: number;
+  matchedRefUnitId?: number;
+  matchedSecondaryUnitId?: string;
+  matchedSharedListingId?: string;
+  matchScore: number;
+  matchBreakdown: Record<string, any>;
+  status: MatchStatus;
+  createdAt: Date;
+  updatedAt: Date;
+
+  constructor(match: PropertyMatch) {
+    this.id = match.id;
+    this.leadInterestId = match.leadInterest.id;
+    this.matchedRefProjectId = match.matchedRefProjectId;
+    this.matchedRefUnitId = match.matchedRefUnitId;
+    this.matchedSecondaryUnitId = match.matchedSecondaryUnit?.id;
+    this.matchedSharedListingId = match.matchedSharedListing?.id;
+    this.matchScore = match.matchScore;
+    this.matchBreakdown = match.matchBreakdown;
+    this.status = match.status;
+    this.createdAt = match.createdAt;
+    this.updatedAt = match.updatedAt;
+  }
+}
+
+export class DealPropertyInterestDto {
+  id: string;
+  dealId: string;
+  refProjectId?: number;
+  refUnitId?: number;
+  secondaryUnitId?: string;
+  sharedListingId?: string;
+  originatingInterestId?: string;
+  interestType: InterestType;
+  budgetMin?: number;
+  budgetMax?: number;
+  agreedPrice?: number;
+  status: DealInterestStatus;
+  confirmedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+
+  constructor(interest: DealPropertyInterest) {
+    this.id = interest.id;
+    this.dealId = interest.deal.id;
+    this.refProjectId = interest.refProjectId;
+    this.refUnitId = interest.refUnitId;
+    this.secondaryUnitId = interest.secondaryUnit?.id;
+    this.sharedListingId = interest.sharedListing?.id;
+    this.originatingInterestId = interest.originatingInterest?.id;
+    this.interestType = interest.interestType;
+    this.budgetMin = interest.budgetMin;
+    this.budgetMax = interest.budgetMax;
+    this.agreedPrice = interest.agreedPrice;
+    this.status = interest.status;
+    this.confirmedAt = interest.confirmedAt;
+    this.createdAt = interest.createdAt;
+    this.updatedAt = interest.updatedAt;
+  }
+}
+```
+
+</Accordion>
+</AccordionGroup>
 
 ## API endpoints
 
@@ -288,76 +938,12 @@ GET    /property-interests/analytics/conversion-funnel
 </Accordion>
 </AccordionGroup>
 
-## Service layer details
+## Access control
 
-The `PropertyMatchService` is the core component that orchestrates property matching across multiple data sources:
+Property interest is **org-scoped** and uses `@UseGuards(AuthGuard, AccessGuard)` with `@CheckAccess`:
 
-### Key service methods
-
-```typescript
-class PropertyMatchService {
-  // Generate matches for a lead property interest
-  async generateMatches(leadInterestId: string): Promise<PropertyMatch[]>
-  
-  // Update match status
-  async updateMatchStatus(matchId: string, status: MatchStatus): Promise<PropertyMatch>
-  
-  // Get matches for a lead (all interests)
-  async getMatchesForLead(leadId: string): Promise<PropertyMatch[]>
-  
-  // Re-score existing matches (when criteria change)
-  async refreshMatches(leadInterestId: string): Promise<PropertyMatch[]>
-  
-  // Bulk regenerate matches for a lead
-  async regenerateMatchesForLead(leadId: string): Promise<PropertyMatch[]>
-  
-  // Get match performance analytics
-  async getMatchPerformance(orgId: string, filters: AnalyticsFilters): Promise<MatchPerformanceDto>
-}
-```
-
-### Additional services
-
-```typescript
-class PropertyInterestService {
-  // CRUD operations for lead property interests
-  async createLeadInterest(leadId: string, data: CreateLeadPropertyInterestDto): Promise<LeadPropertyInterest>
-  async updateLeadInterest(id: string, data: UpdateLeadPropertyInterestDto): Promise<LeadPropertyInterest>
-  async deleteLeadInterest(id: string): Promise<void>
-  async getLeadInterests(leadId: string): Promise<LeadPropertyInterest[]>
-  
-  // CRUD operations for deal property interests
-  async createOrUpdateDealInterest(dealId: string, data: CreateDealPropertyInterestDto): Promise<DealPropertyInterest>
-  async getDealInterest(dealId: string): Promise<DealPropertyInterest | null>
-  async updateDealInterest(dealId: string, data: UpdateDealPropertyInterestDto): Promise<DealPropertyInterest>
-  async deleteDealInterest(dealId: string): Promise<void>
-}
-
-class PropertyAnalyticsService {
-  // Analytics for property interest performance
-  async getInterestDistribution(orgId: string, filters: AnalyticsFilters): Promise<InterestDistributionDto[]>
-  async getConversionFunnel(orgId: string, filters: AnalyticsFilters): Promise<ConversionFunnelDto>
-  async getMatchEffectiveness(orgId: string, filters: AnalyticsFilters): Promise<MatchEffectivenessDto>
-}
-```
-
-### Scoring algorithm
-
-The weighted scoring system ensures the most relevant matches appear first:
-
-<Note>
-Matches with scores below 20 are automatically filtered out to maintain result quality. This threshold prevents low-relevance matches from cluttering the interface while still allowing for some flexibility in matching criteria.
-</Note>
-
-### Data source integration
-
-The matching engine queries three distinct data sources:
-
-1. **Reference database** (via `ReferenceDataService`): Off-plan projects and units
-2. **CRM database** (direct): Organization's secondary unit inventory  
-3. **Shared marketplace** (bypass RLS): Cross-org listings
-
-This multi-source approach provides comprehensive property matching while respecting data ownership boundaries.
+- **List/Create/Match**: `permissions: ['crm.view', 'crm.manage']`
+- **Update/Delete**: `permissions: ['crm.manage']`
 
 ## Match status workflow
 
@@ -385,6 +971,58 @@ User rejected the match (terminal state)
 Once a match is marked as DISMISSED, it cannot be changed to other states. This prevents accidentally re-engaging with explicitly rejected properties.
 </Warning>
 
+## Scoring algorithm details
+
+The weighted scoring system ensures the most relevant matches appear first:
+
+<Note>
+Matches with scores below 20 are automatically filtered out to maintain result quality. This threshold prevents low-relevance matches from cluttering the interface while still allowing for some flexibility in matching criteria.
+</Note>
+
+### Detailed scoring breakdown
+
+<AccordionGroup>
+<Accordion title="Budget scoring (0-30 points)">
+
+- **Exact match**: 30 points - property price equals client budget
+- **Within 20%**: 20 points - property price within ±20% of client budget  
+- **Within 50%**: 10 points - property price within ±50% of client budget
+- **Outside range**: 0 points
+
+</Accordion>
+<Accordion title="Bedroom scoring (0-25 points)">
+
+- **Exact match**: 25 points - exact bedroom count match
+- **±1 bedroom**: 15 points - one bedroom difference
+- **±2 bedrooms**: 5 points - two bedroom difference
+- **>2 difference**: 0 points
+
+</Accordion>
+<Accordion title="Location scoring (0-20 points)">
+
+- **Preferred area**: 20 points - property in client's preferred area list
+- **Preferred community**: 10 points - property in client's preferred community list
+- **Same city/region**: 5 points - property in same general location
+- **Different location**: 0 points
+
+</Accordion>
+<Accordion title="Size scoring (0-15 points)">
+
+- **Within range**: 15 points - property size within client's min/max range
+- **Within 20% of range**: 10 points - close to desired size range
+- **Within 50% of range**: 5 points - moderately close to desired size
+- **Outside range**: 0 points
+
+</Accordion>
+<Accordion title="Property type scoring (0-10 points)">
+
+- **Exact match**: 10 points - exact property type match (Villa, Apartment, etc.)
+- **Compatible type**: 5 points - similar property types (Studio → 1BR Apartment)
+- **Different type**: 0 points
+
+</Accordion>
+</AccordionGroup>
+
 ## Integration patterns
 
 The property-interest module demonstrates several key architectural patterns:
@@ -403,3 +1041,13 @@ The property-interest module demonstrates several key architectural patterns:
 - Automatically generates matches on interest creation/update
 - Supports manual match regeneration for data refresh scenarios
 - Maintains match history for analytics
+
+### Data source integration
+
+The matching engine queries three distinct data sources:
+
+1. **Reference database** (via `ReferenceDataService`): Off-plan projects and units
+2. **CRM database** (direct): Organization's secondary unit inventory  
+3. **Shared marketplace** (bypass RLS): Cross-org listings
+
+This multi-source approach provides comprehensive property matching while respecting data ownership boundaries.
