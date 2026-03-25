@@ -5,120 +5,65 @@ description: "REST endpoints, service functions, and access control for stakehol
 
 This page documents the API endpoints and service functions for managing lead/deal stakeholders, assignment, transfer, and commission handling. For table schemas, data model concepts, and invariants, see the [stakeholder data model](/backend/crm/stakeholder-model).
 
-## Stakeholder sync feature
+## Stakeholder sync feature (v2 — Full bidirectional)
 
-When working with deals that originate from leads, stakeholder assignments maintain consistency automatically. The `StakeholderSyncService` syncs stakeholder assignments between deals and their originating leads.
+### Overview
+
+Leads and their active deals share **identical stakeholder state**. Any change to either side's stakeholders is automatically propagated to the linked entity via `syncToLinkedEntity`. This replaces the previous observer-only sync model.
 
 ### Design principles
 
-1. **One-way primary flow** — Leads inherit to deals at deal creation (existing behavior)
-2. **Bidirectional sync** — Deal stakeholder changes now sync back to lead
-3. **Safe by default** — Multiple safety checks prevent unwanted removals
-4. **Non-blocking** — Sync failures log errors but don't fail the primary operation
+1. **Full bidirectional sync** — Lead ↔ active Deal stakeholder state is always mirrored (same users, same commission, same primary)
+2. **1:1 active deal per lead** — A lead can have at most one active deal (not archived, not closed-lost). A new deal can only be created when no active deal exists
+3. **Last write wins** — Whichever entity (lead or deal) is changed most recently becomes the current truth for both
+4. **100% commission floor** — Once a lead-deal link exists, both sides must maintain 100% total commission. A lead without an active deal can have 0% (not yet configured)
+5. **Inactive deals excluded** — Archived or closed-lost deals are excluded from sync — the lead is effectively "unlinked"
 
-### Use case 1: Assign to deal → auto-assign to lead
+### How sync works
 
-**Scenario:** When you assign a stakeholder to a deal, they should also be able to see the originating lead.
+When `PUT /leads/:id/stakeholders` or `PUT /deals/:id/stakeholders` is called:
 
-**API call:**
-
-```bash
-POST /deals/{dealId}/stakeholders
-Content-Type: application/json
-
-{
-  "userId": "agent-b-uuid",
-  "commissionPercentage": 30,
-  "accessLevel": "WRITE"
-}
-```
-
-**What happens:**
-
-1. Agent B is assigned to Deal #1 (30% commission, WRITE access)
-2. System checks: Does Deal #1 have an originating lead?
-3. If yes AND lead exists AND lead not archived:
-   - Agent B is also assigned to Lead #1 (0% commission, WRITE access, observer)
-   - Returns: `{ success: true, syncedToLead: true, leadId: "lead-uuid" }`
-
-**Sync settings:**
-
-| Property               | Deal value                 | Lead value                |
-| ---------------------- | -------------------------- | ------------------------- |
-| `commissionPercentage` | As specified (e.g., 30%)   | **0%** (observer)         |
-| `accessLevel`          | As specified (e.g., WRITE) | **Same as deal**          |
-| `isPrimary`            | As specified               | **false** (never primary) |
-
-**Skip conditions:**
-
-| Condition            | Action    | Reason                         |
-| -------------------- | --------- | ------------------------------ |
-| No originating lead  | Skip sync | Nothing to sync to             |
-| Lead is archived     | Skip sync | Can't modify archived entities |
-| User already on lead | Skip sync | No duplication needed          |
-
-### Use case 2: Remove from deal → auto-remove from lead
-
-**Scenario:** When you remove a stakeholder from a deal, they should also be removed from the lead if they no longer need access.
-
-**API call:**
-
-```bash
-DELETE /deals/{dealId}/stakeholders/{stakeholderId}
-```
-
-**What happens:**
-
-1. Stakeholder removed from Deal #1
-2. System checks: Should we also remove from originating lead?
-3. Multiple safety checks applied (see below)
-4. If all checks pass:
-   - Stakeholder removed from Lead #1
-   - Other lead stakeholder commissions auto-adjusted to 100%
-   - Returns: `{ success: true, syncedToLead: true, leadId: "lead-uuid" }`
-
-**Safety checks (ALL must pass):**
-
-| #   | Check                                       | Reason                           |
-| --- | ------------------------------------------- | -------------------------------- |
-| 1   | Lead exists and not archived                | Can't modify archived leads      |
-| 2   | User has **0% commission** on lead          | Protect earned commission rights |
-| 3   | User is **NOT primary** on lead             | Protect primary ownership        |
-| 4   | This is user's **ONLY deal** from that lead | Keep access if other deals exist |
-
-**If ANY check fails:** Stakeholder removed from deal only, lead unchanged
-
-**Commission auto-adjustment:**
-
-If removing would break 100% total on lead, the system auto-adjusts:
+1. The sync endpoint applies all add/update/remove changes to the target entity
+2. After changes are committed, `syncToLinkedEntity` is called automatically
+3. It finds the linked entity (lead's active deal, or deal's originating lead)
+4. It maps the source stakeholders to the target's desired state (matching by userId + teamId to preserve existing row IDs)
+5. It calls `syncStakeholdersInTransaction` on the target with `skipSync: true` (recursion guard)
 
 ```
-BEFORE:
-- Agent A: 50%
-- Agent B: 0% ← Removing
-- Agent C: 20%
-Total: 70%
-
-AFTER (auto-adjusted to 100%):
-- Agent A: 71.43% (50 × 100/70)
-- Agent C: 28.57% (20 × 100/70)
-Total: 100% ✓
-
-Formula: new% = old% × (100 / current_total)
+Lead stakeholders changed via PUT
+  → Apply changes to lead
+  → syncToLinkedEntity(LEAD, leadId)
+    → Find active deal for this lead
+    → Call syncStakeholdersInTransaction(DEAL, dealId, ..., { skipSync: true })
 ```
 
-### Sync response format
+### Deal creation with stakeholders
 
-Both create and remove operations return:
+When creating a deal from a lead, the frontend pre-fills the stakeholder list from the lead and lets the user modify it. The backend:
 
-```typescript
-interface StakeholderSyncResultDto {
-  success: boolean; // Operation succeeded
-  syncedToLead: boolean; // Whether sync occurred
-  leadId?: string; // ID of lead (if applicable)
-  message?: string; // Optional status message
-}
-```
+1. Creates the deal with the submitted stakeholder list (via `CreateDealDto.stakeholders[]`)
+2. Syncs the submitted list back to the originating lead (so both sides match)
+3. Validates that commission totals 100% before creating
+
+If no stakeholders are provided, the deal inherits from the lead (legacy behavior) with a validation that the inherited total equals 100%.
+
+### Skip conditions (no sync)
+
+| Condition | When Source Is Lead | When Source Is Deal |
+| --- | --- | --- |
+| No linked entity | No active deal exists | No originating lead |
+| Linked entity deleted | Deal is soft-deleted | Lead is soft-deleted |
+| Linked entity archived | Deal is archived | Lead is archived |
+| Deal is closed-lost | Deal has `isClosed=true AND isWon=false` | N/A |
+
+### Commission rules with sync
+
+| Scenario | Commission Rule |
+| --- | --- |
+| Deal (always) | Must be exactly 100% |
+| Lead with active deal | Must be exactly 100% (synced with deal) |
+| Lead without active deal | 0% or 100% (0% = not yet configured) |
+| Deal transitions to closed-lost or archived | Lead becomes "unlinked" — can go back to 0% |
 
 ## Team commission budget
 
@@ -174,9 +119,12 @@ AFTER claim by Agent X (same team):
 
 ### Commission aggregation with dual-record model
 
-With the [dual-record model](/backend/crm/stakeholder-model#dual-record-model), a single user can hold multiple stakeholder rows on the same entity. Always aggregate when computing payouts:
+With the dual-record model, a single user can hold **multiple** stakeholder rows on the same entity — one personal (`team_id=NULL`) and one per team they claimed from. Each row carries its own `commissionPercentage`.
+
+**Aggregation Rule for Payment/Reporting:**
 
 ```sql
+-- Total commission for a user on an entity (across all contexts)
 SELECT user_id, SUM(commission_percentage) AS total_commission
 FROM entity_stakeholder
 WHERE entity_type = :entityType
@@ -404,31 +352,23 @@ Query params: `userId` (UUID, optional), `teamId` (UUID, optional)
 </Tab>
 <Tab title="Batch update">
 
-**`PATCH /leads/:leadId/stakeholders/batch`** — Batch update with optional remove
+**`PUT /leads/:leadId/stakeholders`** — Full bidirectional sync replacement
 
 ```json Request
-{
-  "updates": [
-    { "stakeholderId": "stakeholder-uuid-1", "commissionPercentage": 50 },
-    { "stakeholderId": "stakeholder-uuid-2", "commissionPercentage": 50 }
-  ],
-  "removeStakeholderId": "stakeholder-uuid-3"
-}
+[
+  { "userId": "user-uuid-1", "commissionPercentage": 50, "isPrimary": true },
+  { "userId": "user-uuid-2", "commissionPercentage": 50, "isPrimary": false }
+]
 ```
+
+This replaces all stakeholders and syncs to active deal if one exists.
 
 ```json Response
 {
-  "updated": [
-    {
-      "id": "stakeholder-uuid-1",
-      "changes": [{ "field": "commissionPercentage", "from": 30, "to": 50 }]
-    },
-    {
-      "id": "stakeholder-uuid-2",
-      "changes": [{ "field": "commissionPercentage", "from": 30, "to": 50 }]
-    }
-  ],
-  "totalCommission": 100
+  "success": true,
+  "syncedToLinkedEntity": true,
+  "linkedEntityId": "deal-uuid-456",
+  "stakeholders": ["...updated stakeholder list..."]
 }
 ```
 
@@ -691,7 +631,7 @@ Query params: `page` (default: 1), `limit` (default: 50)
 | 2   | GET    | `/leads/:leadId/stakeholders/:stakeholderId/removal-preview` | Preview removal adjustments            |
 | 3   | GET    | `/leads/:leadId/stakeholders/add-preview`                    | Preview addition adjustments           |
 | 4   | POST   | `/leads/:leadId/stakeholders`                                | Create stakeholder with adjustments    |
-| 5   | PATCH  | `/leads/:leadId/stakeholders/batch`                          | Batch update stakeholders              |
+| 5   | PUT    | `/leads/:leadId/stakeholders`                                | Replace all stakeholders (with sync)   |
 | 6   | DELETE | `/leads/:leadId/stakeholders/:stakeholderId`                 | Remove stakeholder (auto-redistribute) |
 | 7   | POST   | `/leads/:leadId/assign`                                      | Assign lead to team                    |
 | 8   | POST   | `/leads/:leadId/unassign`                                    | Unassign lead (return to pool)         |
@@ -705,11 +645,34 @@ Query params: `page` (default: 1), `limit` (default: 50)
 
 Deal stakeholder endpoints mirror lead endpoints with `entityType: "deal"`. Key differences:
 
-- Deal stakeholder create/remove uses **automatic lead sync** via `StakeholderSyncService`
+- Deal stakeholder create/remove uses **automatic lead sync** via `syncToLinkedEntity`
 - Deals do **not** have a `/claim` endpoint — deals are created from leads (inheriting stakeholders) or assigned directly
 - Deal `assignToTeam` blocks if _any_ stakeholders exist (unlike lead which only blocks the target team)
 
 <Tabs>
+<Tab title="Replace all (with sync)">
+
+**`PUT /deals/:dealId/stakeholders`** — Replace all stakeholders with automatic lead sync
+
+```json Request
+[
+  { "userId": "user-uuid-1", "commissionPercentage": 60, "isPrimary": true },
+  { "userId": "user-uuid-2", "commissionPercentage": 40, "isPrimary": false }
+]
+```
+
+```json Response
+{
+  "success": true,
+  "syncedToLinkedEntity": true,
+  "linkedEntityId": "lead-uuid-123",
+  "message": "Deal stakeholders updated and synced to originating lead"
+}
+```
+
+Sync mirrors the deal's new stakeholder state to the originating lead. Skips if no lead, lead archived, or deal is closed-lost.
+
+</Tab>
 <Tab title="Create (with sync)">
 
 **`POST /deals/:dealId/stakeholders`** — Create stakeholder with automatic lead sync
@@ -717,13 +680,13 @@ Deal stakeholder endpoints mirror lead endpoints with `entityType: "deal"`. Key 
 ```json Response
 {
   "success": true,
-  "syncedToLead": true,
-  "leadId": "lead-uuid-123",
-  "message": "Stakeholder assigned to deal and synced to originating lead as observer"
+  "syncedToLinkedEntity": true,
+  "linkedEntityId": "lead-uuid-123",
+  "message": "Stakeholder assigned to deal and synced to originating lead"
 }
 ```
 
-Sync creates an observer on the originating lead (0% commission, same access level, never primary). Skips if user already on lead or lead is archived.
+Sync creates matching stakeholder on originating lead with same commission and access level.
 
 </Tab>
 <Tab title="Remove (with sync)">
@@ -731,14 +694,14 @@ Sync creates an observer on the originating lead (0% commission, same access lev
 **`DELETE /deals/:dealId/stakeholders/:stakeholderId`** — Remove with automatic lead sync
 
 ```json Response (synced)
-{ "success": true, "syncedToLead": true, "leadId": "lead-uuid-123" }
+{ "success": true, "syncedToLinkedEntity": true, "linkedEntityId": "lead-uuid-123" }
 ```
 
 ```json Response (sync skipped)
-{ "success": true, "syncedToLead": false, "leadId": "lead-uuid-123" }
+{ "success": true, "syncedToLinkedEntity": false, "linkedEntityId": "lead-uuid-123" }
 ```
 
-Safety checks: lead not archived, user has 0% on lead, user not primary on lead, user's only deal from that lead.
+Syncs removal to lead if conditions allow (see skip conditions table).
 
 </Tab>
 <Tab title="Assign to team">
@@ -768,7 +731,7 @@ Safety checks: lead not archived, user has 0% on lead, user not primary on lead,
 | 2   | GET    | `/deals/:dealId/stakeholders/:stakeholderId/removal-preview` | Preview removal adjustments    |
 | 3   | GET    | `/deals/:dealId/stakeholders/add-preview`                    | Preview addition adjustments   |
 | 4   | POST   | `/deals/:dealId/stakeholders`                                | Create stakeholder with sync   |
-| 5   | PATCH  | `/deals/:dealId/stakeholders/batch`                          | Batch update stakeholders      |
+| 5   | PUT    | `/deals/:dealId/stakeholders`                                | Replace all stakeholders (with sync) |
 | 6   | DELETE | `/deals/:dealId/stakeholders/:stakeholderId`                 | Remove stakeholder with sync   |
 | 7   | POST   | `/deals/:dealId/assign`                                      | Assign deal to team            |
 | 8   | POST   | `/deals/:dealId/unassign`                                    | Unassign deal                  |
@@ -923,7 +886,7 @@ Response is the same paginated format as `/entity-transfers/pending`.
 | 12  | `getRemovalPreview`       | `RemovalPreviewDto`                     | Preview removal adjustments            |
 | 13  | `getAddPreview`           | `AddPreviewDto`                         | Preview addition adjustments           |
 | 14  | `createWithAdjustments`   | `CreateEntityStakeholderResultDto`      | Create with commission adjustments     |
-| 15  | `batchUpdate`             | `BatchEntityStakeholderUpdateResultDto` | Batch update stakeholders              |
+| 15  | `syncStakeholdersInTransaction` | `{ success: boolean }`            | Replace all stakeholders (with sync)   |
 | 16  | `getCommissionSummary`    | `CommissionSummaryDto`                  | Get commission summary for entity      |
 | 17  | `removeAllForEntity`      | `RemovedStakeholdersDto`                | Remove all stakeholders (for unassign) |
 
@@ -932,8 +895,8 @@ Response is the same paginated format as `/entity-transfers/pending`.
 
 | #   | Function                     | Returns                    | Description                               |
 | --- | ---------------------------- | -------------------------- | ----------------------------------------- |
-| 1   | `assignToDealWithLeadSync`   | `StakeholderSyncResultDto` | Assign to deal with automatic lead sync   |
-| 2   | `removeFromDealWithLeadSync` | `StakeholderSyncResultDto` | Remove from deal with automatic lead sync |
+| 1   | `syncToLinkedEntity`         | `StakeholderSyncResultDto` | Sync stakeholders to linked entity        |
+| 2   | `findLinkedEntity`           | `{ entityType, entityId }` | Find linked entity (lead ↔ active deal)  |
 
 </Accordion>
 <Accordion title="LeadService">
@@ -953,10 +916,8 @@ Response is the same paginated format as `/entity-transfers/pending`.
 | --- | --------------------------- | -------------------------- | ------------------------------------------- |
 | 1   | `assignToTeam`              | `{ success: boolean }`     | Assign deal to team                         |
 | 2   | `unassign`                  | `{ success: boolean }`     | Unassign deal                               |
-| 3   | `assignStakeholderWithSync` | `StakeholderSyncResultDto` | Assign stakeholder with automatic lead sync |
-| 4   | `removeStakeholderWithSync` | `StakeholderSyncResultDto` | Remove stakeholder with automatic lead sync |
-| 5   | `getTransferPreview`        | `TransferPreviewDto`       | Preview transfer options                    |
-| 6   | `requestTransfer`           | `{ success: boolean }`     | Create transfer request                     |
+| 3   | `getTransferPreview`        | `TransferPreviewDto`       | Preview transfer options                    |
+| 4   | `requestTransfer`           | `{ success: boolean }`     | Create transfer request                     |
 
 </Accordion>
 <Accordion title="EntityTransferService">
@@ -1064,7 +1025,7 @@ Total: 100% ✓
 | `GET /leads/:id/stakeholders/add-preview`     | `crm.manage` OR `team_crm.manage` (permission-only) |
 | `GET /leads/:id/stakeholders/removal-preview` | `crm.manage` OR `team_crm.manage` (permission-only) |
 | `POST /leads/:id/stakeholders`                | `crm.manage` OR `team_crm.manage` (permission-only) |
-| `PATCH /leads/:id/stakeholders/batch`         | `crm.manage` OR `team_crm.manage` (permission-only) |
+| `PUT /leads/:id/stakeholders`                 | `crm.manage` OR `team_crm.manage` (permission-only) |
 | `DELETE /leads/:id/stakeholders/:id`          | `crm.manage` OR `team_crm.manage` (permission-only) |
 | `POST /leads/:id/assign`                      | `team_crm.manage`, Team Leader, or Admin            |
 | `POST /leads/:id/unassign`                    | Primary stakeholder + `crm.manage`, or Admin        |
@@ -1083,7 +1044,7 @@ Total: 100% ✓
 | `GET /deals/:id/stakeholders/add-preview`     | `sales.manage` OR `team_sales.manage` (permission-only) |
 | `GET /deals/:id/stakeholders/removal-preview` | `sales.manage` OR `team_sales.manage` (permission-only) |
 | `POST /deals/:id/stakeholders`                | `sales.manage` OR `team_sales.manage` (permission-only) |
-| `PATCH /deals/:id/stakeholders/batch`         | `sales.manage` OR `team_sales.manage` (permission-only) |
+| `PUT /deals/:id/stakeholders`                 | `sales.manage` OR `team_sales.manage` (permission-only) |
 | `DELETE /deals/:id/stakeholders/:id`          | `sales.manage` OR `team_sales.manage` (permission-only) |
 
 </Tab>
@@ -1155,19 +1116,27 @@ Now Sarah has 60%, Mike has 40%, team has 0%.
 Deal inherits Sarah (60%) and Mike (40%) from lead.
 </Step>
 
-<Step title="New agent added to deal">
+<Step title="Stakeholder changes synced bidirectionally">
 ```bash
-POST /deals/456/stakeholders
-{ "userId": "tom-uuid", "commissionPercentage": 20 }
+PUT /deals/456/stakeholders
+[
+  { "userId": "sarah-uuid", "commissionPercentage": 50, "isPrimary": true },
+  { "userId": "mike-uuid", "commissionPercentage": 30, "isPrimary": false },
+  { "userId": "tom-uuid", "commissionPercentage": 20, "isPrimary": false }
+]
 ```
-Tom added to deal with 20% commission, also synced to lead as observer (0%).
+Changes are automatically synced to the originating lead with identical stakeholder state.
 </Step>
 
-<Step title="Agent removed from deal">
+<Step title="Lead changes sync back to deal">
 ```bash
-DELETE /deals/456/stakeholders/tom-stakeholder
+PUT /leads/123/stakeholders
+[
+  { "userId": "sarah-uuid", "commissionPercentage": 40, "isPrimary": true },
+  { "userId": "alice-uuid", "commissionPercentage": 60, "isPrimary": false }
+]
 ```
-Tom removed from deal. Since he has 0% on lead and it's his only deal, he's also removed from lead.
+Lead changes are automatically synced to the active deal, maintaining identical state.
 </Step>
 </Steps>
 
@@ -1213,7 +1182,7 @@ Transfer executed: Sarah (20%), Mike (40%), Alice (40%, primary).
 | Update                | `new total ≤ 100`; cannot remove last primary; auto-cancels pending transfers when commission reduced     |
 | Remove                | Auto-redistributes proportionally; cannot remove primary while others exist; auto-cancels transfers       |
 | Transfer              | `fromKeepsPercentage ≤ primary's commission`; 0% only to existing stakeholders; requester must be primary |
-| Batch                 | `sum(all) = 100`; at least one primary; auto-cancels transfers if commission reduced                      |
+| Sync (PUT)            | `sum(all) = 100`; at least one primary; full replacement with bidirectional sync                         |
 | Team Assign           | Same as create; `originalTeamCommission` set to 100                                                       |
 | Team Claim            | User gets team's commission, team → 0%; `originalTeamCommission` recorded; team preserved                 |
 | Unassign              | Removes all stakeholders; auto-cancels all pending transfers                                              |
@@ -1243,7 +1212,7 @@ The sync service follows patterns from the [query optimization guide](/backend/q
 | Assign stakeholder | ~50ms        | ~80ms     | +30ms    |
 | Remove stakeholder | ~50ms        | ~100ms    | +50ms    |
 
-Additional queries: check originating lead (1), check lead exists/archived (1), check user on lead (1), count other deals (1, EXISTS), assign/remove on lead (1-2). Total: 4-6 queries, all optimized with indexes.
+Additional queries: check linked entity (1), check entity exists/archived (1), sync stakeholder state (2-4). Total: 4-6 queries, all optimized with indexes.
 
 <CardGroup cols={2}>
   <Card
