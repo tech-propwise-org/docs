@@ -1,0 +1,315 @@
+---
+title: "Distribution Module Specification"
+description: "Comprehensive specification for the automated lead distribution system including rule-based assignment, agent availability, and business hours configuration"
+---
+
+## Overview
+
+The distribution module manages the automated assignment of leads to agents within an organization. It provides a flexible rule-based system for distributing leads using various methods (round-robin, weighted, weighted round-robin, direct assignment) while respecting agent availability, capacity limits, and business hours.
+
+<Note>
+**Business Hours Refactor (2026-03-30):** Business hours configuration has been extracted from `DistributionSettings` into a dedicated `OrgSettings` entity. `DistributionSettings` now holds only a boolean flag `respectBusinessHours`; `TeamDistributionSettings` has a nullable tri-state `respectBusinessHours`. The `OrgSettings` entity is the single source of truth for timezone, schedule, and enabled flag.
+</Note>
+
+All assignment flows are **direct** — leads are assigned immediately to eligible agents. It maintains comprehensive audit logs of all distribution decisions and provides fallback mechanisms when primary distribution fails.
+
+<Warning>
+The acceptance workflow (offer-based assignment requiring agent accept/decline) was planned but removed. All assignment is now direct. The `lead_assignment_offer` table, `TimeoutAction` enum, and related fields have been deleted from the schema.
+</Warning>
+
+## Architecture
+
+The distribution system is built around five core entities:
+
+- **OrgSettings**: Org-level business hours schedule (timezone, weekly slots, enabled)
+- **DistributionSettings**: Org-level distribution configuration and defaults
+- **TeamDistributionSettings**: Per-team distribution configuration
+- **DistributionRule**: Defines how leads should be distributed (method, scope, criteria)
+- **AgentAvailability**: Controls agent eligibility for receiving leads
+- **DistributionLog**: Immutable audit trail of distribution decisions
+
+The system follows an event-driven architecture where lead creation triggers the distribution engine, which evaluates rules, checks agent availability, and assigns leads directly to the selected agent.
+
+### Distribution Paths
+
+The engine supports two execution paths:
+
+<Tabs>
+<Tab title="Path A - Org-level Distribution">
+**Function**: `runDistribution`
+
+Triggered when a lead enters the org with no team context. Evaluates org-scoped rules, applies the org default method, and can bridge to Path B if a rule or default method routes to a team that has `distributionEnabled = true`.
+</Tab>
+
+<Tab title="Path B - Team-level Distribution">
+**Function**: `runTeamDistribution`
+
+Triggered directly when:
+- A lead is created with a `teamId` in the event payload (team pool assignment)
+- Path A determines the lead belongs to an auto-distributing team
+- Idempotency check finds a single team-only stakeholder with auto-distribute enabled
+
+Path B evaluates team-scoped rules, uses team settings (with org fallback for capacity), and logs the team FK on the resulting DistributionLog record.
+</Tab>
+</Tabs>
+
+## Entity Specifications
+
+### AgentAvailability
+
+Controls whether an agent is eligible to receive auto-distributed leads.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `user` | User | The agent (indexed) |
+| `organization` | Organization | Organization scope (indexed) |
+| `isAvailable` | boolean | Whether agent can receive leads (default: true, indexed) |
+| `unavailableReason` | UnavailableReason | Reason for unavailability (enum) |
+| `unavailableNote` | string | Optional custom note |
+| `unavailableUntil` | DateTime | When availability should be restored |
+
+**Constraints:**
+- Unique constraint on `(user, organization)`
+- Index on `(organization, isAvailable)` for efficient queries
+
+### DistributionRule
+
+Defines distribution logic and criteria for lead assignment.
+
+<AccordionGroup>
+<Accordion title="Core Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `organization` | Organization | Organization scope |
+| `createdBy` | User | Rule creator |
+| `name` | string | Rule identifier |
+| `isActive` | boolean | Whether rule is enabled |
+| `priority` | number | Rule evaluation order (higher = first) |
+| `method` | DistributionMethod | Assignment method (enum) |
+| `scope` | DistributionScope | ORGANIZATION or TEAM |
+| `targetTeam` | Team | Target team (when scope is TEAM) |
+</Accordion>
+
+<Accordion title="Matching & Language Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `conditions` | JSON | Lead matching criteria `[{field, operator, value}]` |
+| `matchMode` | MatchMode | ALL or ANY for conditions |
+| `languageMatchingEnabled` | boolean | Enable language matching filter |
+| `languageMatchingMode` | LanguageMatchingMode | STRICT / PREFERRED / FALLBACK |
+| `recipients` | JSON | Target pool `{agentIds?, teamId?, poolId?, weights?}` |
+</Accordion>
+</AccordionGroup>
+
+### OrgSettings
+
+<Info>
+**New Entity (2026-03-30)**: Stores the org-level business hours schedule. One row per org — auto-created on first access with race-safe unique constraint handling.
+</Info>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `organization` | Organization | Organization scope (unique) |
+| `businessHoursEnabled` | boolean | Global on/off for BH enforcement (default: `false`) |
+| `businessHoursTimezone` | varchar | IANA timezone for schedule evaluation (default: `'Asia/Dubai'`) |
+| `businessHoursSchedule` | JSONB | `[{dayOfWeek, startTime, endTime}]` — multi-shift per day supported |
+| `updatedBy` | User | Last admin to update (nullable) |
+| `createdAt` | DateTime | Auto-set on create |
+| `updatedAt` | DateTime | Auto-set on update |
+
+**RBAC Requirements:**
+- `VIEW_DISTRIBUTION_SETTINGS` for GET operations
+- `MANAGE_DISTRIBUTION` for PUT operations
+
+<Tip>
+**Get-or-create pattern**: `OrgSettingsService.getOrCreateRaw(em, orgId)` provides race-safe auto-creation and returns `{ settings, cleared }`. The `cleared` flag signals when `em.clear()` was invoked during unique-violation recovery.
+</Tip>
+
+### DistributionSettings
+
+Org-level configuration with one record per org. Auto-created with defaults on first access.
+
+<AccordionGroup>
+<Accordion title="Core Distribution Settings">
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `organization` | Organization | Organization scope |
+| `distributionEnabled` | boolean | **Master on/off switch** (default: `false`) |
+| `defaultMethod` | DefaultDistributionMethod | Fallback method when no rule matches |
+| `defaultTeam` | Team | Used when `defaultMethod = SPECIFIC_TEAM` (nullable) |
+| `defaultLanguageMatchingMode` | LanguageMatchingMode | `STRICT`, `PREFERRED`, or `FALLBACK` |
+</Accordion>
+
+<Accordion title="Capacity & Business Hours">
+| Field | Type | Description |
+|-------|------|-------------|
+| `maxActiveLeadsPerAgent` | int | Max active lead-stakeholder records (default: `50`) |
+| `maxNewLeadsPerDay` | int | Max leads assignable per agent per day (default: `15`) |
+| `capacityEnforcementEnabled` | boolean | Exclude agents at capacity (default: `false`) |
+| `respectBusinessHours` | boolean | Gate leads against `OrgSettings.businessHoursSchedule` (default: `true`) |
+| `outsideHoursAction` | OutsideHoursAction | Action for leads outside hours (`QUEUE`, `POOL`, `DUTY_AGENT`) |
+| `dutyAgent` | User | Assigned when `outsideHoursAction = DUTY_AGENT` (nullable) |
+</Accordion>
+
+<Accordion title="Pool Alerts & Metadata">
+| Field | Type | Description |
+|-------|------|-------------|
+| `poolAlertEnabled` | boolean | Whether to send pool-overload alerts |
+| `poolAlertThreshold` | int | Lead count that triggers an alert |
+| `poolAlertWindowMinutes` | int | Rolling window for counting unassigned leads |
+| `updatedBy` | User | Last admin to update settings (nullable) |
+| `createdAt` | DateTime | Auto-set on create |
+| `updatedAt` | DateTime | Auto-set on create/update |
+</Accordion>
+</AccordionGroup>
+
+<Check>
+**Master Toggle Behavior**: When `distributionEnabled = false`, no pg-boss jobs are enqueued and leads go directly to pool. When toggled to `true`, if `defaultMethod` is still `POOL` it auto-upgrades to `ROUND_ROBIN`.
+</Check>
+
+### TeamDistributionSettings
+
+Per-team configuration with one record per `(organization, team)` pair. Auto-created on first access with independent boolean settings and inheritable numeric capacity limits.
+
+<AccordionGroup>
+<Accordion title="Core Team Settings">
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `organization` | Organization | Organization scope |
+| `team` | Team | The team (required, not nullable) |
+| `distributionEnabled` | boolean | Auto-distribute leads assigned to team pool (default: `false`) |
+| `distributionMethod` | DistributionMethod | Distribution method for team (default: `ROUND_ROBIN`) |
+| `agentWeights` | JSONB | `{ [userId]: weight }` for WEIGHTED method (nullable) |
+</Accordion>
+
+<Accordion title="Language & Capacity Settings">
+| Field | Type | Description |
+|-------|------|-------------|
+| `languageMatchingEnabled` | boolean | Enable language matching (default: `false`) |
+| `languageMatchingMode` | LanguageMatchingMode | Language matching mode override (nullable) |
+| `capacityEnforcementEnabled` | boolean | Apply capacity limits (default: `false`) |
+| `maxActiveLeadsPerAgent` | int | Team-level limit, `null` = inherit from org (nullable) |
+| `maxNewLeadsPerDay` | int | Team-level limit, `null` = inherit from org (nullable) |
+| `respectBusinessHours` | boolean | **Tri-state BH override** (nullable) |
+</Accordion>
+
+<Accordion title="Round-Robin & Metadata">
+| Field | Type | Description |
+|-------|------|-------------|
+| `lastAssignedIndex` | int | Round-robin cursor for team fallback path (default: `0`) |
+| `updatedBy` | User | Last admin to update settings (nullable) |
+| `createdAt` | DateTime | Auto-set on create |
+| `updatedAt` | DateTime | Auto-set on create/update |
+</Accordion>
+</AccordionGroup>
+
+<Note>
+**Business Hours Tri-State Logic**:
+- `null` = inherit from org's `DistributionSettings.respectBusinessHours`
+- `true` = team always enforces business hours
+- `false` = team always distributes 24/7 regardless of schedule
+</Note>
+
+## Distribution Methods
+
+<CardGroup cols={2}>
+<Card title="Round Robin" icon="arrows-rotate">
+Sequential assignment to available agents in rotation order
+</Card>
+
+<Card title="Weighted" icon="scale-balanced">
+Random selection based on agent-specific weight values
+</Card>
+
+<Card title="Weighted Round Robin" icon="circle-nodes">
+Combines round-robin fairness with weighted preferences
+</Card>
+
+<Card title="Direct Assignment" icon="bullseye">
+Assigns leads directly to specified agents or teams
+</Card>
+</CardGroup>
+
+## Business Hours Integration
+
+<Steps>
+<Step title="Business Hours Check">
+Engine checks if both `OrgSettings.businessHoursEnabled` AND the effective `respectBusinessHours` flag are true
+</Step>
+
+<Step title="Schedule Evaluation">
+Current time is evaluated against `OrgSettings.businessHoursSchedule` using the configured timezone
+</Step>
+
+<Step title="Outside Hours Action">
+If outside business hours, the configured `outsideHoursAction` is applied:
+- `QUEUE`: Hold lead for next business hour
+- `POOL`: Send to unassigned pool
+- `DUTY_AGENT`: Assign to designated duty agent
+</Step>
+</Steps>
+
+## Capacity Management
+
+The system enforces two types of capacity limits when `capacityEnforcementEnabled` is true:
+
+<Tabs>
+<Tab title="Active Leads Limit">
+**Field**: `maxActiveLeadsPerAgent`
+**Default**: 50
+
+Maximum number of active lead-stakeholder records an agent can hold simultaneously.
+</Tab>
+
+<Tab title="Daily Assignment Limit">
+**Field**: `maxNewLeadsPerDay`
+**Default**: 15
+
+Maximum number of new leads that can be assigned to an agent within a calendar day.
+</Tab>
+</Tabs>
+
+## Language Matching
+
+<AccordionGroup>
+<Accordion title="STRICT Mode">
+Agent must have exact language match with lead's preferred language. No assignment if no match found.
+</Accordion>
+
+<Accordion title="PREFERRED Mode">
+Prioritizes agents with matching languages but falls back to any available agent if no language match exists.
+</Accordion>
+
+<Accordion title="FALLBACK Mode">
+Attempts language matching first, then falls back to standard distribution if no language-matched agents are available.
+</Accordion>
+</AccordionGroup>
+
+## Audit and Monitoring
+
+### DistributionLog
+
+Immutable audit trail capturing all distribution decisions and outcomes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `lead` | Lead | The distributed lead |
+| `organization` | Organization | Organization context |
+| `team` | Team | Team context for Path B distributions (nullable) |
+| `assignedAgent` | User | Selected agent (nullable if failed) |
+| `distributionMethod` | DistributionMethod | Method used for assignment |
+| `ruleApplied` | DistributionRule | Rule that matched (nullable) |
+| `status` | DistributionStatus | SUCCESS, FAILED, NO_ELIGIBLE_AGENTS |
+| `failureReason` | string | Details when status is not SUCCESS (nullable) |
+| `executionTimeMs` | int | Processing time in milliseconds |
+| `createdAt` | DateTime | When distribution occurred |
+
+<Warning>
+**Immutable Records**: DistributionLog entries are never updated or deleted. They provide a complete audit trail of all distribution decisions for compliance and analysis purposes.
+</Warning>
