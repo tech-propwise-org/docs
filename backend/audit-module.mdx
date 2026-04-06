@@ -3,65 +3,192 @@ title: "Audit module"
 description: "Comprehensive tracking and querying capabilities for all data changes within the PropWise CRM system with timeline resolution functionality."
 ---
 
-The audit module provides comprehensive tracking and querying capabilities for all data changes within the PropWise CRM system. It captures create, update, and delete operations across all entities through PostgreSQL triggers, storing them in an immutable audit log. The module includes timeline resolution functionality to convert raw audit entries into human-readable timeline events for frontend consumption.
+The audit module provides comprehensive tracking and querying capabilities for all data changes within the PropWise CRM system. It captures INSERT, UPDATE, and DELETE operations across 35+ entities through PostgreSQL triggers, storing them in an immutable audit log. The module includes timeline resolution functionality to convert raw audit entries into human-readable timeline events for frontend consumption.
 
 <Note>
-The system is built on PostgreSQL triggers so it captures all data changes automatically at the database level, ensuring comprehensive audit coverage.
+The system is built on PostgreSQL triggers so it captures all data changes automatically at the database level, ensuring bypass-proof audit coverage that cannot be circumvented by application code.
 </Note>
 
 ## Architecture
 
-The audit system follows a trigger-based approach where all data changes are captured automatically at the database level:
+The audit system follows a trigger-based approach where all data changes are captured automatically at the database level using PostgreSQL's transaction-local variable system for context propagation:
 
-- **Database Triggers**: PostgreSQL `audit_trigger_func()` captures all CUD operations
-- **Read-Only Entity**: `AuditLog` entity is strictly for querying, never persisted by application code  
-- **Timeline Resolution**: Converts raw audit data into semantic timeline events
-- **Multi-tenant**: Audit logs are scoped by tenant context
-- **Performance**: Indexed by tenant, timestamp, and table for efficient querying
-
-```mermaid
-graph TB
-    A[NestJS Application] --> B[PostgreSQL Triggers]
-    B --> C[audit_log table]
-    C --> D[AuditService]
-    D --> E[Timeline Resolution]
-    E --> F[Frontend APIs]
-    
-    subgraph "Context"
-        G[Tenant ID]
-        H[User ID]
-        I[Timestamp]
-    end
 ```
+┌─────────────────────────┐       ┌──────────────────────────┐
+│   Application Code      │       │   PostgreSQL Trigger     │
+│   (NestJS / ORM)        │──────►│   audit_trigger_func()   │
+│                         │       │   AFTER INSERT/UPDATE/   │
+│  executeInOrg()         │       │   DELETE ON each table   │
+│    SET LOCAL            │       │                          │
+│      app.organization_id│       │  Reads SET LOCAL vars:   │
+│      app.user_id        │       │    app.organization_id   │
+│      app.session_id     │       │    app.user_id           │
+│      app.ip_address     │       │    app.session_id        │
+└─────────────────────────┘       │    app.ip_address        │
+                                  │                          │
+                                  │  Writes to audit_log     │
+                                  └──────────┬───────────────┘
+                                             │
+                                  ┌──────────▼───────────────┐
+                                  │   audit_log table        │
+                                  │   (append-only via RLS)  │
+                                  └──────────────────────────┘
+```
+
+### Key Design Principles
+
+| Principle                   | Implementation                                                                                             |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Atomic capture**          | Trigger fires inside the same transaction as the data change — either both succeed or both roll back       |
+| **Bypass-proof**            | Writes happen at the DB level; application code has no `em.persist()` path to the table                    |
+| **Immutable records**       | RLS policies deny UPDATE and DELETE; INSERT is denied to the application role                              |
+| **Tenant-scoped reads**     | RLS SELECT policy enforces `organization_id` isolation                                                     |
+| **Sensitive data stripped** | Trigger removes `password`, `refresh_token`, `hashed_token`, `refresh_token_hash` before storing snapshots |
+
+## Database Schema
+
+The audit log uses the actual PostgreSQL table structure with Row-Level Security enforcement:
+
+```sql
+CREATE TABLE "audit_log" (
+  "id"               UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  "occurred_at"      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  "user_id"          UUID        NULL,       -- NULL for system/cron actions
+  "organization_id"  UUID        NOT NULL,
+  "session_id"       UUID        NULL,       -- NULL when not in a user session
+  "action"           TEXT        NOT NULL CHECK ("action" IN ('INSERT', 'UPDATE', 'DELETE')),
+  "table_name"       TEXT        NOT NULL,
+  "record_id"        UUID        NOT NULL,
+  "old_data"         JSONB       NULL,       -- NULL for INSERT
+  "new_data"         JSONB       NULL,       -- NULL for DELETE
+  "changed_fields"   TEXT[]      NULL,       -- Populated for UPDATE only
+  "ip_address"       TEXT        NULL,
+  "is_system_action" BOOLEAN     NOT NULL DEFAULT false
+);
+```
+
+### Performance Indexes
+
+| Index                      | Columns                                                  | Purpose                              |
+| -------------------------- | -------------------------------------------------------- | ------------------------------------ |
+| `idx_audit_org_time`       | `organization_id, occurred_at DESC`                      | Default list view — org-scoped feed  |
+| `idx_audit_record`         | `table_name, record_id, occurred_at DESC`                | Change history for a specific record |
+| `idx_audit_user_time`      | `user_id, occurred_at DESC`                              | Activity feed for a specific user    |
+| `idx_audit_table_time`     | `organization_id, table_name, occurred_at DESC`          | Filter by entity type within an org  |
+| `idx_audit_log_session_id` | `session_id, occurred_at DESC` (partial, WHERE NOT NULL) | Per-session activity trace           |
+
+## Row-Level Security (RLS)
+
+Four policies enforce the append-only, tenant-isolated contract:
+
+<AccordionGroup>
+<Accordion title="audit_log_select Policy">
+**Operation:** SELECT  
+**Rule:** Allow if `organization_id` matches `app.organization_id`, or `app.bypass_rls = 'true'`
+
+This policy ensures users can only see audit logs for their organization, with an escape hatch for system administrators.
+</Accordion>
+
+<Accordion title="audit_log_no_insert Policy">
+**Operation:** INSERT  
+**Rule:** `WITH CHECK (false)` — always denied to application role
+
+Prevents application code from inserting audit records directly. Only trigger functions can write.
+</Accordion>
+
+<Accordion title="audit_log_no_update Policy">
+**Operation:** UPDATE  
+**Rule:** `USING (false)` — always denied
+
+Ensures audit logs are immutable once created.
+</Accordion>
+
+<Accordion title="audit_log_no_delete Policy">
+**Operation:** DELETE  
+**Rule:** `USING (false)` — always denied
+
+Prevents deletion of audit records, maintaining complete audit trail.
+</Accordion>
+</AccordionGroup>
+
+<Warning>
+The trigger functions use `SECURITY DEFINER` so they run with elevated privileges and can insert despite the INSERT policy. Application code cannot bypass these restrictions.
+</Warning>
+
+## Trigger Coverage
+
+The audit system covers 35+ tables through two specialized trigger functions:
+
+### `audit_trigger_func()` — General Purpose
+
+Attached to all core business entities:
+
+**Audited Tables:**
+`lead`, `deal`, `contact`, `person`, `company`, `deal_contact`, `contact_company_role`,
+`commission_payment`, `entity_stakeholder`, `entity_transfer`, `lead_stage`, `deal_stage`,
+`lead_stage_history`, `deal_stage_history`, `entity_stakeholder_history`, `user`,
+`user_org_roles`, `organization`, `role`, `permission`, `invitation`, `team`,
+`team_membership`, `team_membership_role`, `secondary_unit`, `inventory_unit_ownership`,
+`inventory_unit_transaction`, `shared_deal`, `shared_listing`, `unit_access_grant`,
+`unit_access_request`, `developer_project_link`, `system_config`, `email_integrations`, `api_key`
+
+**Logic:**
+- **DELETE** → record old_data, record_id from OLD row
+- **INSERT** → record new_data, record_id from NEW row  
+- **UPDATE** → record both, compute changed_fields (array of column names that differ)
+
+### `audit_session_trigger_func()` — Session Table
+
+Dedicated trigger for the `session` table with heartbeat filtering. UPDATE events where only `last_active_at`, `activity_count`, or `last_activity_type` changed are silently discarded to avoid high-frequency noise.
+
+## Context Propagation
+
+Every write transaction sets PostgreSQL session-local variables so triggers can identify who made the change:
+
+```typescript
+// In TenantContext.executeInOrg()
+SET LOCAL app.organization_id = '<uuid>';
+SET LOCAL app.bypass_rls      = 'false';
+SET LOCAL app.user_id         = '<uuid>';      -- from CLS (auth guard)
+SET LOCAL app.session_id      = '<uuid>';      -- from SessionService
+SET LOCAL app.ip_address     = '<ip>';         -- from request headers
+```
+
+<Note>
+Context variables are automatically cleared at transaction end, ensuring no cross-request contamination.
+</Note>
 
 ## Entities
 
 ### AuditLog
 
-The core audit log entity that maps to the `audit_log` database table:
+The core audit log entity that maps to the PostgreSQL `audit_log` table:
 
 ```typescript
 class AuditLog {
   id: string;                    // Primary key (UUID)
-  tenantId: string;             // Tenant isolation
+  organizationId: string;        // Tenant isolation (matches backend schema)
   tableName: string;            // Source table name
   recordId: string;             // ID of the affected record
-  action: AuditAction;          // CREATE | UPDATE | DELETE
-  oldValues?: Record<string, unknown>;  // Previous values (UPDATE/DELETE)
-  newValues?: Record<string, unknown>;  // New values (CREATE/UPDATE)
+  action: AuditAction;          // INSERT | UPDATE | DELETE
+  oldData?: Record<string, unknown>;    // Previous values (UPDATE/DELETE)
+  newData?: Record<string, unknown>;    // New values (INSERT/UPDATE)
   changedFields?: string[];     // List of changed field names
   userId?: string;              // User who made the change
-  timestamp: Date;              // When the change occurred
+  sessionId?: string;           // Session context
+  ipAddress?: string;           // Source IP address
+  isSystemAction: boolean;      // Whether this was a system/cron action
+  occurredAt: Date;             // When the change occurred
 }
 ```
 
 ### AuditAction
 
-Enumeration of possible audit actions:
+Enumeration matching the database constraint:
 
 ```typescript
 enum AuditAction {
-  CREATE = 'CREATE',
+  INSERT = 'INSERT',
   UPDATE = 'UPDATE', 
   DELETE = 'DELETE'
 }
@@ -115,12 +242,12 @@ Cross-tenant audit log access for system administrators with additional tenant f
 
 ```typescript
 class SystemAdminAuditQueryDto extends AuditLogQueryDto {
-  tenantId?: string;  // Filter by specific tenant
+  organizationId?: string;  // Filter by specific tenant
 }
 ```
 
 <Warning>
-The system admin endpoint bypasses tenant isolation. Use carefully when accessing cross-tenant data.
+The system admin endpoint bypasses tenant isolation by setting `app.bypass_rls = 'true'`. Use carefully when accessing cross-tenant data.
 </Warning>
 
 ## Timeline Event Types
@@ -153,13 +280,43 @@ enum TimelineEventType {
 }
 ```
 
+## Security Features
+
+### Sensitive Data Protection
+
+The trigger system automatically strips sensitive fields before storing snapshots:
+
+```sql
+-- Applied to both old_data and new_data
+v_old_data := v_old_data - 'password' - 'refresh_token' - 'hashed_token' - 'refresh_token_hash';
+v_new_data := v_new_data - 'password' - 'refresh_token' - 'hashed_token' - 'refresh_token_hash';
+```
+
+### Bypass-Proof Design
+
+<Steps>
+<Step title="Database-level enforcement">
+All audit capture happens in PostgreSQL triggers, not application code
+</Step>
+<Step title="RLS policy protection">
+Application roles cannot INSERT, UPDATE, or DELETE audit records
+</Step>
+<Step title="SECURITY DEFINER functions">
+Only elevated trigger functions can write to audit tables
+</Step>
+<Step title="Transaction atomicity">
+Audit records are captured in the same transaction as the data change
+</Step>
+</Steps>
+
 ## Business Rules
 
 ### Data Capture Rules
-- All database changes are captured automatically via triggers
-- Sensitive fields (passwords, tokens) are automatically filtered out
-- Audit entries are immutable once created
+- All database changes on covered tables are captured automatically via triggers
+- Sensitive fields (passwords, tokens) are automatically filtered out at trigger level
+- Audit entries are immutable once created (enforced by RLS)
 - Failed transactions do not generate audit entries (same transaction scope)
+- System actions are flagged with `is_system_action = true`
 
 ### Timeline Resolution Rules
 - Each audit log entry maps to exactly one `TimelineEventType`
@@ -168,8 +325,8 @@ enum TimelineEventType {
 - User information is resolved at query time, not stored in audit log
 
 ### Access Control
-- Users can only access audit logs for their tenant
-- System administrators can access cross-tenant audit data
+- Users can only access audit logs for their organization (enforced by RLS)
+- System administrators can access cross-tenant audit data via bypass flag
 - Record-level access follows the same permissions as the source entity
 
 ## Integration Points
@@ -180,8 +337,8 @@ enum TimelineEventType {
 - User context provided via `@GetCurrentUser` decorator
 
 ### Tenant Context
-- All queries are automatically scoped by `TenantContext`
-- Cross-tenant access restricted to system administrators
+- All queries are automatically scoped by RLS `organization_id` enforcement
+- Cross-tenant access restricted to system administrators with bypass privileges
 
 ### Entity References
 - Resolves user information from `User` entity
@@ -221,9 +378,10 @@ The audit system prioritizes data consistency over strict HTTP semantics. Empty 
 ### Performance Considerations
 
 #### Database Optimization
-- **Primary Indexes**: `tenant_id`, `timestamp`, `table_name` for efficient querying
+- **Primary Indexes**: Five specialized indexes for common query patterns
 - **Pagination Strategy**: Prevents large result sets from impacting system performance
 - **Query-time Resolution**: Timeline resolution happens during queries, not at storage time to reduce write overhead
+- **Partitioning Ready**: Schema designed for date-based partitioning at scale
 
 #### Scaling Strategies
 - Audit log tables can be partitioned by date for large datasets
@@ -231,20 +389,22 @@ The audit system prioritizes data consistency over strict HTTP semantics. Empty 
 - Archival strategies can move older audit data to cold storage
 
 <Tip>
-For high-volume systems, consider implementing audit log partitioning and archival policies to maintain query performance over time.
+For high-volume systems, consider implementing audit log partitioning by `occurred_at` and archival policies to maintain query performance over time.
 </Tip>
 
 ### Security
 
 #### Data Protection
 - **Sensitive Field Filtering**: Passwords, tokens, and other sensitive data are automatically filtered at the database trigger level
-- **Tenant Isolation**: All queries are automatically scoped by tenant context to prevent cross-tenant data access
+- **Tenant Isolation**: RLS policies enforce `organization_id` isolation to prevent cross-tenant data access
 - **Immutable Logs**: No direct manipulation of audit logs through application code ensures data integrity
+- **IP Address Tracking**: Source IP addresses captured for security analysis
 
 #### Access Control
 - Standard authentication required for all endpoints
 - System admin endpoints have additional authorization checks
 - Record-level access follows source entity permissions
+- Session-based activity tracking for security audits
 
 <Warning>
 The audit system captures all data changes, including sensitive operations. Ensure proper access controls are in place and consider data retention policies for compliance requirements.
