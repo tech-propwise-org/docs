@@ -3,165 +3,212 @@ title: "Activity Monitor & Escalation Review Issues"
 description: "Critical issues identified during code review of activity monitor and escalation modules"
 ---
 
-This document outlines critical issues identified during a comprehensive code review of the activity monitor and escalation modules located in `src/modules/activity-monitor/` and `src/modules/escalation/`.
+This document outlines critical issues discovered during a comprehensive code review of the activity monitor and escalation modules in `src/modules/activity-monitor/` and `src/modules/escalation/`.
 
 <Warning>
-These issues range from dead code and non-deterministic behavior to potential data consistency problems and API documentation mismatches.
+These issues could impact system reliability, data consistency, and user experience. Prioritize fixes based on your production usage patterns.
 </Warning>
 
-## Dead Code Issues
+## Dead Code Detection
 
 ### `markAlertIgnored` is unused
 
-The `ActivityMonitorService.markAlertIgnored` method is defined but never called anywhere in the codebase. The follow-up processing path marks alerts as `IGNORED` using raw SQL inline instead of utilizing this dedicated method.
+The `ActivityMonitorService.markAlertIgnored` method is defined but never called in the codebase. Instead, the follow-up path marks alerts as `IGNORED` using raw SQL inline.
 
-<Note>
-**Recommendation**: Either consolidate the codebase to use the existing method or remove the dead code to reduce maintenance overhead.
-</Note>
+<Tabs>
+  <Tab title="Current Issue">
+    ```typescript
+    // Method exists but is never called
+    async markAlertIgnored(alertId: string) {
+      // Implementation exists
+    }
+
+    // Raw SQL used instead
+    await db.query('UPDATE alerts SET status = $1 WHERE id = $2', ['IGNORED', alertId]);
+    ```
+  </Tab>
+  <Tab title="Recommended Fix">
+    ```typescript
+    // Either use the existing method
+    await activityMonitorService.markAlertIgnored(alertId);
+
+    // Or remove the unused method entirely
+    ```
+  </Tab>
+</Tabs>
+
+**Impact**: Code maintenance burden and potential confusion for developers.
 
 ## Non-Deterministic Behavior
 
-### Team lead resolution lacks consistency
+### Team lead resolution inconsistency
 
-Both the activity monitor and escalation modules exhibit non-deterministic behavior when selecting team administrators:
+Both modules use `LIMIT 1` or `DISTINCT ON` without deterministic `ORDER BY` clauses when multiple `TEAM_ADMIN` users exist on a team.
 
-- Use `LIMIT 1` or `DISTINCT ON` without deterministic `ORDER BY` clauses
-- When multiple `TEAM_ADMIN` users exist on a team, alert assignment is arbitrary
-- The selected admin can change between different scans
+<Note>
+Which admin receives alerts is arbitrary and could change between database scans, leading to unpredictable notification patterns.
+</Note>
 
-<Warning>
-This unpredictable behavior can lead to inconsistent user experience and makes debugging difficult.
-</Warning>
-
-**Example problematic query pattern:**
 ```sql
+-- Problematic query
 SELECT user_id FROM team_members 
-WHERE team_id = ? AND role = 'TEAM_ADMIN' 
+WHERE team_id = $1 AND role = 'TEAM_ADMIN' 
 LIMIT 1;
--- Missing ORDER BY clause makes selection non-deterministic
+
+-- Should be
+SELECT user_id FROM team_members 
+WHERE team_id = $1 AND role = 'TEAM_ADMIN' 
+ORDER BY created_at ASC 
+LIMIT 1;
 ```
 
-## Data Consistency Issues
+## Concurrency Issues
 
-### Insert idempotency mismatch in escalation module
+### Insert idempotency mismatch in escalation
 
-The escalation module has inconsistent approaches to preventing duplicate inserts:
+Escalation module comments reference `INSERT … ON CONFLICT DO NOTHING`, but the actual code uses `INSERT … WHERE NOT EXISTS`.
 
-- Code comments reference `INSERT ... ON CONFLICT DO NOTHING`
-- Actual implementation uses `INSERT ... WHERE NOT EXISTS`
-- Under concurrent transactions, unique violations are still possible on partial unique indexes
+<Warning>
+Under concurrent transactions, unique violations are still possible on partial unique indexes, though unlikely.
+</Warning>
 
-<Tip>
-Consider using proper `ON CONFLICT` clauses with appropriate conflict resolution strategies to handle concurrent scenarios reliably.
-</Tip>
+<CodeGroup>
+```sql Comment Documentation
+-- Comments suggest this approach
+INSERT INTO escalation_comments (tracker_id, content) 
+VALUES ($1, $2) 
+ON CONFLICT DO NOTHING;
+```
 
-## Performance and Fairness Concerns
+```sql Actual Implementation
+-- Actual code uses this
+INSERT INTO escalation_comments (tracker_id, content) 
+SELECT $1, $2 
+WHERE NOT EXISTS (
+  SELECT 1 FROM escalation_comments 
+  WHERE tracker_id = $1
+);
+```
+</CodeGroup>
 
-### Inconsistent batch processing limits
+## Performance & Fairness Issues
 
-The two modules have different batch processing configurations:
-
-- **Activity Monitor**: Caps at 200 leads per rule per tick
-- **Escalation**: Caps at 500 items per batch
+### Scanner batch caps differ
 
 <Info>
-Large backlogs drain slowly with no fairness mechanism across rules. Earlier rules in iteration order receive priority, potentially starving later rules of processing time.
+Activity monitor processes 200 leads per rule per tick, while escalation processes 500. This inconsistency affects system load balancing.
 </Info>
+
+**Current Limits:**
+- Activity monitor: 200 leads/rule/tick
+- Escalation: 500 items/batch
+
+**Issues:**
+- Large backlogs drain slowly
+- No fairness mechanism across rules
+- Earlier rules in iteration order get priority
+
+### Recommended batch processing strategy
+
+<Steps>
+  <Step title="Standardize batch sizes">
+    Align both modules to use the same configurable batch size
+  </Step>
+  <Step title="Implement round-robin processing">
+    Ensure fair processing across all active rules
+  </Step>
+  <Step title="Add backlog monitoring">
+    Track and alert on processing delays
+  </Step>
+</Steps>
 
 ## State Management Problems
 
-### Exhausted escalation tiers create orphaned trackers
+### Exhausted escalation tiers create limbo state
 
-When all escalation tiers have been triggered:
+When all escalation tiers have fired, trackers remain `ACTIVE` with `next_escalation_at = NULL`, sitting indefinitely until an auto-resolution event occurs.
 
-- Tracker remains in `ACTIVE` status
-- `next_escalation_at` field is set to `NULL`
-- Tracker sits indefinitely until an auto-resolution event occurs
-- No dashboard visibility into "stuck" state
+```typescript
+// Problematic state
+{
+  status: 'ACTIVE',
+  next_escalation_at: null,
+  // No scheduled action, no dashboard visibility
+}
+```
 
-<Warning>
-This can lead to accumulation of stale trackers with no scheduled actions and no clear resolution path.
-</Warning>
+<Tip>
+Consider adding a `EXHAUSTED` status or automatic cleanup for trackers with no future escalation schedule.
+</Tip>
 
-### Stranded activity alerts with disabled notifications
+### Activity alerts can become stranded
 
-When `notifyTeamLead` is configured as `false`:
-
-- Follow-up processing stamps `follow_up_sent_at` timestamp
-- Alert never transitions out of `PENDING` or `ESCALATED` status
-- Alerts can remain in limbo indefinitely
-
-**Problem flow:**
-<Steps>
-<Step title="Alert created">
-Activity alert is generated and enters `PENDING` status
-</Step>
-<Step title="Follow-up processing">
-System processes alert but `notifyTeamLead = false`
-</Step>
-<Step title="Timestamp updated">
-`follow_up_sent_at` is set but status remains unchanged
-</Step>
-<Step title="Alert stranded">
-No terminal state transition occurs, alert persists indefinitely
-</Step>
-</Steps>
-
-## Status Semantics Inconsistency
-
-### Divergent resolution status handling
-
-The system uses inconsistent status values for different resolution scenarios:
-
-<Tabs>
-<Tab title="Archive/Delete Events">
-- **Status**: `CANCELLED`
-- **Reason**: `AUTO_ARCHIVED` or `AUTO_DELETED`
-- Used for leads that are archived or deleted
-</Tab>
-<Tab title="Auto-Resolution Events">
-- **Status**: `RESOLVED`
-- Used for activity, stage, or reassignment events
-</Tab>
-</Tabs>
-
-<Note>
-Analytics or dashboards that count only `RESOLVED` status would undercount the total number of closed escalations, missing those marked as `CANCELLED`.
-</Note>
-
-## Documentation Mismatches
-
-### API route specification inconsistency
-
-There's a mismatch between specification documents and actual API implementation:
-
-- **Specification docs**: Reference paths like `/activity-monitor/rules`
-- **Actual routes**: Use `/activity-monitor-rules` and `/activity-monitor-alerts`
-
-<Check>
-**Action Required**: Update either the API routes to match specifications or update documentation to reflect actual implementation.
-</Check>
-
-## Recommended Actions
+When `notifyTeamLead` is false, the follow-up path stamps `follow_up_sent_at` but never transitions alerts out of `PENDING`/`ESCALATED` status.
 
 <AccordionGroup>
-<Accordion title="High Priority Fixes">
-- Remove dead `markAlertIgnored` method or implement its usage
-- Add deterministic ordering to team lead selection queries
-- Implement proper terminal states for disabled notifications
-- Standardize resolution status semantics across modules
-</Accordion>
-
-<Accordion title="Medium Priority Improvements">
-- Implement fairness mechanisms for batch processing
-- Add monitoring for "stuck" escalation trackers
-- Resolve insert idempotency implementation inconsistencies
-- Align API documentation with actual routes
-</Accordion>
-
-<Accordion title="Performance Considerations">
-- Standardize batch processing limits across modules
-- Implement proper conflict resolution for concurrent operations
-- Add metrics for tracking processing fairness
-</Accordion>
+  <Accordion title="Current Flow Issues">
+    1. Alert created in `PENDING` status
+    2. `notifyTeamLead = false` is processed
+    3. `follow_up_sent_at` timestamp is set
+    4. Alert status never changes
+    5. Alert remains in limbo indefinitely
+  </Accordion>
+  <Accordion title="Recommended Resolution">
+    1. Define terminal states for non-notification scenarios
+    2. Implement automatic transitions after follow-up processing
+    3. Add cleanup jobs for orphaned alerts
+  </Accordion>
 </AccordionGroup>
+
+## Semantic Inconsistencies
+
+### RESOLVED vs CANCELLED status divergence
+
+The system uses different status values for similar resolution scenarios:
+
+<CardGroup cols={2}>
+  <Card title="Archived/Deleted Leads">
+    - Status: `CANCELLED`
+    - Reason: `AUTO_ARCHIVED` or `AUTO_DELETED`
+  </Card>
+  <Card title="Auto-Resolved Items">
+    - Status: `RESOLVED`
+    - Triggers: Activity/stage/reassignment changes
+  </Card>
+</CardGroup>
+
+<Warning>
+Analytics or dashboards counting only `RESOLVED` status would undercount total closed escalations.
+</Warning>
+
+## Documentation Inconsistencies
+
+### API route specification mismatch
+
+Activity monitor specification documents reference REST-style paths that don't match actual implementation:
+
+| Documentation | Actual Routes |
+|--------------|---------------|
+| `/activity-monitor/rules` | `/activity-monitor-rules` |
+| `/activity-monitor/alerts` | `/activity-monitor-alerts` |
+
+<Check>
+Update API documentation to reflect the hyphenated resource-style routes actually implemented.
+</Check>
+
+## Next Steps
+
+<Steps>
+  <Step title="Prioritize fixes">
+    Address concurrency and state management issues first, as they impact data integrity
+  </Step>
+  <Step title="Standardize processing">
+    Align batch sizes and implement fair processing across both modules
+  </Step>
+  <Step title="Update documentation">
+    Correct API route documentation and add state transition diagrams
+  </Step>
+  <Step title="Add monitoring">
+    Implement alerts for stuck trackers and processing backlogs
+  </Step>
+</Steps>
