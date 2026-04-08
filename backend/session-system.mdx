@@ -1,130 +1,143 @@
 ---
 title: "Session system"
-description: "Per-organization session management with device tracking, geolocation, suspicious login detection, three-tier session limits, and three-scope logout."
+description: "Two-level session architecture with AuthSession (device-level) and OrgSession (org-level), featuring global session policy, device registry, blocking enforcement, and real-time presence tracking."
 ---
 
 ## Overview
 
-The session management system tracks user logins with comprehensive device, IP, and location information. Sessions are per-organization — when a user selects an organization, a new session is created for that specific org context. This provides better security and audit capabilities in a multi-tenant environment.
+The session management system has been completely rebuilt with a **two-level architecture**:
 
-The system includes:
-- Per-organization session management with configurable limits
-- **Global device registry** — users can register up to 5 devices across all organizations
-- **Concurrent device limit** — at most 2 devices can be active (online) simultaneously
-- **Monthly device replacement** — users can replace one registered device every 30 days
-- **Device/IP/User blocking** — system admins can block devices, IP addresses, or user accounts
-- **Real-time presence tracking** — online/idle/offline status via WebSocket heartbeats
-- **Session policy system** — configurable limits per organization and user
-- **Enhanced security layers** — pre-request validation, blocking enforcement, activity monitoring
+1. **AuthSession** (device-level) — Created when the user logs in or verifies their email. Represents a device/browser login. One AuthSession = one device. Stores device info, IP geolocation, and the refresh token hash.
+2. **OrgSession** (org-level) — Lightweight child record created when the user selects an organization. Tracks per-org access without duplicating device/IP/token data.
+
+This design ensures:
+- **No security gap after login** — AuthSession exists immediately, before org selection
+- **"5 sessions" = 5 devices globally** — matches user expectations (updated default limit)
+- **Lightweight org switching** — no device registration or geolocation on org selection
+- **Clean separation** — device concerns (tokens, device info, IP, geolocation) on AuthSession; org concerns (per-org access, audit) on OrgSession
+- **Block-on-limit enforcement** — configurable global session and device caps block login when limits are reached (no auto-revocation)
+- **Per-session token storage** — each AuthSession stores its own refresh token hash, enabling true multi-device support
+- **Immediate revocation enforcement** — SessionActivityInterceptor validates sessions on every authenticated request
+- **Real-time presence tracking** — works from login, before org selection
+
+The system also includes:
+- Global device registry with ThumbmarkJS browser fingerprinting (max registered devices configurable via policy)
+- Device removal cooldown (configurable via policy, starts when a device is removed — blocks subsequent removals, not additions)
+- Device/IP/User blocking by system admins with immediate enforcement across all endpoints
+- Real-time presence tracking via WebSocket heartbeats (works from login, before org selection)
+- **Global session policy** — seeded at server startup from SESSION_DEFAULTS constants, fully configurable by system admins, with optional per-user overrides and in-memory caching
+- Pre-request security validation via SessionActivityInterceptor (inactivity timeout, device blocking, IP blocking, session revocation, refresh_token cookie validation)
+- O(1) session lookup via tokenIdentifier (SHA-256 prefix) with indexed queries
+- Pino structured logging with user/org context and device parser for IP extraction
+- Rate limiting via AppThrottlerGuard with per-user/API-key/IP isolation
 
 ## Key design decisions
 
-1. **Sessions are per-organization** — each org selection creates a new session
-2. **Sessions are created on org selection, not login** — login establishes identity via `auth.service.login()`; org selection via `auth.controller.getTenantToken()` creates the session
-3. **Automatic session revocation on org removal** — when a user is removed from an organization, all their sessions for that org are automatically revoked via `revokeAllOrgSessions()`
-4. **Session limits are per-org** — three tiers of enforcement — per-org total (configurable via policy), per-device per-org (configurable via policy), per-IP per-org (configurable via policy)
-5. **Global device registry** — users can register up to 5 devices across all organizations with enforced fingerprinting (configurable via policy)
-6. **Concurrent device limits** — at most 2 devices can have active sessions simultaneously (global enforcement, from system constants)
-7. **Device replacement cooldown** — users can replace one device every 30 days when the device limit is reached (configurable via policy)
-8. **Device and IP blocking** — system admins can block devices or IP addresses, enforced at AuthGuard level with 60-second cache
-9. **RLS bypass for session operations** — all `SessionService` methods use `tenantContext.executeWithBypass()` because sessions are authentication infrastructure that needs cross-org visibility. Session creation is the exception — it uses `tenantContext.executeInOrg()` to set the org context
-10. **Three-scope logout** — logout supports session-level, organization-level, and global scopes with different side effects
-11. **IP blocking uses an in-memory cache** — a 60-second TTL cache prevents a DB hit on every API request for IP block checks
-12. **Presence is heartbeat-driven** — online/idle/offline status is updated only via WebSocket heartbeats at 30s intervals; a cron job marks stale sessions (no heartbeat for 90s) as offline
-13. **Sessions are created without requiring the refresh-token cookie** — `refreshTokenHash` and `tokenIdentifier` are nullable. Sessions created without the cookie are still fully valid and are lazily linked to the refresh token on the first call to `refreshTenantToken` that includes the cookie. **Both fields are always written atomically** — a session will never have `tokenIdentifier` set without `refreshTokenHash`. Any session found by `tokenIdentifier` lookup that has no `refreshTokenHash` is treated as inconsistent state and rejected, not bypassed
-14. **O(1) session lookup** — sessions use a derived `tokenIdentifier` for fast lookup instead of scanning all sessions with bcrypt
-15. **Session policy system** — configurable session limits and timeouts per organization and per user with three-tier resolution (user override > org default > system default)
-16. **Inactivity timeout enforcement** — sessions are checked for inactivity on every API request via SessionActivityInterceptor and revoked if timeout exceeded
-17. **Pre-request security checks** — SessionActivityInterceptor performs inactivity timeout and device blocking checks before processing API requests
-18. **Shared CORS validation** — both HTTP server and WebSocket gateways use the same origin validation logic from `cors.util.ts`
+1. **Two-level session model**: AuthSession (device) + OrgSession (org context)
+2. **Sessions created at login and email verification, not org selection**: `AuthService.login()` and `AuthService.verifyEmail()` both create the AuthSession with device info and geolocation. Both use the lazy-link pattern: the session is created without a refresh token (to check caps first), then linked after tokens are generated. Email verification acts as a full login — the user gets an AuthSession, refresh token cookie, and is sent straight to org selection.
+3. **OrgSession is lightweight**: No device info, no geolocation, no tokens — just a FK to AuthSession + Organization
+4. **AuthSession has no organization FK**: It's device-level, not org-scoped
+5. **Revoking an AuthSession automatically invalidates all its OrgSessions**: Validation always checks the parent first
+6. **O(1) session lookup**: Via `tokenIdentifier` (SHA-256 prefix of refresh token)
+7. **Lazy token linking**: Sessions can be created without the refresh token cookie; linked on first tenant-token refresh
+8. **Session limits apply globally**: `MAX_CONCURRENT_AUTH_SESSIONS` = max devices per user globally (default: 5, not per org)
+9. **Session policy is global**: Policies are managed via global defaults from SESSION_DEFAULTS constants, configurable by system admins
+10. **Tenant token embeds both IDs**: `{ authSessionId, orgSessionId }` for direct validation
+11. **RLS bypass for session operations**: AuthSession and OrgSession queries use `executeWithBypass()` since they're auth infrastructure
+12. **Immediate revocation enforcement**: The `SessionActivityInterceptor` validates sessions on every authenticated request, throwing 401 for revoked/expired/inactive sessions
+13. **Per-session refresh token storage (multi-device safe)**: Each AuthSession stores its own `refreshTokenHash` and `tokenIdentifier`. No user-level refresh token field exists — validation is per session only. **Token issuance and refresh** (`refresh-access-token`, tenant refresh, org selection) use `sessionService.validateSession()`: O(1) lookup by `tokenIdentifier` plus bcrypt against `refreshTokenHash`. **Tenant API requests** use `findSessionByRefreshTokenIdentifier()`: the same indexed `tokenIdentifier` lookup without bcrypt validation. Logging in on Device B never invalidates Device A's ability to refresh tokens.
+14. **One active session per device (hard rule)**: Not configurable. Re-login on the same device replaces the existing session. Backed by a partial unique index.
+15. **Serialized session creation**: All session creation is protected by PostgreSQL advisory locks to prevent race conditions
+16. **Block-on-limit, not auto-revoke**: When session or device caps are reached, login is denied with a clear error code. The user must manually free a slot. This prevents account sharing.
+17. **Logout revokes only the current session**: Other device sessions are not affected. Org switching is handled via `selectOrganization`, not logout.
+18. **Session/device management is identity-token-authed**: Session management endpoints (`/auth/my-sessions`, `/auth/my-devices`) use identity token (not tenant token) since they are global user concerns, accessible both before and after org selection.
 
-## Session policy system
+## Global session policy system
 
-The system supports three-tier session policy configuration:
-- **User overrides** — Per-user session policies for specific organizations
-- **Organization defaults** — Default policies for all users in an organization  
-- **System defaults** — Hard-coded fallback values
+The system supports a **global session policy** seeded from SESSION_DEFAULTS constants at server startup:
 
-Resolution order: User override > Org default > System default
+<Tabs>
+<Tab title="Policy resolution">
+**Resolution order**: User override > System default
 
-**Configurable Parameters:**
-- `maxConcurrentSessions` — Max sessions per user per org (default: 5)
-- `maxRegisteredDevices` — Max registered devices per user globally (default: 5)
-- `maxSessionsPerDevice` — Max sessions per device per org (default: 1)
-- `maxSessionsPerIp` — Max sessions per IP per org (default: 5)
-- `sessionExpiryDays` — Session lifetime in days (default: 14)
-- `inactivityTimeoutHours` — Inactivity timeout in hours (default: 24)
-- `deviceRemovalCooldownDays` — Device replacement cooldown (default: 30)
-- `absoluteSessionLifetimeHours` — Hard session limit in hours (default: 336)
+Unlike the previous per-org system, policies are now managed globally by system admins with optional per-user overrides.
 
-**API Endpoints:**
-- `GET /organizations/:orgId/session-policy` — Get effective session policy for the current user
-- `PUT /organizations/:orgId/session-policy` — Update organization-level policy (admin required)
-- `PUT /organizations/:orgId/users/:userId/session-policy` — Set user-specific policy override (admin required)
+**Policy storage**:
+- System defaults: Seeded from SESSION_DEFAULTS constants
+- User overrides: Stored in database with in-memory caching
+- Real-time updates: Policy changes take effect immediately
+</Tab>
+
+<Tab title="Configurable parameters">
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `maxConcurrentAuthSessions` | 5 | Max devices per user globally |
+| `maxRegisteredDevices` | 5 | Max registered devices per user |
+| `sessionExpiryDays` | 14 | AuthSession lifetime |
+| `inactivityTimeoutHours` | 24 | Inactivity timeout |
+| `deviceRemovalCooldownDays` | 30 | Device replacement cooldown |
+| `absoluteSessionLifetimeHours` | 336 | Hard session limit |
+</Tab>
+</Tabs>
 
 ## Architecture
 
-### Database schema
-
-The `session` table stores all fields on the `Session` entity.
+### Two-level session model
 
 <Tabs>
-<Tab title="Relationships">
-| Field | Type | Constraint | Description |
-|-------|------|------------|-------------|
-| `id` | UUID | PK | Auto-generated via `uuid.v4()` |
-| `user` | ManyToOne(User) | FK `user_id` | Required |
-| `organization` | ManyToOne(Organization) | FK `organization_id`, nullable | The organization this session belongs to |
+<Tab title="AuthSession (device-level)">
+**Created**: At login or email verification  
+**Purpose**: Represents a device/browser login  
+**Contains**:
+- Device information (fingerprint, type, browser, OS)
+- IP geolocation data (country, city, coordinates)
+- Refresh token hash and token identifier
+- Activity tracking (last active, activity count)
+- Presence status (online/idle/offline)
+
+**Key fields**:
+```typescript
+{
+  id: UUID;
+  userId: UUID;          // FK to User
+  refreshTokenHash?: string;
+  tokenIdentifier?: string;
+  deviceFingerprint?: string;
+  deviceType?: string;
+  ipAddress: string;
+  country?: string;
+  city?: string;
+  latitude?: decimal;
+  longitude?: decimal;
+  lastActiveAt?: Date;
+  presenceStatus: 'online' | 'idle' | 'offline';
+  isRevoked: boolean;
+  revokedReason?: string;
+  createdAt: Date;
+  expiresAt: Date;
+}
+```
 </Tab>
 
-<Tab title="Token tracking">
-| Field | Type | Description |
-|-------|------|-------------|
-| `refreshTokenHash` | text (hidden), nullable | bcrypt hash of the refresh token |
-| `tokenIdentifier` | varchar, nullable | Derived identifier for O(1) session lookup |
-| `isRevoked` | boolean | Default `false` |
-| `revokedAt` | timestamp (nullable) | When the session was revoked |
-| `revokedReason` | varchar (nullable) | Why the session was revoked (see `REVOCATION_REASONS`) |
-</Tab>
+<Tab title="OrgSession (org-level)">
+**Created**: When user selects an organization  
+**Purpose**: Tracks per-org access without duplicating device data  
+**Contains**:
+- Link to parent AuthSession
+- Organization context
+- Minimal audit fields
 
-<Tab title="Device info & registry">
-| Field | Type | Description |
-|-------|------|-------------|
-| `deviceType` | varchar (nullable) | `desktop`, `mobile`, `tablet` |
-| `deviceName` | varchar (nullable) | e.g., "Chrome 120 on macOS 14.1" |
-| `deviceFingerprint` | varchar (nullable) | Unique device identifier for registry |
-| `browser` | varchar (nullable) | Browser name |
-| `browserVersion` | varchar (nullable) | Browser version |
-| `os` | varchar (nullable) | Operating system name |
-| `osVersion` | varchar (nullable) | OS version |
-| `userAgent` | text (nullable) | Raw User-Agent string |
-| `isDeviceBlocked` | boolean | Default `false`, for device blocking |
-</Tab>
-
-<Tab title="Location & IP">
-| Field | Type | Description |
-|-------|------|-------------|
-| `ipAddress` | varchar | Required |
-| `city` | varchar (nullable) | City from geolocation |
-| `region` | varchar (nullable) | Region from geolocation |
-| `country` | varchar (nullable) | Country name |
-| `countryCode` | varchar(2) (nullable) | 2-char ISO country code |
-| `latitude` | decimal(9,6) (nullable) | Latitude coordinate |
-| `longitude` | decimal(9,6) (nullable) | Longitude coordinate |
-| `timezone` | varchar (nullable) | Timezone string |
-| `isp` | varchar (nullable) | Internet service provider |
-</Tab>
-
-<Tab title="Activity & presence">
-| Field | Type | Description |
-|-------|------|-------------|
-| `lastActiveAt` | timestamp (nullable) | Last API activity time |
-| `lastActivityType` | varchar (nullable) | e.g., `api_call`, `page_view` |
-| `activityCount` | int | Default `0`, incremented on each tracked activity |
-| `presenceStatus` | enum | `online`, `idle`, `offline` - updated via WebSocket heartbeats |
-| `lastHeartbeatAt` | timestamp (nullable) | Last WebSocket heartbeat time |
-| `createdAt` | timestamp | Default `now()` |
-| `expiresAt` | timestamp | Required, set to `createdAt + SESSION_EXPIRY_DAYS` |
+**Key fields**:
+```typescript
+{
+  id: UUID;
+  authSessionId: UUID;   // FK to AuthSession
+  organizationId: UUID;  // FK to Organization
+  isRevoked: boolean;
+  revokedReason?: string;
+  createdAt: Date;
+}
+```
 </Tab>
 </Tabs>
 
@@ -132,191 +145,169 @@ The `session` table stores all fields on the `Session` entity.
 
 | Index name | Properties | Purpose |
 |------------|-----------|---------|
-| `idx_session_user_org_active` | `[user, organization, isRevoked]` | Primary query path for user sessions per org |
-| `idx_session_org_active` | `[organization, isRevoked]` | Org-level session queries |
-| `idx_session_user_only` | `[user, isRevoked]` | Cross-org user session queries |
-| `idx_session_cleanup` | `[expiresAt, isRevoked]` | Expired session cleanup |
-| `idx_session_token` | `[refreshTokenHash]` | Unique constraint on token hash |
-| `idx_session_token_identifier` | `[tokenIdentifier]` | O(1) session lookup by token identifier |
-| `idx_session_device_fingerprint` | `[user, deviceFingerprint]` | Device registry lookups |
-| `idx_session_presence` | `[presenceStatus, lastHeartbeatAt]` | Presence status queries |
+| `idx_auth_session_user_active` | `[userId, isRevoked]` | Primary query path for user sessions |
+| `idx_auth_session_token` | `[tokenIdentifier]` | O(1) session lookup by token identifier |
+| `idx_auth_session_device` | `[userId, deviceFingerprint]` | Device registry lookups |
+| `idx_org_session_auth_org` | `[authSessionId, organizationId]` | Org session validation |
+| `idx_org_session_cleanup` | `[isRevoked, createdAt]` | Cleanup queries |
 
 ### Key components
 
+<Tabs>
+<Tab title="Core services">
 | Component | File | Responsibility |
 |-----------|------|---------------|
-| Session Entity | `src/modules/auth/entities/session.entity.ts` | MikroORM entity with indexed fields for performance, unique constraints on `refreshTokenHash` and `tokenIdentifier` |
-| Session Service | `src/modules/auth/services/session.service.ts` | Session creation, validation, and revocation, three-tier limit enforcement, suspicious login detection, session activity tracking, expired session cleanup |
-| Session Policy Service | `src/modules/auth/services/session-policy.service.ts` | Three-tier session policy resolution (user override > org default > system default) |
-| Device Registry Service | `src/modules/auth/services/device-registry.service.ts` | Global device registration, device limit enforcement, monthly device replacement |
-| Device Blocking Service | `src/modules/auth/services/device-blocking.service.ts` | Device and IP blocking enforcement with in-memory cache |
-| Presence Service | `src/modules/auth/services/presence.service.ts` | Real-time presence tracking via WebSocket heartbeats |
-| Session DTO | `src/modules/auth/session.dto.ts` | Constructor-based DTO with computed `isExpired` and `isActive` fields, transforms Session entity to API response format with nested `SimpleUserDto` |
-| Geolocation Service | `src/modules/auth/services/geolocation.service.ts` | IP-to-location lookups using ip-api.com (HTTP, 45 req/min limit), in-memory cache with 24-hour TTL, distance calculation via Haversine formula for impossible travel detection, private IP detection (127.0.0.1, 10.x, 172.16-31.x, 192.168.x) |
-| Device Parser Service | `src/modules/auth/services/device-parser.service.ts` | User-Agent parsing with `ua-parser-js`, generates human-readable device names (e.g., "Chrome 120 on macOS 14.1"), device type classification (`desktop`, `mobile`, `tablet`, `unknown`), IP extraction from requests (handles `X-Forwarded-For`, `X-Real-IP`, direct IP) |
-| Session Activity Interceptor | `src/interceptors/session-activity.interceptor.ts` | Global NestJS interceptor registered in `app.module.ts`, reads refresh token from `req.cookies.refresh_token`, calls `getCurrentSession()` to find session, performs inactivity timeout and device blocking checks, then fires `updateSessionActivity()` as fire-and-forget, silently fails — session tracking never blocks or breaks API responses |
-| System Admin Service | `src/modules/system-admin/system-admin.service.ts` | Session stats, listing with filters, admin revocation, device/IP blocking management |
-| System Admin Controller | `src/modules/system-admin/system-admin.controller.ts` | Admin-only endpoints for session management, device blocking |
-| Admin Session DTO | `src/modules/system-admin/dto/admin-session.dto.ts` | Extends `SessionDto` for admin session views |
+| AuthSession Entity | `src/modules/auth/entities/auth-session.entity.ts` | Device-level session with device info, tokens, geolocation |
+| OrgSession Entity | `src/modules/auth/entities/org-session.entity.ts` | Lightweight org-level session |
+| Session Service | `src/modules/auth/services/session.service.ts` | Two-level session creation, validation, revocation |
+| Session Policy Service | `src/modules/auth/services/session-policy.service.ts` | Global policy management with user overrides |
+| Device Registry Service | `src/modules/auth/services/device-registry.service.ts` | Global device registration and limits |
+</Tab>
+
+<Tab title="Security & enforcement">
+| Component | File | Responsibility |
+|-----------|------|---------------|
+| SessionActivityInterceptor | `src/interceptors/session-activity.interceptor.ts` | Pre-request validation, immediate revocation enforcement |
+| Device Blocking Service | `src/modules/auth/services/device-blocking.service.ts` | Device and IP blocking with in-memory cache |
+| Presence Service | `src/modules/auth/services/presence.service.ts` | Real-time presence tracking via WebSocket |
+| Geolocation Service | `src/modules/auth/services/geolocation.service.ts` | IP geolocation with caching |
+</Tab>
+</Tabs>
 
 ## Features
 
+### Session creation flow
+
+<Steps>
+<Step title="Login/Email verification">
+`AuthService.login()` or `AuthService.verifyEmail()` creates an AuthSession with device info and geolocation. Uses lazy-link pattern: session created without refresh token, then linked after token generation.
+</Step>
+
+<Step title="Organization selection">
+User selects organization via `POST /auth/select-organization`. Creates lightweight OrgSession linking to the AuthSession. No device registration or geolocation lookup needed.
+</Step>
+
+<Step title="Token validation">
+Tenant token embeds `{ authSessionId, orgSessionId }`. Validation checks both levels: AuthSession for device/token validity, OrgSession for org access.
+</Step>
+</Steps>
+
 ### Global device registry
 
-- Users can register up to 5 devices across all organizations (configurable via policy)
-- Device fingerprinting based on browser + OS combination
-- Concurrent device limit: maximum 2 devices can be active simultaneously
-- Monthly device replacement: users can replace one registered device every 30 days
-- Enforced at session creation and validated via `DeviceRegistryService`
+- Users can register up to 5 devices globally (configurable via policy)
+- ThumbmarkJS browser fingerprinting for device identification
+- Device removal cooldown: configurable period before device replacement allowed
+- Enforced at AuthSession creation time
 
-### Device and IP blocking
+### Block-on-limit enforcement
 
-- System admins can block specific devices or IP addresses
-- Blocking enforced at `AuthGuard` level with 60-second in-memory cache
-- Blocked devices/IPs are denied access to all API endpoints
-- Managed via `DeviceBlockingService` with cache invalidation
+<Warning>
+When session or device caps are reached, login is **denied** with a clear error code. No automatic revocation occurs. Users must manually free a slot to prevent account sharing.
+</Warning>
 
 ### Real-time presence tracking
 
-- Online/idle/offline status updated via WebSocket heartbeats every 30 seconds
-- Sessions without heartbeat for 90+ seconds marked offline by cron job
-- Presence status stored in `presenceStatus` and `lastHeartbeatAt` fields
-- Managed by `PresenceService` with WebSocket gateway integration
+- Online/idle/offline status updated via WebSocket heartbeats
+- Works from login, before org selection (attached to AuthSession)
+- Sessions without heartbeat for 90+ seconds marked offline
+- Managed by `PresenceService` with WebSocket integration
 
-### Session creation
+### Immediate revocation enforcement
 
-- Automatically created when user **selects an organization** via `POST /auth/select-organization` (not on login)
-- `auth.service.login()` explicitly does NOT create a session — device info is passed through to `issueTenantToken()`
-- Each organization has separate sessions
-- Stores device fingerprint (browser, OS, user agent, device type/name)
-- Fetches geolocation from IP address via `GeolocationService`
-- Enforces device registry limits and concurrent device limits
-- Session created inside `tenantContext.executeInOrg()` to set the organization RLS context
-- Supports creation without refresh token cookie (lazily linked on first refresh)
+The `SessionActivityInterceptor` validates sessions on **every authenticated request**:
 
-### Session validation
+1. Extracts refresh token from cookies
+2. Validates AuthSession (checks revocation, expiry, inactivity)
+3. Validates OrgSession if in org context
+4. Throws 401 for invalid sessions
+5. Updates activity tracking asynchronously
 
-- **General validation** (`validateSession`) — O(1) lookup by `tokenIdentifier` then bcrypt verification
-- **Organization-scoped validation** (`validateSessionForOrganization`) — narrows search to specific user+org combination, used during tenant token refresh
-- **Legacy fallback** — if `tokenIdentifier` lookup fails, falls back to scanning all sessions with bcrypt
+## Session validation
 
-<Note>
-Both validation methods use RLS bypass since validation occurs during authentication before any org context exists.
-</Note>
+<Tabs>
+<Tab title="AuthSession validation">
+**Method**: `validateAuthSession(refreshToken)`
+- O(1) lookup by `tokenIdentifier`
+- bcrypt verification against `refreshTokenHash`
+- Checks revocation status and expiry
+- Used for token refresh and identity operations
+</Tab>
 
-### Session limit enforcement
+<Tab title="Two-level validation">
+**Method**: `validateSessionPair(authSessionId, orgSessionId)`
+- Validates both AuthSession and OrgSession
+- Ensures OrgSession belongs to the AuthSession
+- Used for tenant token validation
+- Throws 401 if either level is invalid
+</Tab>
 
-Three tiers of enforcement via session policy system:
-
-| Tier | Method | Configurable limit | Behavior |
-|------|--------|-------------------|----------|
-| Per-org total | `enforceSessionLimit()` | `maxConcurrentSessions` (default: 5) | Revokes oldest sessions beyond limit |
-| Per-device per-org | `enforceDeviceLimit()` | `maxSessionsPerDevice` (default: 1) | Revokes oldest same-device sessions |
-| Per-IP per-org | `enforceIpLimit()` | `maxSessionsPerIp` (default: 5) | Revokes oldest same-IP sessions |
-
-All enforcement methods sort sessions by `createdAt ASC` and revoke the oldest ones first with reason `session_limit`.
+<Tab title="Multi-device safety">
+Each AuthSession stores its own refresh token hash. Logging in on Device B never invalidates Device A's ability to refresh tokens. True multi-device support without interference.
+</Tab>
+</Tabs>
 
 ### Session revocation
 
 <Tabs>
-<Tab title="User-initiated">
-| Scope | Method | Triggered by |
-|-------|--------|-------------|
-| Individual | `revokeSession(sessionId, userId, reason)` | User revokes own session; single-session logout |
-| Per-org bulk | `revokeAllOrgSessions(userId, orgId, reason)` | User removed from org; org-level logout |
-| Cross-org bulk | `revokeAllUserSessions(userId, exceptSessionId?, reason)` | Global logout |
-| Flexible | `revokeAllSessions(userId, orgId?, exceptCurrentId?)` | "Revoke all" endpoint; uses `MANUAL` reason |
+<Tab title="AuthSession revocation">
+Revoking an AuthSession automatically invalidates all its child OrgSessions. Used for:
+- Device-level logout
+- Global user logout  
+- Device blocking enforcement
+- Session limit enforcement
 </Tab>
 
-<Tab title="System admin">
-| Method | Triggered by | Reason |
-|--------|-------------|--------|
-| `SystemAdminService.revokeSession(sessionId)` | System admin | `admin_revoked` |
-| `SystemAdminService.revokeUserSessions(userId)` | System admin | `admin_revoked_all` |
-| `SystemAdminService.revokeOrganizationSessions(orgId)` | System admin | `admin_revoked_org` |
+<Tab title="OrgSession revocation">
+Lightweight revocation for org-specific access removal:
+- User removed from organization
+- Org-level access restrictions
+- Admin org session management
 </Tab>
 
-<Tab title="Automatic">
-| Method | Triggered by | Reason |
-|--------|-------------|--------|
-| `SystemAdminService.deleteOrganization()` | Org deletion | `organization_deleted` |
-| `enforceSessionLimit/DeviceLimit/IpLimit` | Session creation | `session_limit` |
-| `cleanupExpiredSessions()` | Periodic cleanup | `expired` |
-| `SessionActivityInterceptor` | Inactivity timeout | `inactivity_timeout` |
+<Tab title="Revocation reasons">
+```typescript
+{
+  MANUAL: 'manual',
+  LOGOUT: 'logout',
+  EXPIRED: 'expired',
+  INACTIVITY_TIMEOUT: 'inactivity_timeout',
+  DEVICE_BLOCKED: 'device_blocked',
+  SESSION_LIMIT: 'session_limit',
+  ORG_ACCESS_REVOKED: 'org_access_revoked',
+  ADMIN_REVOKED: 'admin_revoked'
+}
+```
 </Tab>
 </Tabs>
 
-### Logout system (three scopes)
+### Device and IP blocking
 
-The `POST /auth/logout` endpoint supports three scopes via request body:
-
-| Scope | Body parameter | Side effects | Cookie cleared |
-|-------|---------------|--------------|----------------|
-| **Session** | `sessionId` (or auto-detected from cookie) | Revokes single session only | No |
-| **Organization** | `organizationId` | Revokes all sessions in that org | No |
-| **Global** | `logoutEverywhere: true` | Revokes all sessions, increments `tokenVersion`, clears `refreshToken`, invalidates permission cache | Yes |
-
-Default behavior (no body params): auto-detects current session from refresh token cookie and revokes it.
-
-```typescript Logout response
-{
-  message: 'Logged out successfully',
-  scope: 'session' | 'organization' | 'global',
-  revokedCount: number,
-}
-```
-
-### Suspicious login detection
-
-Flags logins as suspicious when any of these conditions are met:
-
-1. **Different country** — `countryCode` of new session differs from last session in same org
-2. **Impossible travel** — distance > 500km (configurable) within 2 hours, calculated via Haversine formula using stored `latitude`/`longitude`
-3. **New device** — browser+OS fingerprint not found in the last 50 sessions for this user+org
-
-Returns `{ isSuspicious: boolean; reasons: string[] }`.
-
-### Session activity tracking
-
-- Global `SessionActivityInterceptor` tracks every API call and enforces security policies
-- Reads refresh token from `req.cookies.refresh_token` to identify session
-- Performs pre-request security checks:
-  - Inactivity timeout validation (revokes session if exceeded)
-  - Device blocking enforcement (denies access if device blocked)
-- Calls `getCurrentSession()` to find session, then fires `updateSessionActivity()` as fire-and-forget
-- Updates `lastActiveAt`, `lastActivityType` (set to `'api_call'`), and increments `activityCount`
-- Runs asynchronously after response (fire-and-forget via `tap()` in RxJS pipe)
-
-<Warning>
-The interceptor silently fails — session activity tracking never blocks or breaks API responses, but security checks (timeout/blocking) will deny access.
-</Warning>
-
-### Expired session cleanup
-
-`cleanupExpiredSessions()` finds all sessions where `isRevoked = false` and `expiresAt < now`, marks them as revoked with reason `expired`. Can be called periodically.
+- System admins can block devices (by fingerprint) or IP addresses
+- Blocking enforced at multiple layers:
+  - Public endpoints (signup, login, verify, etc.)
+  - SessionActivityInterceptor (every authenticated request)
+  - AppThrottlerGuard (rate limiting layer)
+- In-memory cache with 60-second TTL prevents database hits
+- Immediate enforcement across all endpoints
 
 ## API endpoints
 
-### User session endpoints
+### Identity-token authenticated endpoints
+
+<Note>
+These endpoints use identity tokens (not tenant tokens) since they are global user concerns, accessible before and after org selection.
+</Note>
 
 <Tabs>
-<Tab title="GET /auth/sessions">
-List active sessions for the current user.
+<Tab title="GET /auth/my-sessions">
+List user's AuthSessions across all devices.
 
-**Guard:** `AuthGuard`
-
-**Query parameters:**
-- `allOrgs` (optional, boolean) — if `true`, returns sessions across all organizations. Default shows only current org sessions.
-
-**Response:** `SessionListItem[]`
-
-```typescript SessionListItem
+**Response**: `AuthSessionDto[]`
+```typescript
 {
   id: string;
   deviceName?: string;
   deviceType?: string;
-  browser?: string;
-  os?: string;
   ipAddress: string;
   city?: string;
   country?: string;
@@ -325,131 +316,24 @@ List active sessions for the current user.
   presenceStatus: 'online' | 'idle' | 'offline';
   createdAt: Date;
   expiresAt: Date;
-  organization?: {
+  orgSessions: {
     id: string;
-    name: string;
-  };
+    organizationId: string;
+    organizationName: string;
+  }[];
 }
 ```
 </Tab>
 
-<Tab title="GET /auth/sessions/history">
-Get paginated session history (includes revoked and expired).
-
-**Guard:** `AuthGuard`
-
-**Query parameters:**
-- `page` (default: 1)
-- `limit` (default: 20)
-- `allOrgs` (optional, boolean) — if `true`, returns history across all organizations.
-
-**Response:** `SessionHistory`
-
-```typescript SessionHistory
-{
-  sessions: SessionListItem[];
-  total: number;
-  page: number;
-  limit: number;
-}
-```
+<Tab title="DELETE /auth/my-sessions/:id">
+Revoke a specific AuthSession. Automatically revokes all child OrgSessions.
 </Tab>
 
-<Tab title="GET /auth/sessions/current">
-Get details of the current session (identified by refresh token cookie).
+<Tab title="GET /auth/my-devices">
+List registered devices with activity information.
 
-**Guard:** `AuthGuard`
-
-**Response:** Session details with organization info. Throws `UnauthorizedException` if no active session.
-</Tab>
-
-<Tab title="DELETE /auth/sessions/:id">
-Revoke a specific session by ID. User can only revoke their own sessions.
-
-**Guard:** `AuthGuard`
-</Tab>
-
-<Tab title="POST /auth/sessions/revoke-all">
-Revoke all sessions except the current one.
-
-**Guard:** `AuthGuard`
-
-**Query parameters:**
-- `allOrgs` (optional, boolean) — if `true`, revokes across all organizations. Default revokes only current org sessions.
-</Tab>
-
-<Tab title="POST /auth/logout">
-Logout with different scopes.
-
-**Guard:** `AuthGuard`
-
-**Body (all optional):**
-
-```typescript Logout body
-{
-  sessionId?: string;        // Revoke this specific session
-  organizationId?: string;   // Revoke all sessions in this org
-  logoutEverywhere?: boolean; // Revoke everything, clear tokens
-}
-```
-
-If no body params provided, auto-detects current session from cookie and revokes it.
-</Tab>
-</Tabs>
-
-### Session policy endpoints
-
-<Tabs>
-<Tab title="GET /organizations/:orgId/session-policy">
-Get effective session policy for the current user in an organization.
-
-**Guard:** `AuthGuard`
-
-**Response:** `SessionPolicyDto`
-
-```typescript SessionPolicyDto
-{
-  maxConcurrentSessions: number;
-  maxRegisteredDevices: number;
-  maxSessionsPerDevice: number;
-  maxSessionsPerIp: number;
-  sessionExpiryDays: number;
-  inactivityTimeoutHours: number;
-  deviceRemovalCooldownDays: number;
-  absoluteSessionLifetimeHours: number;
-  source: 'user' | 'organization' | 'system';
-}
-```
-</Tab>
-
-<Tab title="PUT /organizations/:orgId/session-policy">
-Update organization-level session policy.
-
-**Guard:** `AuthGuard` + organization admin permissions
-
-**Body:** Partial `SessionPolicyDto`
-</Tab>
-
-<Tab title="PUT /organizations/:orgId/users/:userId/session-policy">
-Set user-specific session policy override.
-
-**Guard:** `AuthGuard` + organization admin permissions
-
-**Body:** Partial `SessionPolicyDto`
-</Tab>
-</Tabs>
-
-### Device management endpoints
-
-<Tabs>
-<Tab title="GET /auth/devices">
-List registered devices for the current user.
-
-**Guard:** `AuthGuard`
-
-**Response:** `RegisteredDeviceDto[]`
-
-```typescript RegisteredDeviceDto
+**Response**: `RegisteredDeviceDto[]`
+```typescript
 {
   deviceFingerprint: string;
   deviceName: string;
@@ -462,209 +346,70 @@ List registered devices for the current user.
 ```
 </Tab>
 
-<Tab title="DELETE /auth/devices/:fingerprint">
+<Tab title="DELETE /auth/my-devices/:fingerprint">
 Remove a registered device (subject to cooldown period).
-
-**Guard:** `AuthGuard`
-
-**Response:** Confirmation with next available replacement date.
 </Tab>
 </Tabs>
 
-### System admin session endpoints
+### System admin endpoints
 
 <Note>
 All system admin endpoints require the `@SystemAdmin()` decorator.
 </Note>
 
 <Tabs>
-<Tab title="GET /system-admin/sessions/stats">
-Get session statistics.
-
-**Response:** `SessionStatsDto`
-
-```typescript SessionStatsDto
-{
-  totalActiveSessions: number;
-  totalRevokedSessions: number;
-  totalExpiredSessions: number;
-  uniqueActiveUsers: number;
-  onlineUsers: number;
-  registeredDevices: number;
-  blockedDevices: number;
-  blockedIPs: number;
-}
-```
-</Tab>
-
 <Tab title="GET /system-admin/sessions">
-List all sessions across the platform with optional filters.
+List all AuthSessions and OrgSessions with filters.
 
-**Query parameters:** `ListSessionsQueryDto`
-
-```typescript ListSessionsQueryDto
+**Query parameters**:
+```typescript
 {
-  organizationId?: string;
   userId?: string;
-  page?: number;          // default: 1
-  limit?: number;         // default: 20, max: 100
-  includeRevoked?: boolean; // default: false
-  includeExpired?: boolean; // default: false
-  presenceStatus?: 'online' | 'idle' | 'offline';
+  organizationId?: string;
+  sessionType?: 'auth' | 'org';
+  page?: number;
+  limit?: number;
+  includeRevoked?: boolean;
 }
 ```
-
-Sessions of soft-deleted users are excluded by default.
-
-**Response:** `PaginatedResponseDto<AdminSessionDto>`
 </Tab>
 
 <Tab title="POST /system-admin/sessions/:id/revoke">
-Revoke a specific session (system admin). Uses `admin_revoked` as reason.
+Revoke a specific AuthSession or OrgSession.
+- AuthSession revocation cascades to child OrgSessions
+- Uses `admin_revoked` reason
 </Tab>
 
-<Tab title="POST /system-admin/users/:id/revoke-sessions">
-Revoke all sessions for a specific user. Uses `admin_revoked_all` as reason via `nativeUpdate`.
-
-**Response:** `{ message: string; count: number }`
+<Tab title="GET /system-admin/session-policy">
+Get current global session policy.
 </Tab>
 
-<Tab title="POST /system-admin/organizations/:id/revoke-sessions">
-Revoke all sessions for an organization's users. Uses raw SQL with CTE + subquery on `organization_users` table. Uses `admin_revoked_org` as reason.
+<Tab title="PUT /system-admin/session-policy">
+Update global session policy defaults.
+</Tab>
 
-**Response:** `{ message: string; count: number }`
+<Tab title="PUT /system-admin/users/:userId/session-policy">
+Set user-specific policy override.
 </Tab>
 </Tabs>
 
-### Device and IP blocking endpoints
+### Device blocking endpoints
 
 <Tabs>
-<Tab title="GET /system-admin/blocked-devices">
-List all blocked devices.
-
-**Guard:** `@SystemAdmin()`
-
-**Query parameters:**
-- `page` (default: 1)
-- `limit` (default: 20)
-
-**Response:** `PaginatedResponseDto<BlockedDeviceDto>`
-</Tab>
-
 <Tab title="POST /system-admin/devices/:fingerprint/block">
-Block a specific device by fingerprint.
-
-**Guard:** `@SystemAdmin()`
-
-**Body:** `{ reason?: string }`
-</Tab>
-
-<Tab title="DELETE /system-admin/devices/:fingerprint/unblock">
-Unblock a specific device.
-
-**Guard:** `@SystemAdmin()`
-</Tab>
-
-<Tab title="GET /system-admin/blocked-ips">
-List all blocked IP addresses.
-
-**Guard:** `@SystemAdmin()`
-
-**Response:** `PaginatedResponseDto<BlockedIpDto>`
+Block a device by fingerprint. All AuthSessions using this device are immediately revoked.
 </Tab>
 
 <Tab title="POST /system-admin/ips/:ip/block">
-Block a specific IP address.
-
-**Guard:** `@SystemAdmin()`
-
-**Body:** `{ reason?: string }`
+Block an IP address. Affects all future requests from this IP.
 </Tab>
 
-<Tab title="DELETE /system-admin/ips/:ip/unblock">
-Unblock a specific IP address.
-
-**Guard:** `@SystemAdmin()`
-</Tab>
-</Tabs>
-
-## DTOs
-
-<Tabs>
-<Tab title="SessionDto">
-Constructor-based DTO used for standard session responses (`src/modules/auth/session.dto.ts`):
-
-```typescript SessionDto
-class SessionDto {
-  id: string;
-  user: SimpleUserDto;
-  organizationId?: string;
-  organizationName?: string;
-  deviceType?: string;
-  deviceName?: string;
-  deviceFingerprint?: string;
-  browser?: string;
-  browserVersion?: string;
-  os?: string;
-  osVersion?: string;
-  ipAddress: string;
-  city?: string;
-  region?: string;
-  country?: string;
-  countryCode?: string;
-  isRevoked: boolean;
-  revokedAt?: Date;
-  revokedReason?: string;
-  lastActiveAt?: Date;
-  activityCount: number;
-  presenceStatus: 'online' | 'idle' | 'offline';
-  lastHeartbeatAt?: Date;
-  createdAt: Date;
-  expiresAt: Date;
-  isExpired: boolean;   // computed: new Date() > expiresAt
-  isActive: boolean;    // computed: !isRevoked && !isExpired
-}
-```
+<Tab title="GET /system-admin/blocked-devices">
+List all blocked devices with pagination.
 </Tab>
 
-<Tab title="AdminSessionDto">
-Extends `SessionDto` for system admin session views (`src/modules/system-admin/dto/admin-session.dto.ts`).
-</Tab>
-
-<Tab title="ListSessionsQueryDto">
-Admin query parameters with validation decorators (`class-validator`):
-
-| Field | Type | Default | Validation |
-|-------|------|---------|------------|
-| `organizationId` | string (optional) | — | `@IsString()` |
-| `userId` | string (optional) | — | `@IsString()` |
-| `page` | number (optional) | 1 | `@Min(1)` |
-| `limit` | number (optional) | 20 | `@Min(1) @Max(100)` |
-| `includeRevoked` | boolean (optional) | false | `@IsBoolean()` |
-| `includeExpired` | boolean (optional) | false | `@IsBoolean()` |
-| `presenceStatus` | enum (optional) | — | `@IsEnum(['online', 'idle', 'offline'])` |
-</Tab>
-
-<Tab title="SessionListItem">
-Returned by `SessionService.getActiveSessions()` and `getSessionHistory()`. Lighter than `SessionDto` — no user object, no revocation fields, includes `organization` as `{ id, name }` and `presenceStatus`.
-</Tab>
-
-<Tab title="SessionPolicyDto">
-Session policy configuration object:
-
-```typescript SessionPolicyDto
-{
-  maxConcurrentSessions: number;
-  maxRegisteredDevices: number;
-  maxSessionsPerDevice: number;
-  maxSessionsPerIp: number;
-  sessionExpiryDays: number;
-  inactivityTimeoutHours: number;
-  deviceRemovalCooldownDays: number;
-  absoluteSessionLifetimeHours: number;
-  source: 'user' | 'organization' | 'system';
-}
-```
+<Tab title="GET /system-admin/blocked-ips">
+List all blocked IP addresses with pagination.
 </Tab>
 </Tabs>
 
@@ -675,16 +420,12 @@ Constants defined in `src/common/constants/session.constants.ts`:
 <CodeGroup>
 ```typescript SESSION_DEFAULTS
 SESSION_DEFAULTS = {
-  MAX_CONCURRENT_SESSIONS_PER_ORG: 5,
+  MAX_CONCURRENT_AUTH_SESSIONS: 5,
   MAX_REGISTERED_DEVICES: 5,
-  MAX_ACTIVE_DEVICES: 2,
-  MAX_SESSIONS_PER_DEVICE_PER_ORG: 1,
-  MAX_SESSIONS_PER_IP_PER_ORG: 5,
   SESSION_EXPIRY_DAYS: 14,
   INACTIVITY_TIMEOUT_HOURS: 24,
   DEVICE_REMOVAL_COOLDOWN_DAYS: 30,
   ABSOLUTE_SESSION_LIFETIME_HOURS: 336,
-  SUSPICIOUS_LOGIN_DISTANCE_KM: 500,
   HEARTBEAT_INTERVAL_SECONDS: 30,
   OFFLINE_THRESHOLD_SECONDS: 90,
   IP_BLOCK_CACHE_TTL_SECONDS: 60,
@@ -695,23 +436,12 @@ SESSION_DEFAULTS = {
 REVOCATION_REASONS = {
   MANUAL: 'manual',
   LOGOUT: 'logout',
-  SECURITY: 'security',
   EXPIRED: 'expired',
-  SESSION_LIMIT: 'session_limit',
   INACTIVITY_TIMEOUT: 'inactivity_timeout',
-  ORG_ACCESS_REVOKED: 'org_access_revoked',
-  ORG_SWITCHED: 'org_switched',
-  ORG_DELETED: 'organization_deleted',
   DEVICE_BLOCKED: 'device_blocked',
-}
-```
-
-```typescript DEVICE_TYPES
-DEVICE_TYPES = {
-  DESKTOP: 'desktop',
-  MOBILE: 'mobile',
-  TABLET: 'tablet',
-  UNKNOWN: 'unknown',
+  SESSION_LIMIT: 'session_limit',
+  ORG_ACCESS_REVOKED: 'org_access_revoked',
+  ADMIN_REVOKED: 'admin_revoked',
 }
 ```
 
@@ -724,28 +454,20 @@ PRESENCE_STATUS = {
 ```
 </CodeGroup>
 
-<Info>
-System admin revocation uses additional string literal reasons not in the constants: `'admin_revoked'`, `'admin_revoked_all'`, `'admin_revoked_org'`.
-</Info>
-
 ## RLS & multi-tenancy pattern
 
-Sessions are authentication infrastructure that needs cross-org visibility. The RLS strategy is:
+Both AuthSession and OrgSession are authentication infrastructure requiring cross-org visibility:
 
 | Operation | RLS method | Reason |
 |-----------|-----------|--------|
-| `createSession` | `tenantContext.executeInOrg(orgId)` | Sets org context so session row gets the correct `organization_id` for RLS |
-| `validateSession` | `tenantContext.executeWithBypass()` | Called during auth before org context exists |
-| `validateSessionForOrganization` | `tenantContext.executeWithBypass()` | Called during tenant token refresh before org context |
-| All revocation methods | `tenantContext.executeWithBypass()` | Need cross-org visibility for user sessions |
-| `getActiveSessions` | `tenantContext.executeWithBypass()` | May return sessions across multiple orgs (`allOrgs` mode) |
-| `getSessionHistory` | `tenantContext.executeWithBypass()` | May return sessions across multiple orgs |
-| All enforcement methods | `tenantContext.executeWithBypass()` | Need to see all sessions for user in org |
-| System admin methods | `tenantContext.executeWithBypass()` | Admin operations are cross-org by nature |
-| Policy resolution | `tenantContext.executeWithBypass()` | Policy lookup spans user and org tables |
-| Device registry operations | `tenantContext.executeWithBypass()` | Device registry is global across orgs |
-| Blocking operations | `tenantContext.executeWithBypass()` | Blocking enforcement is global |
-| Presence updates | `tenantContext.executeWithBypass()` | Presence tracking spans all user sessions |
+| `createAuthSession` | `tenantContext.executeWithBypass()` | Device-level, no org context |
+| `createOrgSession` | `tenantContext.executeInOrg(orgId)` | Sets org context for child session |
+| All validation methods | `tenantContext.executeWithBypass()` | Called during auth before org context exists |
+| All revocation methods | `tenantContext.executeWithBypass()` | Need cross-org visibility |
+| Session listing | `tenantContext.executeWithBypass()` | May span multiple orgs |
+| Policy operations | `tenantContext.executeWithBypass()` | Global policy management |
+| Device registry | `tenantContext.executeWithBypass()` | Global across orgs |
+| Blocking operations | `tenantContext.executeWithBypass()` | Global enforcement |
 
 <Tip>
 See [multi-tenancy & RLS](/backend/multi-tenancy/tenant-context) for the full transaction-first design and `TenantContext` patterns used across the codebase.
@@ -753,29 +475,28 @@ See [multi-tenancy & RLS](/backend/multi-tenancy/tenant-context) for the full tr
 
 ## Security considerations
 
-1. **Refresh token hashing** — tokens are bcrypt-hashed (cost 10) before storage, never stored in plaintext
-2. **O(1) token lookup** — `tokenIdentifier` provides fast session lookup without bcrypt scanning
-3. **Atomic token fields** — `tokenIdentifier` and `refreshTokenHash` are written together or not at all
-4. **Unique constraints** — `idx_session_token` and `idx_session_token_identifier` prevent token reuse
-5. **Expiration** — sessions auto-expire based on configurable policy (`sessionExpiryDays`)
-6. **Inactivity timeout** — sessions revoked after configurable inactivity period (`inactivityTimeoutHours`)
-7. **Activity tracking** — detects dormant sessions via `lastActiveAt` and `activityCount`
-8. **Suspicious detection** — alerts on unusual login patterns (different country, impossible travel, new device)
-9. **Three-tier limits** — configurable session limits via policy system prevent session accumulation
-10. **Global device registry** — enforces device limits and prevents unlimited device registration
-11. **Device and IP blocking** — system admin controls with cached enforcement
-12. **Real-time presence** — heartbeat-driven online/offline status prevents stale presence
-13. **Pre-request security** — SessionActivityInterceptor enforces blocking and timeouts before API processing
-14. **Cookie security** — refresh tokens in HTTP-only cookies with `secure` (production) and `sameSite` (`none` in production, `lax` in dev)
-15. **Global logout** — increments `tokenVersion` to invalidate all JWTs, clears `refreshToken`, and invalidates permission cache
+1. **Two-level validation** — Both AuthSession and OrgSession must be valid for tenant access
+2. **Per-session token storage** — Each AuthSession has its own refresh token hash, enabling true multi-device support
+3. **O(1) token lookup** — `tokenIdentifier` provides fast session lookup without bcrypt scanning
+4. **Block-on-limit** — Login denied when caps reached, prevents account sharing
+5. **Immediate revocation** — SessionActivityInterceptor enforces revocation on every request
+6. **Global device caps** — Prevents unlimited device registration per user
+7. **Device fingerprinting** — ThumbmarkJS provides reliable device identification
+8. **Multi-layer IP blocking** — Blocked IPs rejected at all endpoints and layers
+9. **Advisory locks** — Session creation serialized to prevent race conditions
+10. **Lazy token linking** — Sessions can exist before token generation for cap checking
 
 ## Organization deletion cascade
 
-When a system admin deletes an organization via `DELETE /system-admin/organizations/:id`:
+When a system admin deletes an organization:
 
 <Steps>
-<Step title="Revoke sessions">
-All active sessions for that organization are bulk-revoked via `em.nativeUpdate()` with reason `'organization_deleted'`.
+<Step title="Revoke OrgSessions">
+All OrgSessions for that organization are bulk-revoked with reason `organization_deleted`.
+</Step>
+
+<Step title="Preserve AuthSessions">
+AuthSessions remain valid for other organizations the user belongs to.
 </Step>
 
 <Step title="Soft-delete organization">
@@ -783,124 +504,42 @@ The organization is soft-deleted (`isDeleted = true`).
 </Step>
 </Steps>
 
-## Service method reference
-
-<AccordionGroup>
-<Accordion title="SessionService methods">
-| Method | Parameters | Returns | Description |
-|--------|-----------|---------|-------------|
-| `createSession` | `userId, orgId, refreshToken, deviceInfo, ipAddress` | `Session` | Creates session in org context |
-| `validateSession` | `refreshToken` | `Session \| null` | O(1) validation via token identifier |
-| `validateSessionForOrganization` | `refreshToken, userId, orgId` | `Session \| null` | Validates for specific user+org |
-| `revokeSession` | `sessionId, userId, reason` | `void` | Revokes single session (user must own it) |
-| `revokeAllOrgSessions` | `userId, orgId, reason?` | `number` | Revokes all user sessions in org |
-| `revokeAllUserSessions` | `userId, exceptSessionId?, reason?` | `number` | Revokes all user sessions cross-org |
-| `revokeAllSessions` | `userId, orgId?, exceptCurrentId?` | `number` | Flexible revocation (used by revoke-all endpoint) |
-| `getActiveSessions` | `userId, orgId?, currentSessionId?` | `SessionListItem[]` | Lists active sessions |
-| `getSessionHistory` | `userId, orgId?, page?, limit?` | `SessionHistory` | Paginated session history |
-| `updateSessionActivity` | `sessionId, activityType?` | `void` | Updates activity tracking fields |
-| `enforceSessionLimit` | `userId, orgId, limit?` | `void` | Enforces max sessions per org via policy |
-| `enforceDeviceLimit` | `userId, orgId, browser, os, limit?` | `number` | Enforces max sessions per device via policy |
-| `enforceIpLimit` | `userId, orgId, ipAddress, limit?` | `number` | Enforces max sessions per IP via policy |
-| `detectSuspiciousLogin` | `userId, orgId, ipAddress, geolocation` | `{ isSuspicious, reasons }` | Checks for suspicious login patterns |
-| `getCurrentSession` | `refreshToken` | `Session \| null` | Alias for `validateSession` |
-| `hasActiveSessionInOrg` | `userId, orgId` | `boolean` | Checks for any active session in org |
-| `getSessionById` | `sessionId` | `Session \| null` | Retrieves session by ID |
-| `cleanupExpiredSessions` | — | `number` | Marks expired sessions as revoked |
-| `checkInactivityTimeout` | `sessionId` | `boolean` | Checks and revokes session if timeout exceeded |
-</Accordion>
-
-<Accordion title="SessionPolicyService methods">
-| Method | Parameters | Returns | Description |
-|--------|-----------|---------|-------------|
-| `getEffectivePolicy` | `userId, orgId` | `SessionPolicy` | Three-tier policy resolution |
-| `setOrgPolicy` | `orgId, policy` | `void` | Set organization default policy |
-| `setUserPolicy` | `userId, orgId, policy` | `void` | Set user-specific policy override |
-| `getOrgPolicy` | `orgId` | `SessionPolicy \| null` | Get organization policy |
-| `getUserPolicy` | `userId, orgId` | `SessionPolicy \| null` | Get user policy override |
-| `deleteOrgPolicy` | `orgId` | `void` | Remove organization policy |
-| `deleteUserPolicy` | `userId, orgId` | `void` | Remove user policy override |
-</Accordion>
-
-<Accordion title="DeviceRegistryService methods">
-| Method | Parameters | Returns | Description |
-|--------|-----------|---------|-------------|
-| `registerDevice` | `userId, deviceFingerprint, deviceInfo` | `boolean` | Register new device (respects limits) |
-| `getRegisteredDevices` | `userId` | `RegisteredDevice[]` | List user's registered devices |
-| `removeDevice` | `userId, deviceFingerprint` | `void` | Remove device (respects cooldown) |
-| `canReplaceDevice` | `userId` | `boolean` | Check if device replacement allowed |
-| `getDeviceReplacementDate` | `userId` | `Date \| null` | Next available replacement date |
-| `enforceDeviceLimit` | `userId` | `void` | Enforce global device limit |
-| `enforceActiveDeviceLimit` | `userId` | `void` | Enforce concurrent active device limit |
-</Accordion>
-
-<Accordion title="DeviceBlockingService methods">
-| Method | Parameters | Returns | Description |
-|--------|-----------|---------|-------------|
-| `blockDevice` | `deviceFingerprint, reason?` | `void` | Block device globally |
-| `unblockDevice` | `deviceFingerprint` | `void` | Unblock device |
-| `blockIp` | `ipAddress, reason?` | `void` | Block IP address |
-| `unblockIp` | `ipAddress` | `void` | Unblock IP address |
-| `isDeviceBlocked` | `deviceFingerprint` | `boolean` | Check device block status (cached) |
-| `isIpBlocked` | `ipAddress` | `boolean` | Check IP block status (cached) |
-| `getBlockedDevices` | `page?, limit?` | `PaginatedResponse<BlockedDevice>` | List blocked devices |
-| `getBlockedIps` | `page?, limit?` | `PaginatedResponse<BlockedIp>` | List blocked IPs |
-</Accordion>
-
-<Accordion title="PresenceService methods">
-| Method | Parameters | Returns | Description |
-|--------|-----------|---------|-------------|
-| `updateHeartbeat` | `sessionId` | `void` | Update session heartbeat |
-| `setPresenceStatus` | `sessionId, status` | `void` | Set online/idle/offline status |
-| `getPresenceStatus` | `sessionId` | `PresenceStatus` | Get current presence status |
-| `markStaleSessionsOffline` | — | `number` | Cron job: mark sessions offline after 90s |
-| `getOnlineUsers` | `orgId?` | `number` | Count online users |
-| `getUserPresence` | `userId, orgId?` | `PresenceStatus` | Get user's presence across sessions |
-</Accordion>
-</AccordionGroup>
-
 ## File locations
 
 ```
 src/
 ├── modules/auth/
-│   ├── entities/session.entity.ts        # Session entity with device registry and presence fields
-│   ├── services/session.service.ts       # Core session logic
-│   ├── services/session-policy.service.ts # Three-tier policy system
-│   ├── services/device-registry.service.ts # Global device management
-│   ├── services/device-blocking.service.ts # Device and IP blocking
-│   ├── services/presence.service.ts      # Real-time presence tracking
-│   ├── services/geolocation.service.ts   # IP geolocation
-│   ├── services/device-parser.service.ts # User-Agent parsing
-│   ├── session.dto.ts                    # SessionDto with presence fields
-│   ├── auth.controller.ts                # Session endpoints (/auth/sessions/*)
-│   ├── auth.service.ts                   # Logout logic, session creation orchestration
-│   └── auth.module.ts                    # Registers session providers
+│   ├── entities/
+│   │   ├── auth-session.entity.ts        # Device-level session entity
+│   │   └── org-session.entity.ts         # Org-level session entity
+│   ├── services/
+│   │   ├── session.service.ts            # Two-level session logic
+│   │   ├── session-policy.service.ts     # Global policy management
+│   │   ├── device-registry.service.ts    # Global device management
+│   │   ├── device-blocking.service.ts    # Device and IP blocking
+│   │   ├── presence.service.ts           # Real-time presence tracking
+│   │   ├── geolocation.service.ts        # IP geolocation
+│   │   └── device-parser.service.ts      # User-Agent parsing
+│   ├── dto/
+│   │   ├── auth-session.dto.ts           # AuthSession response DTO
+│   │   └── org-session.dto.ts            # OrgSession response DTO
+│   ├── auth.controller.ts                # Identity-token session endpoints
+│   ├── auth.service.ts                   # Session creation orchestration
+│   └── auth.module.ts                    # Session providers registration
 ├── modules/system-admin/
 │   ├── system-admin.controller.ts        # Admin session and blocking endpoints
-│   ├── system-admin.service.ts           # Admin session logic and blocking management
-│   ├── dto/admin-session.dto.ts          # AdminSessionDto, ListSessionsQueryDto, SessionStatsDto
-│   ├── dto/blocking.dto.ts               # BlockedDeviceDto, BlockedIpDto
-│   └── system-admin.module.ts            # Registers admin providers
+│   ├── system-admin.service.ts           # Admin session management
+│   └── dto/
+│       ├── admin-session.dto.ts          # Admin session views
+│       └── blocking.dto.ts               # Device/IP blocking DTOs
 ├── interceptors/
-│   └── session-activity.interceptor.ts   # Global activity tracking with security checks
+│   └── session-activity.interceptor.ts   # Pre-request validation and activity tracking
 ├── gateways/
-│   └── presence.gateway.ts               # WebSocket gateway for presence heartbeats
+│   └── presence.gateway.ts               # WebSocket presence heartbeats
 ├── common/constants/
-│   └── session.constants.ts              # SESSION_DEFAULTS, REVOCATION_REASONS, DEVICE_TYPES, PRESENCE_STATUS
-├── common/utils/
-│   └── cors.util.ts                      # Shared CORS validation for HTTP and WebSocket
-└── app.module.ts                         # Registers SessionActivityInterceptor globally
+│   └── session.constants.ts              # SESSION_DEFAULTS, REVOCATION_REASONS
+└── app.module.ts                         # SessionActivityInterceptor registration
 ```
-
-## Dependencies
-
-- `ua-parser-js` — User-Agent parsing
-- `bcryptjs` — token hashing
-- `ip-api.com` — free geolocation API (45 req/min limit, HTTP only)
-- `node-cache` — in-memory caching for IP blocks and geolocation
-- `@nestjs/websockets` — WebSocket support for presence tracking
-- `@nestjs/schedule` — cron jobs for offline session marking
 
 <CardGroup cols={2}>
 <Card title="Multi-tenancy & RLS" icon="shield-halved" href="/backend/multi-tenancy/overview">
