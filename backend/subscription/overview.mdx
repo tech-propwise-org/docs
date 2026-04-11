@@ -1,0 +1,546 @@
+---
+title: "Subscription & Billing Overview"
+description: "Complete specification for the subscription and billing module with Stripe integration"
+---
+
+The Subscription Module implements a **freemium SaaS billing system** for PropWise CRM. Every organization has a subscription tied to one of four plan tiers. The module handles plan-based feature gating, resource limits, credit-based metering, dual seat types, and complete Stripe integration.
+
+<Note>
+This module is fully implemented and actively used in production. Status: **Active**
+</Note>
+
+## Architecture
+
+### High-Level Components
+
+The subscription system follows a layered architecture with clear separation of concerns:
+
+<CardGroup cols={2}>
+  <Card title="API Layer" icon="code">
+    Controllers handling authenticated subscription management and public Stripe webhooks
+  </Card>
+  <Card title="Service Layer" icon="gear">
+    Business logic for subscription lifecycle, credit management, and Stripe integration
+  </Card>
+  <Card title="Data Layer" icon="database">
+    MikroORM entities for plans, subscriptions, usage tracking, and billing events
+  </Card>
+  <Card title="Payment Gateway" icon="credit-card">
+    Stripe integration for checkout, subscriptions, webhooks, and billing portal
+  </Card>
+</CardGroup>
+
+### Design Principles
+
+| Principle | Implementation |
+|---|---|
+| **Freemium Model** | Free plan with limited features; paid tiers unlock progressively |
+| **Per-Organization Billing** | Billing is per organization; developer portal is free |
+| **Dual Seat Types** | Manager seats (Owner, Admin) and agent seats (Basic, custom roles) |
+| **Feature Flags Over Tier Checks** | Uses `@RequiresFeature('flag')` on plan JSONB for flexibility |
+| **Stripe as Source of Truth** | Webhook-driven lifecycle with idempotent event processing |
+| **Prorated Changes** | All mid-cycle changes use `proration_behavior: 'create_prorations'` |
+
+## Plan Tiers & Pricing
+
+<Tabs>
+  <Tab title="Pricing Overview">
+    Four tiers with progressive feature unlocks, priced in USD:
+
+    | Plan | Monthly | Annual | Manager Seats | Agent Seats |
+    |---|---|---|---|---|
+    | **Free** | $0 | $0 | 1 included | 0 included |
+    | **Starter** | $49 | $470.40 | 2 included | 3 included |
+    | **Professional** | $149 | $1,430.40 | 5 included | 15 included |
+    | **Business** | $399 | $3,830.40 | 10 included | 40 included |
+  </Tab>
+  
+  <Tab title="Extra Seat Pricing">
+    Additional seats priced per tier:
+
+    | Plan | Extra Manager Seat | Extra Agent Seat |
+    |---|---|---|
+    | **Starter** | $25/month | $12/month |
+    | **Professional** | $20/month | $10/month |
+    | **Business** | $18/month | $8/month |
+  </Tab>
+</Tabs>
+
+### Resource Limits
+
+<AccordionGroup>
+  <Accordion title="Data Storage Limits">
+    | Resource | Free | Starter | Professional | Business |
+    |---|---|---|---|---|
+    | Leads | 50 | 1,000 | 10,000 | Unlimited |
+    | Contacts | 50 | 1,000 | 10,000 | Unlimited |
+    | Deals | 20 | 500 | 5,000 | Unlimited |
+    | Companies | 10 | 200 | 2,000 | Unlimited |
+    | File Storage | 500 MB | 5 GB | 25 GB | 100 GB |
+  </Accordion>
+  
+  <Accordion title="Monthly Credit Allowances">
+    | Credit Type | Free | Starter | Professional | Business |
+    |---|---|---|---|---|
+    | AI Credits | 20 | 200 | 1,000 | 5,000 |
+    | Messaging Credits | 0 | 100 | 500 | 2,000 |
+    
+    <Info>Credits reset monthly and can be topped up with one-time purchases</Info>
+  </Accordion>
+</AccordionGroup>
+
+## Feature Gating Model
+
+The system uses three distinct gating mechanisms:
+
+### Type 1: Binary Feature Flags
+
+Boolean flags stored in `SubscriptionPlan.features` (JSONB), checked via `@RequiresFeature('flagName')`:
+
+<CodeGroup>
+```typescript Controller Usage
+@RequiresFeature('customPipelineStages')
+@Post('pipeline-stages')
+async createCustomStage() {
+  // Only available on Starter+ plans
+}
+```
+
+```typescript Service Usage
+async someMethod(orgId: string) {
+  await this.subscriptionService.checkFeature(orgId, 'apiAccess');
+  // Throws if organization doesn't have API access
+}
+```
+</CodeGroup>
+
+| Feature | Free | Starter | Pro | Business |
+|---|---|---|---|---|
+| Custom Pipeline Stages | ❌ | ✅ | ✅ | ✅ |
+| Distribution Engine | ❌ | ❌ | ✅ | ✅ |
+| Advanced Analytics | ❌ | ❌ | ✅ | ✅ |
+| Custom Roles | ❌ | ❌ | ❌ | ✅ |
+| White Label | ❌ | ❌ | ❌ | ✅ |
+
+### Type 2: Credit-Based Consumption
+
+Features available on the tier but limited by monthly budget:
+
+<Steps>
+  <Step title="Check Monthly Allowance">
+    First, consume from the plan's monthly credit allocation
+  </Step>
+  <Step title="Use Purchased Packs">
+    When monthly allowance is exhausted, consume from purchased packs (FIFO order)
+  </Step>
+  <Step title="Block When Depleted">
+    When all credits are consumed, feature becomes unavailable until next billing cycle or top-up purchase
+  </Step>
+</Steps>
+
+### Type 3: Add-on Packs
+
+| Add-on | Type | Stripe Model | Behavior |
+|---|---|---|---|
+| Storage Pack (+10 GB) | Recurring | Subscription line item | Stacks with base storage |
+| AI Credit Pack (+500) | One-time | Payment intent | Consumed then depleted |
+| Messaging Pack (+500) | One-time | Payment intent | Consumed then depleted |
+
+## Seat Management
+
+<Warning>
+Every user in an organization consumes exactly one seat. Seat type is automatically derived from the user's RBAC role - there is no separate seat assignment.
+</Warning>
+
+### Seat Type Mapping
+
+| Seat Type | Included Roles | Pricing |
+|---|---|---|
+| **Manager** | Owner, Admin | Varies by plan tier |
+| **Agent** | Basic, custom organization roles | Varies by plan tier |
+
+### Seat Counting Logic
+
+Seats are computed on-demand from active `UserOrgRole` records:
+
+```typescript
+managerSeatsUsed = count(active users with Owner or Admin role)
+agentSeatsUsed = count(active users with any other org role)
+```
+
+<Tip>
+Pending invitations do not occupy seats. Seats are only counted when users accept invitations and receive active `UserOrgRole` records.
+</Tip>
+
+### Enforcement Points
+
+1. **Invitation Service** - Checks seat availability before creating invitations
+2. **Role Assignment Validation** - Validates seat capacity when changing user roles
+
+## Credit System
+
+### Consumption Flow
+
+<Steps>
+  <Step title="Monthly Allowance First">
+    Credits are consumed from the monthly plan allowance first
+    ```typescript
+    if (usage.aiCreditsUsed < plan.aiCreditsPerMonth) {
+      // Consume from monthly allowance
+      usage.aiCreditsUsed += amount;
+    }
+    ```
+  </Step>
+  
+  <Step title="Purchased Packs (FIFO)">
+    When monthly allowance is exhausted, consume from purchased packs in FIFO order
+    ```typescript
+    const availablePacks = await this.creditPurchaseRepo.find({
+      organization: orgId,
+      creditsRemaining: { $gt: 0 }
+    }, { orderBy: { purchasedAt: 'ASC' } });
+    ```
+  </Step>
+  
+  <Step title="Block When Depleted">
+    When all credits are consumed, feature calls throw `InsufficientCreditsError`
+  </Step>
+</Steps>
+
+## Subscription Lifecycle
+
+### Checkout Flow (Free → Paid)
+
+<Steps>
+  <Step title="Create Checkout Session">
+    ```typescript
+    POST /v1/subscriptions/checkout
+    // Creates Stripe Checkout session for first-time subscription
+    ```
+  </Step>
+  
+  <Step title="User Payment">
+    User completes payment on Stripe's hosted checkout page
+  </Step>
+  
+  <Step title="Webhook Processing">
+    ```typescript
+    // Stripe fires checkout.session.completed webhook
+    POST /webhooks/stripe
+    // SubscriptionService.activateSubscription() called
+    ```
+  </Step>
+  
+  <Step title="Activation">
+    Subscription status updated to `ACTIVE` in local database
+  </Step>
+</Steps>
+
+### Plan Change Flow (Paid → Different Paid)
+
+<Steps>
+  <Step title="Validate Change">
+    ```typescript
+    POST /v1/subscriptions/change-plan
+    // Validates seat overflow and plan compatibility
+    ```
+  </Step>
+  
+  <Step title="Stripe Price Swap">
+    ```typescript
+    // Prorated change in Stripe subscription
+    await stripeService.swapSubscriptionPrice(subscriptionId, newPriceId);
+    ```
+  </Step>
+  
+  <Step title="Seat Reconciliation">
+    Adjusts manager and agent seat line items with prorated pricing
+  </Step>
+  
+  <Step title="Local Update">
+    Updates local `Subscription` entity immediately
+  </Step>
+</Steps>
+
+### Payment Failure Flow
+
+<Steps>
+  <Step title="Payment Failure">
+    Stripe invoice payment fails → `invoice.payment_failed` webhook
+  </Step>
+  
+  <Step title="Grace Period">
+    Subscription status changes to `PAST_DUE` (2-day grace period)
+  </Step>
+  
+  <Step title="Resolution Paths">
+    <Tabs>
+      <Tab title="Payment Succeeds">
+        - User updates payment method or payment retries succeed
+        - `invoice.paid` webhook received
+        - Status returns to `ACTIVE`
+      </Tab>
+      <Tab title="All Retries Fail">
+        - Stripe exhausts retry attempts
+        - `customer.subscription.updated` webhook with status `unpaid`
+        - Local status changes to `SUSPENDED`
+        - Organization becomes read-only
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
+
+## API Endpoints
+
+### Subscription Management
+
+<AccordionGroup>
+  <Accordion title="GET /v1/subscriptions/current">
+    Get current organization's subscription details including usage and limits.
+    
+    **Response:**
+    ```json
+    {
+      "id": "uuid",
+      "planId": "uuid", 
+      "status": "ACTIVE",
+      "billingCycle": "MONTHLY",
+      "currentPeriodStart": "2024-01-01T00:00:00Z",
+      "currentPeriodEnd": "2024-02-01T00:00:00Z",
+      "plan": {
+        "name": "Professional",
+        "price": 14900,
+        "features": { "customRoles": false }
+      },
+      "usage": {
+        "managerSeatsUsed": 3,
+        "agentSeatsUsed": 12,
+        "aiCreditsUsed": 450,
+        "messagingCreditsUsed": 200
+      }
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="POST /v1/subscriptions/checkout">
+    Create Stripe checkout session for Free → Paid upgrade.
+    
+    **Request:**
+    ```json
+    {
+      "planId": "uuid",
+      "billingCycle": "MONTHLY",
+      "managerSeats": 2,
+      "agentSeats": 5
+    }
+    ```
+    
+    **Response:**
+    ```json
+    {
+      "checkoutUrl": "https://checkout.stripe.com/c/pay/..."
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="POST /v1/subscriptions/change-plan">
+    Change between paid plans with prorated billing.
+    
+    **Request:**
+    ```json
+    {
+      "planId": "uuid",
+      "managerSeats": 3,
+      "agentSeats": 10
+    }
+    ```
+    
+    **Response:** Updated subscription object
+  </Accordion>
+</AccordionGroup>
+
+### Credit Management
+
+<AccordionGroup>
+  <Accordion title="POST /v1/subscriptions/credits/purchase">
+    Purchase one-time credit top-up packs.
+    
+    **Request:**
+    ```json
+    {
+      "type": "AI",
+      "packSize": 500
+    }
+    ```
+    
+    **Response:**
+    ```json
+    {
+      "checkoutUrl": "https://checkout.stripe.com/c/pay/...",
+      "amount": 2500
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="GET /v1/subscriptions/credits/balance">
+    Get remaining credit balances.
+    
+    **Response:**
+    ```json
+    {
+      "aiCredits": {
+        "monthly": 550,
+        "purchased": 1200,
+        "total": 1750
+      },
+      "messagingCredits": {
+        "monthly": 300,
+        "purchased": 0,
+        "total": 300
+      }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Guards & Decorators
+
+### Feature Gating
+
+<CodeGroup>
+```typescript @RequiresFeature Decorator
+@RequiresFeature('advancedAnalytics')
+@Get('analytics/advanced')
+async getAdvancedAnalytics() {
+  // Only accessible on Professional+ plans
+}
+```
+
+```typescript @RequiresActiveSubscription Guard
+@UseGuards(SubscriptionActiveGuard)
+@Post('deals')
+async createDeal() {
+  // Blocked if subscription is SUSPENDED or PAST_DUE
+}
+```
+
+```typescript Service-Level Checks
+async createLead(orgId: string, data: any) {
+  // Check resource limits before creation
+  await this.subscriptionService.checkResourceLimit(orgId, 'leads');
+  
+  // Create the lead
+  return this.leadService.create(data);
+}
+```
+</CodeGroup>
+
+### Available Guards
+
+| Guard | Purpose | Usage |
+|---|---|---|
+| `SubscriptionActiveGuard` | Ensures subscription is not suspended | Write operations |
+| `RequiresFeature` | Validates feature access | Feature-specific endpoints |
+| Built-in limit checks | Resource and credit validation | Service layer methods |
+
+## Environment Configuration
+
+<CodeGroup>
+```bash Required Variables
+# Stripe Configuration
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_PUBLISHABLE_KEY=pk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+# Application URLs
+FRONTEND_URL=https://app.propwise.ai
+BACKEND_URL=https://api.propwise.ai
+```
+
+```bash Optional Variables
+# Subscription Defaults
+DEFAULT_PLAN_ID=free-plan-uuid
+BILLING_GRACE_PERIOD_HOURS=48
+
+# Feature Flags (for development)
+DISABLE_STRIPE_INTEGRATION=false
+ALLOW_FREE_OVERRIDES=false
+```
+</CodeGroup>
+
+<Warning>
+If `STRIPE_SECRET_KEY` is not configured, billing features will be unavailable but the application will still start in a limited mode.
+</Warning>
+
+## Integration Points
+
+### Module Dependencies
+
+<CardGroup cols={2}>
+  <Card title="Organization Module" icon="building">
+    - Links subscriptions to organizations
+    - Manages stripe customer IDs
+    - Handles organization suspension
+  </Card>
+  
+  <Card title="RBAC Module" icon="users">
+    - Seat type derivation from roles
+    - Role change validation
+    - User invitation gating
+  </Card>
+  
+  <Card title="Lead/Contact Modules" icon="address-book">
+    - Resource limit enforcement
+    - Creation blocking when limits exceeded
+  </Card>
+  
+  <Card title="AI Services" icon="brain">
+    - Credit consumption tracking
+    - Feature availability checking
+    - Usage analytics
+  </Card>
+</CardGroup>
+
+### Database Schema
+
+Key entities and relationships:
+
+```sql
+SubscriptionPlan {
+  id: UUID PRIMARY KEY,
+  name: VARCHAR,
+  price: INTEGER, -- cents
+  features: JSONB, -- feature flags
+  limits: JSONB -- resource limits
+}
+
+Subscription {
+  id: UUID PRIMARY KEY,
+  organizationId: UUID REFERENCES organizations(id),
+  planId: UUID REFERENCES subscription_plans(id),
+  stripeSubscriptionId: VARCHAR,
+  status: subscription_status_enum,
+  currentPeriodStart: TIMESTAMP,
+  currentPeriodEnd: TIMESTAMP
+}
+
+SubscriptionUsage {
+  subscriptionId: UUID REFERENCES subscriptions(id),
+  aiCreditsUsed: INTEGER DEFAULT 0,
+  messagingCreditsUsed: INTEGER DEFAULT 0,
+  -- Reset monthly on billing cycle
+}
+
+CreditPurchase {
+  id: UUID PRIMARY KEY,
+  organizationId: UUID REFERENCES organizations(id),
+  creditType: credit_type_enum,
+  creditsTotal: INTEGER,
+  creditsRemaining: INTEGER,
+  purchasedAt: TIMESTAMP
+}
+```
+
+<Check>
+The subscription module is fully operational and handles all aspects of freemium SaaS billing, from feature gating to credit management to Stripe integration.
+</Check>
