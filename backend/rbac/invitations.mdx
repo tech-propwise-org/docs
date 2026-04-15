@@ -26,6 +26,13 @@ User
 ├── id: uuid
 ├── first_name, last_name: string
 ├── email: string (globally unique among active users)
+├── password: string (hashed)
+├── phone_number?: string
+├── avatar_url?: string (public URL to avatar image, stored as WebP on R2)
+├── languages?: string[] (array of language codes)
+├── preferred_language?: string
+├── is_verified: boolean
+├── is_active: boolean
 ├── is_system_admin: boolean (platform-level admin)
 ├── selected_organization_id?: uuid → Organization
 ├── Relationships:
@@ -42,11 +49,19 @@ User
 Organization
 ├── id: uuid
 ├── name: string
+├── website?: string
+├── email?: string
+├── vat?: string
+├── avatar_url?: string (public URL to org logo, stored as WebP on R2)
+├── address?: jsonb (embedded Address object)
 ├── owner_id: uuid → User (organization owner)
 ├── Relationships:
 │   ├── users → User[] (ManyToMany via organization_users)
-│   ├── teams → Team[]
-│   └── invitations → Invitation[]
+│   ├── owner → User (ManyToOne)
+│   ├── leads → Lead[] (OneToMany)
+│   ├── contacts → Contact[] (OneToMany)
+│   ├── deals → Deal[] (OneToMany)
+│   └── companies → Company[] (OneToMany)
 ```
 </Tab>
 
@@ -57,9 +72,12 @@ Organization
 Role
 ├── id: uuid
 ├── name: string
+├── description?: string
+├── color?: string
 ├── scope: RoleScope (ORG | TEAM)
 ├── is_system: boolean (true for seeded roles)
 ├── organization_id?: uuid → Organization (NULL for system roles)
+├── team_id?: uuid → Team (NULL for org roles)
 ├── Relationships:
 │   ├── permissions → Permission[] (via role_permissions)
 │   ├── userOrgRoles → UserOrgRole[]
@@ -80,6 +98,7 @@ Permission
 ├── description: string
 ├── scope: PermissionScope (ORG | TEAM)
 ├── category: string (organization, team, lead, etc.)
+├── team_available: boolean (for ORG-scoped permissions)
 ├── Relationships:
 │   └── roles → Role[] (via role_permissions)
 ```
@@ -107,6 +126,16 @@ All permissions combined using union logic (most permissive).
 ORG-scoped permissions available organization-wide, TEAM-scoped permissions limited to specific teams.
 </Step>
 </Steps>
+
+## Invitation System Architecture
+
+The invitation system follows these core principles:
+
+1. **Secure Token-Based Invitations**: Uses cryptographically secure 64-character hex tokens
+2. **Pre-Configured RBAC Assignments**: Invitations contain complete role and team assignments
+3. **Multi-Organization Support**: Users can be invited to multiple organizations with different roles
+4. **Dual User Flows**: Supports both new user registration and existing user integration
+5. **RLS Bypass Integration**: Invitation acceptance bypasses Row-Level Security for RBAC assignments
 
 ## Invitation Entity
 
@@ -775,6 +804,152 @@ class UserService {
 </Accordion>
 </AccordionGroup>
 
+## Services & Controllers
+
+The invitation system integrates with the comprehensive service and controller architecture defined in the RBAC specification.
+
+### InvitationService
+
+Core business logic for invitation management with comprehensive RBAC integration:
+
+```typescript
+@Injectable()
+export class InvitationService {
+  constructor(
+    @InjectRepository(Invitation) private readonly em: EntityManager,
+    private readonly authService: AuthService,
+    private readonly emailService: EmailService,
+    private readonly tenantContext: TenantContext
+  ) {}
+
+  async createInvitation(dto: CreateInvitationDto): Promise<Invitation> {
+    // Validate role assignments against RBAC system
+    await this.validateRoleAssignments(
+      dto.organizationId, 
+      dto.orgRoleAssignments, 
+      dto.teamRoleAssignments
+    );
+
+    const token = this.generateSecureToken();
+    const invitation = this.em.create(Invitation, {
+      ...dto,
+      token,
+      status: InvitationStatus.PENDING,
+      expiresAt: dto.expiresAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+    });
+
+    await this.em.persistAndFlush(invitation);
+    await this.sendInvitationEmail(invitation);
+    
+    return invitation;
+  }
+
+  async acceptInvitation(token: string, userData: AcceptInvitationDto): Promise<User> {
+    const invitation = await this.validateInvitationToken(token);
+    
+    // Create new user account
+    const user = await this.authService.register({
+      email: invitation.email,
+      ...userData
+    });
+
+    // Apply RBAC assignments with RLS bypass
+    await this.tenantContext.executeWithBypass(async (bypassEm) => {
+      await this.applyInvitationRbacAssignments(bypassEm, user, invitation);
+    });
+
+    return user;
+  }
+
+  async acceptInvitationExisting(token: string, user: User): Promise<Invitation> {
+    const invitation = await this.validateInvitationToken(token);
+    
+    if (invitation.email !== user.email) {
+      throw new BadRequestException('Invitation email does not match user email');
+    }
+
+    // Apply RBAC assignments for existing user
+    await this.tenantContext.executeWithBypass(async (bypassEm) => {
+      await this.applyInvitationRbacAssignments(bypassEm, user, invitation);
+    });
+
+    return invitation;
+  }
+}
+```
+
+### InvitationController
+
+HTTP endpoints for invitation management:
+
+```typescript
+@Controller('invitations')
+@ApiTags('Invitations')
+export class InvitationController {
+  constructor(private readonly invitationService: InvitationService) {}
+
+  @Post()
+  @UseGuards(JwtAuthGuard, PermissionGuard)
+  @RequirePermissions('invitations:create')
+  async createInvitation(
+    @Body() dto: CreateInvitationDto,
+    @CurrentUser() user: User
+  ): Promise<Invitation> {
+    return this.invitationService.createInvitation({ ...dto, invitedById: user.id });
+  }
+
+  @Post('accept/:token')
+  @ApiOperation({ summary: 'Accept invitation (new user)' })
+  async acceptInvitation(
+    @Param('token') token: string,
+    @Body() userData: AcceptInvitationDto
+  ): Promise<{ user: User; token: string; permissions: string[] }> {
+    const user = await this.invitationService.acceptInvitation(token, userData);
+    const authToken = await this.authService.generateTokens(user);
+    
+    // Get user's permissions in the new organization
+    const invitation = await this.invitationService.getInvitationByToken(token);
+    const permissions = await this.rbacService.getUserPermissions(
+      user.id,
+      invitation.organization.id
+    );
+    
+    return { 
+      user, 
+      token: authToken.accessToken,
+      permissions: permissions.allPermissions
+    };
+  }
+
+  @Post('accept-existing/:token')
+  @UseGuards(JwtAuthGuard)
+  async acceptInvitationExisting(
+    @Param('token') token: string,
+    @CurrentUser() user: User
+  ): Promise<{ success: boolean; permissions: string[] }> {
+    const invitation = await this.invitationService.acceptInvitationExisting(token, user);
+    
+    // Get updated permissions in the new organization
+    const permissions = await this.rbacService.getUserPermissions(
+      user.id,
+      invitation.organization.id
+    );
+    
+    return { 
+      success: true, 
+      permissions: permissions.allPermissions
+    };
+  }
+
+  @Put(':id/cancel')
+  @UseGuards(JwtAuthGuard, PermissionGuard)
+  @RequirePermissions('invitations:cancel')
+  async cancelInvitation(@Param('id') id: string): Promise<Invitation> {
+    return this.invitationService.cancelInvitation(id);
+  }
+}
+```
+
 ## Query Patterns
 
 ### Common Invitation Queries
@@ -1001,54 +1176,6 @@ const invitation = await invitationService.createInvitation({
   welcomeMessage: 'Welcome to our sales organization! You'll have admin access and will lead our sales team.',
   expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14 days
 });
-```
-
-### Accepting Invitations with RBAC Integration
-
-```typescript
-// Public endpoint for new users - creates account and applies RBAC
-@Post('accept/:token')
-async acceptInvitation(
-  @Param('token') token: string,
-  @Body() userData: AcceptInvitationDto
-): Promise<{ user: User; token: string; permissions: string[] }> {
-  const user = await this.invitationService.acceptInvitation(token, userData);
-  const authToken = await this.authService.generateTokens(user);
-  
-  // Get user's permissions in the new organization
-  const invitation = await this.invitationService.getInvitationByToken(token);
-  const permissions = await this.rbacService.getUserPermissions(
-    user.id,
-    invitation.organization.id
-  );
-  
-  return { 
-    user, 
-    token: authToken.accessToken,
-    permissions: permissions.allPermissions
-  };
-}
-
-// Authenticated endpoint for existing users - adds to new organization
-@Post('accept-existing/:token')
-@UseGuards(JwtAuthGuard)
-async acceptInvitationExisting(
-  @Param('token') token: string,
-  @CurrentUser() user: User
-): Promise<{ success: boolean; permissions: string[] }> {
-  const invitation = await this.invitationService.acceptInvitationExisting(token, user);
-  
-  // Get updated permissions in the new organization
-  const permissions = await this.rbacService.getUserPermissions(
-    user.id,
-    invitation.organization.id
-  );
-  
-  return { 
-    success: true, 
-    permissions: permissions.allPermissions
-  };
-}
 ```
 
 ### RLS Integration
