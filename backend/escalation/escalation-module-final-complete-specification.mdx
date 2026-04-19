@@ -1,0 +1,780 @@
+---
+title: "Escalation Module - Final Complete Specification"
+description: "Complete technical specification for the Escalation Module including architecture, entities, engine, API endpoints, and implementation details"
+---
+
+## Overview
+
+The Escalation Module automates responses when assigned leads go stale. A scheduled engine detects trigger conditions (no first contact, went cold) and executes tiered escalation actions — notifications, temperature changes, tag additions, and redistribution to new agents.
+
+<Note>
+**Status:** Active — fully implemented  
+**Module Path:** `src/modules/crm/escalation/`
+</Note>
+
+### Design Principles
+
+The escalation system follows these key architectural decisions:
+
+<CardGroup cols={2}>
+  <Card title="pg-boss Scheduling" icon="clock">
+    Escalation scheduler uses pg-boss recurring job for reliability
+  </Card>
+  <Card title="Tiered Actions" icon="layer-group">
+    Rules have ordered tiers with configurable delays; actions execute in sequence
+  </Card>
+  <Card title="Auto-resolution" icon="check-circle">
+    Events (activity, stage change, reassignment) automatically resolve active trackers
+  </Card>
+  <Card title="Idempotency" icon="shield">
+    Partial unique index + `ON CONFLICT DO NOTHING` prevents duplicate trackers
+  </Card>
+</CardGroup>
+
+<Info>
+The system delegates redistribution to the distribution engine (`REDISTRIBUTE` action) rather than implementing a separate paradigm, ensuring consistency across lead assignment workflows.
+</Info>
+
+## Architecture
+
+### High-Level Architecture Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                  API Layer (Controllers)                        │
+│  EscalationRuleCtrl  │  EscalationAnalyticsCtrl                │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+┌──────────────────────────────▼─────────────────────────────────┐
+│  Escalation Engine                                              │
+│  ┌─────────────────────┐  ┌─────────────────────────────────┐  │
+│  │ TriggerDetector     │  │ TierExecutor                    │  │
+│  │ EscalationScheduler │  │ EscalationAutoResolver          │  │
+│  │  (pg-boss recurring)│  │  (event listener)               │  │
+│  └─────────────────────┘  └─────────────────────────────────┘  │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+┌──────────────────────────────▼─────────────────────────────────┐
+│                    Shared Services                               │
+│  DistributionEngineService │ NotificationService │ EventEmitter2 │
+│  UserStatusService │ TenantContext │ pg-boss                     │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+┌──────────────────────────────▼─────────────────────────────────┐
+│                    Data Layer (MikroORM + PostgreSQL)            │
+│  escalation_rule │ escalation_tier │ escalation_tracker          │
+│  escalation_action_log                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Component Responsibilities
+
+| Component | Responsibility |
+|-----------|----------------|
+| **EscalationScheduler** | pg-boss recurring job that runs every 60 seconds to detect new triggers and process due escalations |
+| **TriggerDetector** | Scans leads for unmet conditions (no first contact, went cold); creates tracker records |
+| **TierExecutor** | Executes escalation tier actions (notify, redistribute, change temp, add tag) |
+| **EscalationAutoResolver** | Listens to domain events and resolves active trackers when conditions change |
+| **EscalationRuleService** | CRUD for escalation rules; handles tracker cancellation on deactivation/deletion |
+
+## Entity Specifications
+
+### EscalationRule
+
+Defines when and how a lead should be escalated. Evaluated by `TriggerDetector`.
+
+<Tabs>
+  <Tab title="Schema">
+    | Column | Type | Notes |
+    |--------|------|-------|
+    | id | uuid PK | |
+    | organization_id | uuid FK | RLS |
+    | name | varchar | Human-readable rule name |
+    | is_active | bool | default true |
+    | priority | int | Evaluation order |
+    | trigger_type | enum | `NO_FIRST_CONTACT`, `WENT_COLD` |
+    | trigger_config | jsonb | `{thresholdMinutes?, thresholdValue?, thresholdUnit?}` |
+    | conditions | jsonb | `EscalationCondition[]` — AND-joined applicability filters; `[]` = all leads |
+    | respect_business_hours | bool | default true. References org business hours schedule. |
+    | created_by | uuid FK | |
+    | created_at, updated_at | timestamp | |
+    | is_deleted | bool | soft delete |
+  </Tab>
+  <Tab title="Conditions">
+    ```typescript
+    interface EscalationCondition {
+      field: 'temperature' | 'leadSource' | 'language' | 'sourceChannel';
+      operator: 'eq' | 'in';
+      value: string | string[];
+    }
+    ```
+
+    **SQL field mapping (used by `TriggerDetector.buildApplicabilityExtraWhere`):**
+
+    | Field | SQL Column | Table | Notes |
+    |-------|-----------|-------|-------|
+    | `temperature` | `l.temperature` | lead | |
+    | `leadSource` | `l.lead_source` | lead | |
+    | `sourceChannel` | `l.source_channel` | lead | |
+    | `language` | `p.language` | person | Adds `LEFT JOIN person p ON p.id = l.person_id` |
+  </Tab>
+</Tabs>
+
+### EscalationTier
+
+Each tier in an escalation rule represents a delayed action set. Tiers execute in `tier_order` sequence.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| escalation_rule_id | uuid FK | |
+| organization_id | uuid FK | RLS |
+| tier_order | int | 1, 2, 3... (max 10) |
+| delay_minutes | int | Tier 1: always 0. Subsequent tiers: minutes after previous tier |
+| actions | jsonb | `TierAction[]` |
+
+<Warning>
+For **Tier 1** (lowest tier_order), `delay_minutes` must always be 0 — the threshold is the sole timing control. Subsequent tiers specify minutes after the previous tier completed.
+</Warning>
+
+#### Tier Action Types
+
+<AccordionGroup>
+  <Accordion title="Notification Actions">
+    | Action Type | Parameters | Resolution |
+    |-------------|------------|------------|
+    | `NOTIFY_AGENT` | `message?: string` | Resolved from lead's current stakeholder (assigned agent) |
+    | `NOTIFY_ADMIN` | `message?: string` | **Self-resolving** — queries all org users with the `system.admin` permission key |
+    | `NOTIFY_TEAM_LEAD` | `message?: string` | **Self-resolving** — queries team members with `team.admin` permission in lead's assigned team |
+  </Accordion>
+  <Accordion title="Lead Modification Actions">
+    | Action Type | Parameters | Resolution |
+    |-------------|------------|------------|
+    | `REDISTRIBUTE` | _(no params)_ | **Distribution engine delegation** — removes current stakeholders, calls redistribution |
+    | `CHANGE_TEMPERATURE` | `temperature: 'hot' \| 'warm' \| 'cold'` | **Direct entity update** |
+    | `ADD_TAG` | `tagIds: string[]` | **Direct entity update** — appends to `lead.tagIds` array |
+  </Accordion>
+</AccordionGroup>
+
+<Check>
+**REDISTRIBUTE Action**: Must be in the **last tier** only. The API rejects rules where REDISTRIBUTE appears in intermediate tiers. If redistribution outcome is `ASSIGNED`, the scheduler resolves the tracker with `resolvedBy = REDISTRIBUTED`.
+</Check>
+
+#### Action Configuration Examples
+
+```typescript
+{ "type": "NOTIFY_AGENT", "message": "Lead needs attention" }
+{ "type": "NOTIFY_ADMIN", "message": "Escalation alert" }
+{ "type": "NOTIFY_TEAM_LEAD" }
+{ "type": "REDISTRIBUTE" }
+{ "type": "CHANGE_TEMPERATURE", "temperature": "hot" }
+{ "type": "ADD_TAG", "tagIds": ["tag-uuid-1", "tag-uuid-2"] }
+```
+
+### EscalationTracker
+
+Tracks the escalation state of a specific lead against a specific rule.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| lead_id | uuid FK | |
+| escalation_rule_id | uuid FK | |
+| organization_id | uuid FK | RLS |
+| current_tier | int | 0 = triggered but not yet escalated; increments with each tier |
+| trigger_fired_at | timestamp | when the trigger condition was first detected |
+| next_escalation_at | timestamp | indexed for scheduler query; null after all tiers complete |
+| status | enum | `ACTIVE`, `RESOLVED`, `CANCELLED` |
+| resolved_at | timestamp nullable | |
+| resolved_by | enum nullable | See ResolvedBy values below |
+| history | jsonb | `TrackerHistoryEntry[]` — append-only summary |
+| created_at | timestamp | |
+
+#### Key Indexes
+
+<Info>
+These indexes are critical for escalation performance:
+</Info>
+
+| Index | Columns | Type | Notes |
+|-------|---------|------|-------|
+| `uq_escalation_tracker_lead_rule` | `(lead_id, escalation_rule_id) WHERE status = 'ACTIVE'` | Partial unique | Prevents duplicate ACTIVE trackers |
+| `idx_escalation_tracker_next_at` | `(next_escalation_at, status)` | Composite | Primary scheduler query |
+| `idx_escalation_tracker_lead` | `(lead_id, status)` | Composite | Auto-resolver lookups |
+| `idx_escalation_tracker_org_status` | `(organization_id, status)` | Composite | Per-org active tracker counts |
+
+#### Idempotency Guarantee
+
+The partial unique index provides database-level protection. `TriggerDetector` uses `INSERT ... ON CONFLICT ... DO NOTHING`:
+
+```sql
+INSERT INTO escalation_tracker
+  (id, lead_id, escalation_rule_id, organization_id, trigger_fired_at,
+   next_escalation_at, status, history, current_tier, created_at)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', '[]', 0, NOW())
+ON CONFLICT (lead_id, escalation_rule_id) WHERE status = 'ACTIVE' DO NOTHING;
+```
+
+<Warning>
+`TriggerDetector` must **never** use `em.persistAndFlush()` for tracker creation — always use the raw `execute()` call with `ON CONFLICT DO NOTHING`.
+</Warning>
+
+### EscalationActionLog
+
+Normalized table recording every escalation tier action execution. Used for analytics queries.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid PK | |
+| tracker_id | uuid FK | references `escalation_tracker` |
+| organization_id | uuid FK | RLS |
+| tier_order | int | which tier triggered this action |
+| action_type | varchar | e.g., `NOTIFY_AGENT`, `REDISTRIBUTE` |
+| action_params | jsonb nullable | serialized parameters |
+| result | enum | `SUCCESS`, `FAILED`, `SKIPPED` |
+| executed_at | timestamp | |
+
+**Key Indexes:**
+- `(organization_id, action_type)` — analytics by action type
+- `(organization_id, executed_at)` — time-range queries  
+- `(tracker_id)` — lookup all actions for a tracker
+
+## Type Definitions
+
+### Core Enums
+
+```typescript
+enum TriggerType {
+  NO_FIRST_CONTACT = 'NO_FIRST_CONTACT',
+  WENT_COLD = 'WENT_COLD',
+}
+
+enum EscalationActionType {
+  NOTIFY_AGENT = 'NOTIFY_AGENT',
+  NOTIFY_ADMIN = 'NOTIFY_ADMIN',
+  NOTIFY_TEAM_LEAD = 'NOTIFY_TEAM_LEAD',
+  REDISTRIBUTE = 'REDISTRIBUTE',
+  CHANGE_TEMPERATURE = 'CHANGE_TEMPERATURE',
+  ADD_TAG = 'ADD_TAG',
+}
+
+enum EscalationStatus {
+  ACTIVE = 'ACTIVE',
+  RESOLVED = 'RESOLVED',
+  CANCELLED = 'CANCELLED',
+}
+
+enum ActionResult {
+  SUCCESS = 'SUCCESS',
+  FAILED = 'FAILED',
+  SKIPPED = 'SKIPPED',
+}
+```
+
+### ResolvedBy Values
+
+| Value | Description |
+|-------|-------------|
+| `MANUAL` | User explicitly resolved via UI/API |
+| `AUTO_ACTIVITY` | New activity added to lead |
+| `AUTO_STAGE_CHANGE` | Lead moved to different stage |
+| `AUTO_REASSIGNMENT` | Lead assigned to different user/team |
+| `AUTO_ARCHIVED` | Lead was archived |
+| `AUTO_DELETED` | Lead was deleted |
+| `AUTO_ORPHANED` | Lead has no stakeholders |
+| `REDISTRIBUTED` | Escalation redistribution completed successfully |
+
+## Escalation Engine
+
+### Scheduler Overview
+
+The escalation engine runs as a pg-boss recurring job every 60 seconds. It performs two main operations:
+
+<Steps>
+  <Step title="Trigger Detection">
+    Scans leads for new escalation trigger conditions and creates tracker records
+  </Step>
+  <Step title="Tier Execution">
+    Processes existing trackers that are due for their next escalation tier
+  </Step>
+</Steps>
+
+### TriggerDetector
+
+Identifies leads that meet escalation trigger conditions and creates new tracker records.
+
+#### Trigger Types
+
+<Tabs>
+  <Tab title="NO_FIRST_CONTACT">
+    Triggers when a lead has been assigned for a specified duration without any activity.
+
+    **Query Logic:**
+    ```sql
+    SELECT l.id FROM lead l
+    LEFT JOIN activity a ON a.lead_id = l.id
+    WHERE l.assigned_at IS NOT NULL
+      AND l.assigned_at < (NOW() - INTERVAL '{{thresholdMinutes}} minutes')
+      AND a.id IS NULL
+      AND l.stage != 'closed_won' AND l.stage != 'closed_lost'
+    ```
+  </Tab>
+  <Tab title="WENT_COLD">
+    Triggers when a lead's temperature changed to 'cold' a specified duration ago.
+
+    **Query Logic:**
+    ```sql
+    SELECT l.id FROM lead l
+    WHERE l.temperature = 'cold'
+      AND l.temperature_updated_at IS NOT NULL
+      AND l.temperature_updated_at < (NOW() - INTERVAL '{{thresholdMinutes}} minutes')
+      AND l.stage != 'closed_won' AND l.stage != 'closed_lost'
+    ```
+  </Tab>
+</Tabs>
+
+#### Business Hours Handling
+
+When `respect_business_hours = true`, the system adjusts threshold calculations:
+
+<Note>
+Business hours are defined per organization and used to calculate "business time" rather than calendar time for trigger evaluation.
+</Note>
+
+### TierExecutor
+
+Executes actions for escalation tiers that are due for processing.
+
+#### Execution Flow
+
+<Steps>
+  <Step title="Query Due Trackers">
+    Find all trackers where `next_escalation_at <= NOW()` and `status = 'ACTIVE'`
+  </Step>
+  <Step title="Process Each Tier">
+    Execute all actions in the current tier, logging results to `escalation_action_log`
+  </Step>
+  <Step title="Advance or Complete">
+    Either schedule the next tier or mark the tracker as resolved if all tiers complete
+  </Step>
+</Steps>
+
+#### Action Execution Details
+
+<AccordionGroup>
+  <Accordion title="NOTIFY_AGENT">
+    - Resolves notification target from lead's current stakeholder
+    - Creates notification via `NotificationService`
+    - Result: `SUCCESS` if stakeholder exists, `SKIPPED` if no assigned agent
+  </Accordion>
+  <Accordion title="NOTIFY_ADMIN">
+    - Queries users with `system.admin` permission in organization
+    - Creates notifications for all admin users
+    - Result: `SUCCESS` if admins exist, `SKIPPED` if none found
+  </Accordion>
+  <Accordion title="NOTIFY_TEAM_LEAD">
+    - Queries team members with `team.admin` permission in lead's assigned team
+    - Creates notifications for all team leaders
+    - Result: `SUCCESS` if team leaders exist, `SKIPPED` if no team or leaders
+  </Accordion>
+  <Accordion title="REDISTRIBUTE">
+    - Calls `DistributionEngineService.redistribute()`
+    - If outcome is `ASSIGNED`, resolves tracker with `REDISTRIBUTED`
+    - Must be the last tier (validated at rule creation)
+  </Accordion>
+  <Accordion title="CHANGE_TEMPERATURE">
+    - Updates `lead.temperature` directly
+    - Bypasses `LeadService.update()` validation guards
+    - Result: Always `SUCCESS`
+  </Accordion>
+  <Accordion title="ADD_TAG">
+    - Appends tag IDs to `lead.tagIds` array
+    - Deduplicates existing entries
+    - Result: Always `SUCCESS`
+  </Accordion>
+</AccordionGroup>
+
+### EscalationAutoResolver
+
+Listens to domain events and automatically resolves active escalation trackers when trigger conditions change.
+
+#### Resolution Events
+
+| Event | ResolvedBy | Condition |
+|-------|------------|-----------|
+| `lead.activity.created` | `AUTO_ACTIVITY` | New activity added |
+| `lead.stage.changed` | `AUTO_STAGE_CHANGE` | Stage moved to closed_won/closed_lost |
+| `lead.stakeholder.assigned` | `AUTO_REASSIGNMENT` | New stakeholder assigned |
+| `lead.archived` | `AUTO_ARCHIVED` | Lead archived |
+| `lead.deleted` | `AUTO_DELETED` | Lead deleted |
+| `lead.stakeholder.removed` | `AUTO_ORPHANED` | All stakeholders removed |
+
+<Tip>
+The auto-resolver prevents unnecessary escalation actions when the underlying conditions that triggered the escalation are no longer valid.
+</Tip>
+
+## API Endpoints
+
+### Escalation Rules API
+
+<CodeGroup>
+```typescript GET /api/escalation/rules
+// List escalation rules with filtering and pagination
+interface GetEscalationRulesQuery {
+  page?: number;
+  limit?: number;
+  isActive?: boolean;
+  triggerType?: TriggerType;
+  search?: string;
+}
+
+interface GetEscalationRulesResponse {
+  rules: EscalationRule[];
+  total: number;
+  page: number;
+  limit: number;
+}
+```
+
+```typescript POST /api/escalation/rules
+// Create new escalation rule
+interface CreateEscalationRuleRequest {
+  name: string;
+  triggerType: TriggerType;
+  triggerConfig: TriggerConfig;
+  conditions: EscalationCondition[];
+  respectBusinessHours: boolean;
+  tiers: CreateEscalationTierRequest[];
+  priority?: number;
+}
+
+interface CreateEscalationRuleResponse {
+  rule: EscalationRule;
+}
+```
+
+```typescript PUT /api/escalation/rules/:id
+// Update escalation rule (cancels active trackers if deactivated)
+interface UpdateEscalationRuleRequest {
+  name?: string;
+  triggerConfig?: TriggerConfig;
+  conditions?: EscalationCondition[];
+  respectBusinessHours?: boolean;
+  tiers?: UpdateEscalationTierRequest[];
+  priority?: number;
+  isActive?: boolean;
+}
+```
+
+```typescript DELETE /api/escalation/rules/:id
+// Soft delete escalation rule and cancel active trackers
+interface DeleteEscalationRuleResponse {
+  success: boolean;
+  cancelledTrackers: number;
+}
+```
+</CodeGroup>
+
+### Escalation Analytics API
+
+<CodeGroup>
+```typescript GET /api/escalation/analytics/summary
+// Get escalation metrics for organization
+interface EscalationAnalyticsSummaryQuery {
+  startDate?: string;
+  endDate?: string;
+  ruleId?: string;
+}
+
+interface EscalationAnalyticsSummaryResponse {
+  activeTrackers: number;
+  totalTriggered: number;
+  totalResolved: number;
+  averageResolutionTimeHours: number;
+  actionBreakdown: {
+    actionType: EscalationActionType;
+    count: number;
+    successRate: number;
+  }[];
+}
+```
+
+```typescript GET /api/escalation/analytics/trackers
+// List escalation trackers with filtering
+interface GetEscalationTrackersQuery {
+  page?: number;
+  limit?: number;
+  status?: EscalationStatus;
+  ruleId?: string;
+  leadId?: string;
+  startDate?: string;
+  endDate?: string;
+}
+```
+</CodeGroup>
+
+### Manual Operations API
+
+<CodeGroup>
+```typescript POST /api/escalation/trackers/:id/resolve
+// Manually resolve an active tracker
+interface ResolveEscalationTrackerRequest {
+  reason?: string;
+}
+
+interface ResolveEscalationTrackerResponse {
+  tracker: EscalationTracker;
+}
+```
+
+```typescript POST /api/escalation/rules/:id/cancel-trackers
+// Cancel all active trackers for a rule
+interface CancelRuleTrackersResponse {
+  cancelledTrackers: number;
+}
+```
+</CodeGroup>
+
+## Security & Permissions
+
+### Required Permissions
+
+| Operation | Permission | Notes |
+|-----------|------------|-------|
+| View escalation rules | `escalation.view` | List and read rule configurations |
+| Create/edit rules | `escalation.manage` | Create, update, delete rules |
+| View analytics | `escalation.analytics` | Access escalation metrics and reports |
+| Manual resolution | `escalation.resolve` | Manually resolve active trackers |
+
+### Row Level Security
+
+All escalation entities include `organization_id` and are protected by RLS policies:
+
+```sql
+-- escalation_rule RLS
+CREATE POLICY escalation_rule_tenant_isolation ON escalation_rule
+  USING (organization_id = current_setting('app.current_tenant_id')::uuid);
+
+-- escalation_tracker RLS  
+CREATE POLICY escalation_tracker_tenant_isolation ON escalation_tracker
+  USING (organization_id = current_setting('app.current_tenant_id')::uuid);
+
+-- escalation_action_log RLS
+CREATE POLICY escalation_action_log_tenant_isolation ON escalation_action_log
+  USING (organization_id = current_setting('app.current_tenant_id')::uuid);
+```
+
+<Warning>
+The scheduler runs with elevated permissions to access cross-tenant data, but all user-facing APIs are protected by RLS policies.
+</Warning>
+
+## Analytics & Metrics
+
+### Key Metrics Tracked
+
+<CardGroup cols={2}>
+  <Card title="Active Trackers" icon="bell">
+    Current number of leads in active escalation
+  </Card>
+  <Card title="Resolution Rate" icon="chart-line">
+    Percentage of escalations resolved vs cancelled
+  </Card>
+  <Card title="Action Success Rate" icon="check">
+    Success percentage by action type
+  </Card>
+  <Card title="Average Resolution Time" icon="stopwatch">
+    Mean time from trigger to resolution
+  </Card>
+</CardGroup>
+
+### Analytics Queries
+
+The system provides several optimized queries for common analytics patterns:
+
+<Tabs>
+  <Tab title="Escalation Volume">
+    ```sql
+    SELECT 
+      DATE_TRUNC('day', trigger_fired_at) as date,
+      COUNT(*) as triggers,
+      COUNT(*) FILTER (WHERE status = 'RESOLVED') as resolved
+    FROM escalation_tracker
+    WHERE organization_id = $1
+      AND trigger_fired_at >= $2
+    GROUP BY date
+    ORDER BY date;
+    ```
+  </Tab>
+  <Tab title="Action Effectiveness">
+    ```sql
+    SELECT 
+      action_type,
+      COUNT(*) as total,
+      COUNT(*) FILTER (WHERE result = 'SUCCESS') as successful,
+      ROUND(COUNT(*) FILTER (WHERE result = 'SUCCESS')::numeric / COUNT(*) * 100, 2) as success_rate
+    FROM escalation_action_log
+    WHERE organization_id = $1
+      AND executed_at >= $2
+    GROUP BY action_type;
+    ```
+  </Tab>
+  <Tab title="Rule Performance">
+    ```sql
+    SELECT 
+      er.name,
+      COUNT(et.*) as triggers,
+      AVG(EXTRACT(EPOCH FROM (et.resolved_at - et.trigger_fired_at))/3600) as avg_resolution_hours
+    FROM escalation_tracker et
+    JOIN escalation_rule er ON er.id = et.escalation_rule_id
+    WHERE et.organization_id = $1
+      AND et.status = 'RESOLVED'
+    GROUP BY er.id, er.name;
+    ```
+  </Tab>
+</Tabs>
+
+## Edge Case Handling
+
+### Concurrent Modifications
+
+<AccordionGroup>
+  <Accordion title="Rule Updates During Active Escalations">
+    When a rule is updated, existing active trackers continue with their original configuration. New trackers use the updated rule configuration.
+  </Accordion>
+  <Accordion title="Lead Reassignment During Escalation">
+    The auto-resolver detects reassignment events and resolves active trackers with `AUTO_REASSIGNMENT`. New escalations may trigger based on the new assignment.
+  </Accordion>
+  <Accordion title="Rule Deactivation">
+    Deactivating a rule cancels all active trackers for that rule with `CANCELLED` status.
+  </Accordion>
+</AccordionGroup>
+
+### Business Hours Edge Cases
+
+<Warning>
+**Timezone Changes**: If an organization changes timezone settings, existing escalation timers use the timezone that was active when the tracker was created.
+</Warning>
+
+- **Weekend Triggers**: Escalations triggered on weekends are delayed until the next business day
+- **Holiday Handling**: System holidays (if configured) extend business hour calculations
+- **Partial Business Days**: Escalations respect reduced business hours on partial days
+
+### Data Integrity Safeguards
+
+<Steps>
+  <Step title="Orphaned Tracker Prevention">
+    The auto-resolver monitors lead deletion events and resolves trackers with `AUTO_DELETED`
+  </Step>
+  <Step title="Duplicate Prevention">
+    Partial unique index ensures only one active tracker per lead-rule combination
+  </Step>
+  <Step title="Tier Validation">
+    API validates that `REDISTRIBUTE` actions only appear in final tiers
+  </Step>
+  <Step title="Circular Reference Prevention">
+    Rules cannot reference themselves in conditions or trigger infinite loops
+  </Step>
+</Steps>
+
+## Performance & Scaling
+
+### Scheduler Performance
+
+The escalation scheduler is optimized for high-volume environments:
+
+<Tabs>
+  <Tab title="Query Optimization">
+    - Dedicated indexes on `next_escalation_at` for fast due tracker queries
+    - Batch processing of up to 1000 trackers per run
+    - Minimal query complexity with pre-joined data
+  </Tab>
+  <Tab title="Concurrency">
+    - pg-boss ensures only one scheduler instance runs at a time
+    - Database-level conflict resolution prevents race conditions
+    - Separate queries for trigger detection vs tier execution
+  </Tab>
+  <Tab title="Memory Management">
+    - Streaming query results to avoid loading large result sets
+    - Entity manager clearing after each batch
+    - Minimal object retention between runs
+  </Tab>
+</Tabs>
+
+### Scaling Considerations
+
+<Info>
+**Database Partitioning**: For very high volumes, consider partitioning `escalation_action_log` by date to improve query performance on historical analytics.
+</Info>
+
+- **Tracker Cleanup**: Implement periodic cleanup of resolved trackers older than retention period
+- **Analytics Aggregation**: Pre-compute common metrics for faster dashboard loading
+- **Event Queue**: Consider moving auto-resolution to a dedicated event queue for high-frequency lead updates
+
+## Module Structure
+
+The escalation module follows the standard NestJS module organization:
+
+```
+src/modules/crm/escalation/
+├── controllers/
+│   ├── escalation-rule.controller.ts
+│   └── escalation-analytics.controller.ts
+├── services/
+│   ├── escalation-rule.service.ts
+│   ├── escalation-scheduler.service.ts
+│   ├── trigger-detector.service.ts
+│   ├── tier-executor.service.ts
+│   └── escalation-auto-resolver.service.ts
+├── entities/
+│   ├── escalation-rule.entity.ts
+│   ├── escalation-tier.entity.ts
+│   ├── escalation-tracker.entity.ts
+│   └── escalation-action-log.entity.ts
+├── dto/
+│   ├── create-escalation-rule.dto.ts
+│   ├── update-escalation-rule.dto.ts
+│   └── escalation-analytics.dto.ts
+├── types/
+│   └── escalation.types.ts
+└── escalation.module.ts
+```
+
+## Integration Points
+
+### External Dependencies
+
+<CardGroup cols={2}>
+  <Card title="Distribution Engine" icon="share-nodes">
+    Used for REDISTRIBUTE actions to reassign leads following standard distribution logic
+  </Card>
+  <Card title="Notification Service" icon="bell">
+    Handles delivery of escalation notifications to agents, admins, and team leads
+  </Card>
+  <Card title="Business Hours Service" icon="calendar">
+    Provides business hour calculations when `respect_business_hours = true`
+  </Card>
+  <Card title="User Permission Service" icon="shield">
+    Resolves admin and team lead permissions for notification targeting
+  </Card>
+</CardGroup>
+
+### Event Integration
+
+The escalation module both emits and listens to domain events:
+
+**Events Listened To:**
+- `lead.activity.created`
+- `lead.stage.changed` 
+- `lead.stakeholder.assigned`
+- `lead.stakeholder.removed`
+- `lead.archived`
+- `lead.deleted`
+
+**Events Emitted:**
+- `escalation.tracker.created`
+- `escalation.tracker.resolved`
+- `escalation.tier.executed`
+
+<Tip>
+These events enable integration with audit logging, webhook systems, and other modules that need to respond to escalation state changes.
+</Tip>
