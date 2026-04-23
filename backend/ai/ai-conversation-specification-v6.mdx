@@ -1,0 +1,467 @@
+---
+title: "AI Conversation Specification v6"
+description: "Complete specification for the AI conversation system with four interaction modes (OFF, AUTO_REPLY, SUGGEST_ONLY, DRAFT) and comprehensive integration with the messaging pipeline"
+---
+
+## Overview
+
+The AI Conversation System enables automated and AI-assisted responses within the unified messaging module. It integrates with the existing webhook processing pipeline, conversation model, and template system to provide four modes of AI interaction controlled per-conversation.
+
+<Note>
+This specification was last updated on 2026-03-04 and is currently in draft status.
+</Note>
+
+## AI Interaction Modes
+
+The system supports four distinct AI interaction modes, each serving different automation and assistance needs:
+
+| Mode | Behavior |
+|------|----------|
+| `OFF` | No AI involvement. Messages routed to human agents only. |
+| `AUTO_REPLY` | AI generates and sends responses automatically as `senderType = BOT`. |
+| `SUGGEST_ONLY` | AI generates a suggested response and emits it via WebSocket. Agent sees suggestion but must send manually. |
+| `DRAFT` | AI pre-fills the reply input box. Agent can edit before sending. |
+
+### Mode Cascade for New Conversations
+
+When a new conversation is created, the AI mode is determined by cascade priority:
+
+```
+ChannelAccount.defaultAiMode ?? Organization.settings.defaultAiMode ?? AiMode.OFF
+```
+
+<Tip>
+Agents can override the mode at any time via the conversation header toggle using the `PUT /messaging/conversations/:id/ai-mode` endpoint.
+</Tip>
+
+## AI Decision Pipeline
+
+### Integration Point
+
+AI processing occurs in **Phase B** of the webhook processor, after the message has been persisted (Phase A). This ensures:
+
+- Message persistence is never blocked by AI processing
+- AI failures are non-critical (logged, not thrown)
+- The inbound message is available for context composition
+
+### Pipeline Flow
+
+```
+Inbound Message Received
+  │
+  ├─ Phase A: Persist message + update conversation (transactional)
+  │
+  └─ Phase B: Side-effects (non-critical, isolated try-catch)
+      │
+      ├─ Block 1: WebSocket events (new-message, new-conversation)
+      ├─ Block 2: Notification events (NewMessageEvent)
+      ├─ Block 3: Automation rule evaluation
+      └─ Block 4: AI Response Pipeline ◄── NEW
+           │
+           ├─ Check conversation.aiMode
+           │   ├─ OFF → skip
+           │   ├─ AUTO_REPLY → generate + send
+           │   ├─ SUGGEST_ONLY → generate + emit WebSocket
+           │   └─ DRAFT → generate + emit WebSocket (draft payload)
+           │
+           ├─ Check escalation triggers (before generating)
+           │   └─ If escalation triggered → set aiMode = OFF, notify agent, skip
+           │
+           ├─ Compose prompt context
+           ├─ Call LLM provider
+           ├─ Process response by mode
+           └─ Increment conversation.aiMessageCount
+```
+
+### Performance Requirements
+
+<Warning>
+The AI pipeline must meet strict latency requirements to maintain responsive user experience.
+</Warning>
+
+**Target Latency Budget: < 5 seconds end-to-end**
+
+- Context composition: < 200ms
+- LLM API call: < 4s (with timeout)
+- Response processing + send: < 800ms
+
+**Timeout Handling:** If LLM call exceeds 8s, abort and log warning. Do not retry in the message pipeline — the opportunity has passed.
+
+### Future Queue-Based Architecture
+
+For high-volume deployments, AI processing can be moved to a dedicated pg-boss queue (`ai-response`) to decouple it from the webhook worker entirely. The current Phase B approach is simpler and sufficient for initial rollout.
+
+## LLM Integration Architecture
+
+### Provider Abstraction Layer
+
+The system uses a provider abstraction to support multiple LLM services:
+
+<CodeGroup>
+```typescript Provider Interface
+interface LlmProvider {
+  generateResponse(request: LlmRequest): Promise<LlmResponse>;
+  countTokens(text: string): number;
+}
+
+interface LlmRequest {
+  systemPrompt: string;
+  messages: LlmMessage[];
+  maxTokens: number;
+  temperature: number;
+}
+
+interface LlmMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface LlmResponse {
+  content: string;
+  tokensUsed: { prompt: number; completion: number };
+  model: string;
+  finishReason: string;
+}
+```
+
+```typescript Organization Settings
+interface OrganizationSettings {
+  defaultAiMode?: AiMode;
+  ai?: {
+    provider: 'openai' | 'gemini' | 'anthropic';
+    model: string;
+    apiKey: string; // encrypted at rest
+    maxTokensPerResponse: number; // default 500
+    temperature: number; // default 0.7
+  };
+}
+```
+</CodeGroup>
+
+### Supported Providers
+
+| Provider | SDK | Supported Models |
+|----------|-----|------------------|
+| OpenAI | `openai` npm package | GPT-4o, GPT-4o-mini |
+| Google Gemini | `@google/generative-ai` | Gemini 2.0 Flash, Pro |
+| Anthropic | `@anthropic-ai/sdk` | Claude Sonnet, Haiku |
+
+### Context Composition Strategy
+
+The AI context window is built from multiple sources, ordered by priority:
+
+<Steps>
+<Step title="System prompt">
+From the matched AI_PROMPT MessageTemplate (via `findAiPromptTemplate`) or a default org-level prompt
+</Step>
+
+<Step title="Knowledge context">
+Relevant chunks from the RAG pipeline via `EmbeddingService.findSimilar()` (if available)
+</Step>
+
+<Step title="CRM context">
+Person name, lead details (budget, timeline, intent), property interests
+</Step>
+
+<Step title="Conversation history">
+Last N messages (configurable, default 20), formatted as user/assistant turns
+</Step>
+</Steps>
+
+### Token Budget Management
+
+<Info>
+When context exceeds the available token budget, the system trims content based on priority.
+</Info>
+
+```
+Total Budget = Organization.settings.ai.maxTokensPerResponse (completion)
+                + calculated prompt tokens (context)
+
+Context Priority (when trimming needed):
+1. System prompt (never trimmed)
+2. Last 5 messages (never trimmed)
+3. CRM context (trimmed second)
+4. Knowledge context (trimmed first)
+5. Older messages (trimmed by removing oldest first)
+```
+
+**Limits:**
+- Token counting uses the provider's tokenizer (tiktoken for OpenAI, approximate for others)
+- Maximum context window: 8,000 tokens for prompt (conservative default)
+- If total context exceeds budget, trim knowledge chunks first, then older messages
+
+## AI Response Generation Service
+
+### Service Implementation
+
+**Module:** `src/modules/messaging/services/ai-response.service.ts`  
+**Registered in:** `MessagingModule.providers`
+
+### Core Method: `processInboundMessage`
+
+```typescript
+async processInboundMessage(
+  conversation: Conversation,
+  inboundMessage: Message,
+  em: EntityManager,
+): Promise<void>
+```
+
+### Processing Steps
+
+<Steps>
+<Step title="Mode validation">
+If `conversation.aiMode === AiMode.OFF`, return immediately.
+</Step>
+
+<Step title="Escalation check">
+Evaluate escalation triggers before generating. If triggered, abort.
+</Step>
+
+<Step title="Find AI prompt template">
+```typescript
+const template = await templateService.findAiPromptTemplate(
+  conversation.organization.id,
+  conversation.channelAccount.id,
+  conversation.tags,
+);
+const systemPrompt = template?.systemPrompt?.prompt ?? template?.body ?? DEFAULT_SYSTEM_PROMPT;
+```
+</Step>
+
+<Step title="Build context">
+- Load last N messages for conversation
+- Load PersonChannel → Person → Lead context (if linked)
+- Query knowledge base for relevant chunks (if EmbeddingService available)
+- Compose `LlmRequest` with token budget enforcement
+</Step>
+
+<Step title="Call LLM provider">
+```typescript
+const llmResponse = await llmProvider.generateResponse(request);
+```
+</Step>
+
+<Step title="Process by mode">
+Handle response based on the conversation's AI mode (see mode-specific processing below)
+</Step>
+
+<Step title="Update counters">
+```typescript
+conversation.aiMessageCount += 1;
+await em.flush();
+```
+</Step>
+</Steps>
+
+### Mode-Specific Processing
+
+<Tabs>
+<Tab title="AUTO_REPLY">
+- Create outbound Message with `senderType = SenderType.BOT`
+- Create MessageOutbox entry (transactional outbox pattern)
+- Update conversation stats (lastMessageAt, lastMessagePreview)
+- Emit WebSocket `new-message` event
+</Tab>
+
+<Tab title="SUGGEST_ONLY">
+Emit WebSocket event `ai-suggestion` to the conversation room:
+```typescript
+{
+  conversationId: string;
+  suggestion: string;
+  generatedAt: Date;
+}
+```
+Agent sees the suggestion in the UI and can accept/modify/dismiss
+</Tab>
+
+<Tab title="DRAFT">
+Emit WebSocket event `ai-draft` to the conversation room:
+```typescript
+{
+  conversationId: string;
+  draft: string;
+  generatedAt: Date;
+}
+```
+Frontend pre-fills the reply input with the draft text
+</Tab>
+</Tabs>
+
+### Error Handling
+
+<Warning>
+All AI processing errors are handled gracefully to ensure agent workflow is never blocked.
+</Warning>
+
+- **LLM API errors:** Log with full context, do not throw. Agent is not blocked.
+- **Token limit exceeded:** Trim context and retry once with reduced context.
+- **Provider unavailable:** Log error, emit WebSocket event `ai-error` to notify the agent.
+- **Rate limiting:** Respect provider rate limits. If rate-limited, skip and log.
+
+### Default System Prompt
+
+```
+You are a helpful real estate assistant for {organizationName}.
+Answer questions about properties, pricing, availability, and services.
+Be professional, concise, and helpful. If you cannot answer a question,
+politely suggest the customer speak with a human agent.
+Do not make up information about specific properties or pricing.
+```
+
+## Human Escalation Logic
+
+### Escalation Configuration
+
+Escalation triggers are configurable per organization via `Organization.settings.ai.escalation`:
+
+```typescript
+interface EscalationConfig {
+  maxAiMessages: number; // default 5 — escalate after N AI exchanges
+  keywords: string[]; // e.g., ["speak to agent", "human", "manager"]
+  sentimentThreshold?: number; // 0.0-1.0, escalate below threshold (future)
+  confidenceThreshold?: number; // 0.0-1.0, escalate below threshold (future)
+}
+```
+
+### Trigger Evaluation Process
+
+<Steps>
+<Step title="Keyword detection">
+Check inbound message text against `escalation.keywords` (case-insensitive substring match). Fastest check, done first.
+</Step>
+
+<Step title="Message count check">
+If `conversation.aiMessageCount >= escalation.maxAiMessages`, escalate. Prevents infinite AI loops.
+</Step>
+
+<Step title="Sentiment analysis (future)">
+If implemented, check sentiment score of inbound message. Below threshold triggers escalation.
+</Step>
+
+<Step title="Confidence score (future)">
+If LLM response includes a confidence indicator below threshold, escalate after sending the response.
+</Step>
+</Steps>
+
+### Escalation Actions
+
+When any trigger fires, the system performs the following actions:
+
+```typescript
+// 1. Update conversation
+conversation.aiMode = AiMode.OFF;
+conversation.aiEscalatedAt = new Date();
+
+// 2. Notify assigned agent (or team)
+eventEmitter.emit('ai.escalated', {
+  conversationId: conversation.id,
+  organizationId: conversation.organization.id,
+  reason: triggerType, // 'keyword' | 'max_messages' | 'sentiment' | 'confidence'
+  triggerDetail: string, // the keyword matched, count reached, etc.
+});
+
+// 3. Emit WebSocket event
+gateway.emitToConversation(conversation.id, 'ai-escalated', {
+  conversationId: conversation.id,
+  reason: triggerType,
+  escalatedAt: conversation.aiEscalatedAt,
+});
+
+// 4. (Optional) Send a handoff message to the customer
+// "I'm connecting you with a human agent who can help further."
+```
+
+### Re-enabling AI After Escalation
+
+<Check>
+After escalation, an agent can manually re-enable AI via the conversation toggle (`PUT /messaging/conversations/:id/ai-mode`). This resets `aiEscalatedAt` to null and `aiMessageCount` to 0.
+</Check>
+
+## AI Analytics and Metrics
+
+### Key Performance Indicators
+
+The system tracks comprehensive metrics to measure AI effectiveness:
+
+| Metric | Source | Aggregation |
+|--------|--------|-------------|
+| AI conversations count | `conversation.aiMessageCount > 0` | Per org, per period |
+| Human-only conversations | `conversation.aiMessageCount = 0 AND aiMode = OFF` | Per org, per period |
+| Escalation count | `conversation.aiEscalatedAt IS NOT NULL` | Per org, per period |
+| Escalation rate | Escalated / Total AI conversations | Percentage |
+| Average AI messages per conversation | `AVG(aiMessageCount)` where `aiMessageCount > 0` | Per org, per period |
+| Token usage | Sum of `tokensUsed` from LLM responses | Per org, per period |
+| Response time | Time from inbound message to AI response | Per org, per period |
+
+### Analytics Implementation
+
+<AccordionGroup>
+<Accordion title="Database Views">
+Create materialized views for efficient analytics queries:
+
+```sql
+CREATE MATERIALIZED VIEW ai_conversation_metrics AS
+SELECT 
+  organization_id,
+  DATE(created_at) as date,
+  COUNT(*) FILTER (WHERE ai_message_count > 0) as ai_conversations,
+  COUNT(*) FILTER (WHERE ai_message_count = 0 AND ai_mode = 'OFF') as human_only_conversations,
+  COUNT(*) FILTER (WHERE ai_escalated_at IS NOT NULL) as escalated_conversations,
+  AVG(ai_message_count) FILTER (WHERE ai_message_count > 0) as avg_ai_messages
+FROM conversations
+GROUP BY organization_id, DATE(created_at);
+```
+</Accordion>
+
+<Accordion title="Real-time Metrics">
+Use Redis for real-time metric tracking:
+
+```typescript
+// Increment counters on AI events
+await redis.hincrby(`ai:metrics:${orgId}:${date}`, 'ai_responses', 1);
+await redis.hincrby(`ai:metrics:${orgId}:${date}`, 'escalations', 1);
+await redis.hincrby(`ai:metrics:${orgId}:${date}`, 'tokens_used', tokensUsed);
+```
+</Accordion>
+
+<Accordion title="Dashboard Integration">
+Expose metrics via REST API for dashboard consumption:
+
+```typescript
+GET /api/analytics/ai-metrics?orgId={id}&period={week|month|quarter}
+```
+
+Returns aggregated metrics with trend analysis and comparison to previous periods.
+</Accordion>
+</AccordionGroup>
+
+### Success Metrics
+
+<CardGroup cols={2}>
+<Card title="Response Quality" icon="star">
+- Escalation rate < 15%
+- Average conversation length < 8 messages
+- Customer satisfaction scores
+</Card>
+
+<Card title="Operational Efficiency" icon="clock">
+- Response time < 5 seconds
+- 95% uptime for AI pipeline
+- Token cost per conversation
+</Card>
+
+<Card title="Adoption Metrics" icon="chart-line">
+- % of conversations using AI
+- Agent time savings
+- Volume of AI vs human responses
+</Card>
+
+<Card title="Business Impact" icon="dollar-sign">
+- Lead conversion rates
+- Customer retention
+- Cost per conversation
+</Card>
+</CardGroup>
