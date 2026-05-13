@@ -1,0 +1,1200 @@
+---
+title: "Subscription Module Specification v14"
+description: "Complete specification for the subscription and billing module including plan tiers, feature gating, seat management, credit system, and Stripe integration"
+---
+
+## Overview
+
+The Subscription Module implements a **freemium SaaS billing system** for PropWise CRM. Every organization has a subscription tied to one of four plan tiers. The module handles:
+
+- **Plan-based feature gating** — binary feature flags per tier
+- **Resource limits** — caps on leads, contacts, deals, companies, and storage
+- **Credit-based metering** — monthly AI and messaging allowances with purchasable top-ups
+- **Dual seat types** — manager seats and agent seats with per-tier pricing; every user consumes a seat
+- **Stripe integration** — checkout, subscription management, mid-cycle plan changes, webhooks, billing portal
+- **Proration** — mid-cycle upgrades, downgrades, and seat changes are prorated to the day
+- **Suspension flow** — 2-day grace period on payment failure, then org goes read-only
+
+### Design Principles
+
+<AccordionGroup>
+<Accordion title="Core Design Decisions">
+| Principle | Decision |
+|---|---|
+| Freemium model | Free plan with limited features; paid tiers unlock progressively |
+| Per-org billing | Billing is per organization; developer portal is free |
+| Dual seat types | Manager seats (Owner, Admin) and agent seats (Basic, custom roles); every user consumes a seat |
+| Seat type derived from role | No explicit seat assignment — seat type is automatically determined by the user's RBAC role |
+| Feature flags over tier checks | Gating uses `@RequiresFeature('flag')` on plan JSONB — changing what a tier includes requires only a seeder update, not code changes |
+| Service-layer limit enforcement | Resource limits and credit consumption are checked in service methods, not guards, because they need entity counts |
+| Stripe as source of truth for payments | Webhook-driven lifecycle: the app reacts to Stripe events rather than polling |
+| Prorated plan changes | All mid-cycle changes (upgrade, downgrade, add/remove seats) use `proration_behavior: 'create_prorations'` — charges are fair to the day |
+| Checkout vs. change-plan separation | `POST /checkout` is for first-time subscription (Free → Paid); `POST /change-plan` is for switching between paid tiers |
+| Idempotent webhooks | Every Stripe event is logged in `BillingEvent` with a unique `stripeEventId` to prevent duplicate processing |
+| Graceful degradation | If `app.stripe.secretKey` (`STRIPE_SECRET_KEY`) is not set, billing features are unavailable but the app still starts |
+</Accordion>
+</AccordionGroup>
+
+## Architecture
+
+### High-level diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        API Layer (Controllers)                       │
+│  SubscriptionController            │  StripeWebhookController        │
+│  (authenticated, /v1/subscriptions)│  (public, /webhooks/stripe)     │
+└──────────────┬─────────────────────┴────────────┬───────────────────┘
+               │                                  │
+┌──────────────▼──────────────────────────────────▼───────────────────┐
+│  Service Layer                                                       │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
+│  │ SubscriptionSvc  │  │  CreditService   │  │  StripeService    │  │
+│  │ • lifecycle      │  │  • consume FIFO  │  │  • SDK wrapper    │  │
+│  │ • plan changes   │  │  • balance query │  │  • checkout       │  │
+│  │ • seat mgmt      │  │  • record packs  │  │  • subscriptions  │  │
+│  │ • resource limits│  │                  │  │  • price swaps    │  │
+│  │ • feature checks │  │                  │  │  • webhooks       │  │
+│  └──────────────────┘  └──────────────────┘  └───────────────────┘  │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────────────────────────┐
+│  Data Layer (MikroORM / PostgreSQL)                                  │
+│  SubscriptionPlan │ Subscription │ SubscriptionUsage                 │
+│  CreditPurchase   │ BillingEvent │ Organization.stripeCustomerId     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data flows
+
+<Tabs>
+<Tab title="First-time Checkout">
+```
+Frontend "Upgrade" button
+  → POST /v1/subscriptions/checkout
+    → Rejects if org already has a Stripe subscription (use change-plan instead)
+    → SubscriptionService.createCheckoutSession()
+      → StripeService.createCheckoutSession()
+        → Returns Stripe Checkout URL
+          → User pays on Stripe's hosted page
+            → Stripe fires checkout.session.completed webhook
+              → StripeWebhookController receives + verifies signature
+                → SubscriptionService.activateSubscription()
+                  → Subscription entity updated to ACTIVE
+```
+</Tab>
+<Tab title="Plan Change">
+```
+Frontend "Change Plan" button
+  → POST /v1/subscriptions/change-plan
+    → SubscriptionService.changePlan()
+      → Validates seat overflow (blocks if current users exceed new plan capacity)
+      → StripeService.swapSubscriptionPrice() — prorated
+      → Reconciles seat line items (old tier price → new tier price)
+      → Updates local Subscription entity
+      → Returns updated subscription immediately
+```
+</Tab>
+<Tab title="Payment Failure">
+```
+Stripe charges renewal invoice
+  ├─ invoice.paid → handleInvoicePaid() → status stays ACTIVE, period updated
+  └─ invoice.payment_failed → handleInvoicePaymentFailed() → status → PAST_DUE
+       └─ Stripe retries for 2 days
+            ├─ Payment succeeds → invoice.paid → back to ACTIVE
+            └─ All retries fail → customer.subscription.updated (status: unpaid)
+                 → handleSubscriptionUpdated() → status → SUSPENDED
+                      → Org is read-only (SubscriptionActiveGuard blocks writes)
+```
+</Tab>
+</Tabs>
+
+## Plan Tiers & Pricing
+
+Four tiers, priced in USD cents:
+
+<CardGroup cols={2}>
+<Card title="Free Plan" icon="gift">
+- Monthly price: $0
+- Manager seats: 1 included
+- Agent seats: 0 included
+- Basic features only
+</Card>
+<Card title="Starter Plan" icon="rocket">
+- Monthly: $49 / Annual: $470.40 (~20% off)
+- Manager seats: 2 included
+- Agent seats: 3 included
+- Essential business features
+</Card>
+<Card title="Professional Plan" icon="briefcase">
+- Monthly: $149 / Annual: $1,430.40
+- Manager seats: 5 included
+- Agent seats: 15 included
+- Advanced features + API access
+</Card>
+<Card title="Business Plan" icon="building">
+- Monthly: $399 / Annual: $3,830.40
+- Manager seats: 10 included
+- Agent seats: 40 included
+- Enterprise features + white-label
+</Card>
+</CardGroup>
+
+### Resource limits
+
+| Resource | Free | Starter | Professional | Business |
+|---|---|---|---|---|
+| Leads | 50 | 1,000 | 10,000 | Unlimited |
+| Contacts | 50 | 1,000 | 10,000 | Unlimited |
+| Deals | 20 | 500 | 5,000 | Unlimited |
+| Companies | 10 | 200 | 2,000 | Unlimited |
+| Storage | 500 MB | 5 GB | 25 GB | 100 GB |
+
+### Monthly credits
+
+| Credit type | Free | Starter | Professional | Business |
+|---|---|---|---|---|
+| AI credits | 20 | 200 | 1,000 | 5,000 |
+| Messaging credits | 0 | 100 | 500 | 2,000 |
+
+### Extra seat pricing
+
+| Seat type | Starter | Professional | Business |
+|---|---|---|---|
+| Extra manager seat | $25/mo | $20/mo | $18/mo |
+| Extra agent seat | $12/mo | $10/mo | $8/mo |
+
+## Feature Gating Model
+
+Features are gated using three distinct mechanisms:
+
+### Type 1: Binary feature flags
+
+Boolean flags stored in `SubscriptionPlan.features` (JSONB). Checked via `@RequiresFeature('flagName')` guard decorator or `SubscriptionService.checkFeature()`.
+
+<AccordionGroup>
+<Accordion title="Feature Flag Matrix">
+| Feature flag | Free | Starter | Pro | Business |
+|---|---|---|---|---|
+| `customPipelineStages` | — | ✓ | ✓ | ✓ |
+| `distributionEngine` | — | — | ✓ | ✓ |
+| `escalationEngine` | — | — | ✓ | ✓ |
+| `advancedAnalytics` | — | — | ✓ | ✓ |
+| `apiAccess` | — | — | ✓ | ✓ |
+| `commissionTracking` | — | — | ✓ | ✓ |
+| `teamsAndHierarchy` | — | — | ✓ | ✓ |
+| `customRoles` | — | — | — | ✓ |
+| `whiteLabel` | — | — | — | ✓ |
+| `maxMessagingChannels` | 0 | 1 | 3 | Unlimited (-1) |
+| `maxEmailIntegrations` | 0 | 1 | 3 | Unlimited (-1) |
+| `auditLogRetentionDays` | 0 | 0 | 30 | Unlimited (-1) |
+</Accordion>
+</AccordionGroup>
+
+### Type 2: Credit-based (monthly allowance)
+
+Features that are available on the tier but have a monthly budget that resets each billing cycle. Tracked in `SubscriptionUsage`. When exhausted, the org can purchase one-time top-up packs (`CreditPurchase`).
+
+<Note>
+Consumption order: **monthly plan allowance first → purchased packs FIFO (oldest first)**
+</Note>
+
+### Type 3: Add-on packs
+
+| Add-on | Behavior | Stripe model |
+|---|---|---|
+| Storage pack (+10 GB) | Recurring, stacks | Subscription line item (per-unit) |
+| AI credit pack (+500) | One-time, consumed then gone | Payment intent |
+| Messaging credit pack (+500) | One-time, consumed then gone | Payment intent |
+
+## Seat Management
+
+### Seat types
+
+Every user in an organization consumes exactly one seat. The seat type is **derived from the user's RBAC role** — there is no separate seat assignment.
+
+| Seat type | Roles that consume it | Price varies by tier |
+|---|---|---|
+| **Manager** | Owner, Admin | Yes |
+| **Agent** | Basic, custom org roles | Yes |
+
+<Info>
+The mapping is defined in `subscription.service.ts`:
+
+```typescript
+const ROLE_SEAT_MAP: Record<string, SeatType> = {
+  Owner: SeatType.MANAGER,
+  Admin: SeatType.MANAGER,
+};
+// Any other role → SeatType.AGENT
+```
+</Info>
+
+### Seat counting
+
+Seats are **derived from RBAC roles**, not tracked via a separate assignment table. The count is computed on-demand from active `UserOrgRole` records:
+
+```
+managerSeatsUsed = count of active users with Owner or Admin org role
+agentSeatsUsed   = count of active users with any other org role
+```
+
+<Warning>
+A seat is **not occupied** by a pending invitation — it only counts when the user has accepted and has an active `UserOrgRole`.
+</Warning>
+
+| Step | Seat occupied? |
+|---|---|
+| Admin sends invitation with role "Admin" | No — seat availability is checked but not reserved |
+| User accepts → `UserOrgRole` created | Yes — now counted |
+| User removed (role soft-deleted) | No — freed |
+| User's role changed (Basic → Admin) | Swaps: frees one agent seat, occupies one manager seat |
+
+### Enforcement points
+
+Seat availability is checked at two integration points:
+
+1. **`invitation.service.ts`** — before creating an invitation, the role determines the seat type and availability is checked
+2. **`role-assignment-validation.service.ts`** — when changing a user's role (e.g. promoting Basic → Admin), checks that the target seat type has room; the old seat type is freed simultaneously
+
+### Proration on seat changes
+
+Adding or removing seats mid-cycle uses `proration_behavior: 'create_prorations'`:
+
+- **Adding a seat on April 15** (30-day month): prorated charge for 15 remaining days, billed on the next invoice
+- **Removing a seat on April 15**: prorated credit for 15 remaining days, applied to the next invoice
+- **Adding on April 4, removing on April 6**: net charge for 2 days only (charge for 26 days minus credit for 24 days)
+
+### Stripe billing
+
+Extra seats are billed as subscription line items with `per_unit` pricing. A subscription for a Professional org with 7 managers and 20 agents would have:
+
+| Line Item | Qty | Price |
+|---|---|---|
+| PropWise Professional | 1 | $149/mo |
+| Extra Manager Seat (Pro) | 2 | $40/mo |
+| Extra Agent Seat (Pro) | 5 | $50/mo |
+
+## Credit System
+
+### Consumption flow
+
+<Steps>
+<Step title="Initiate consumption">
+`SubscriptionService.consumeCredits(orgId, 'ai', 1)` is called
+</Step>
+<Step title="Credit service processing">
+`CreditService.consumeCredits(subscription, AI, 1)` executes:
+1. Check monthly allowance: `usage.aiCreditsUsed < plan.aiCredits`
+2. If available: increment `usage.aiCreditsUsed`, return success
+3. If exhausted: find oldest unconsumed `CreditPurchase` for this org + credit type
+4. Consume from pack: increment `purchase.creditsUsed`, return success
+5. If no packs available: throw `InsufficientCreditsException`
+</Step>
+<Step title="Transaction handling">
+All operations are wrapped in database transactions for consistency
+</Step>
+</Steps>
+
+### Credit types
+
+```typescript
+enum CreditType {
+  AI = 'ai',
+  MESSAGING = 'messaging'
+}
+```
+
+### Monthly allowance reset
+
+Monthly allowances reset on the **billing cycle date** (not calendar month). For example:
+- Subscription started on March 15
+- Credits reset on April 15, May 15, etc.
+- Reset is triggered by `invoice.paid` webhook from Stripe
+
+<Note>
+The reset happens by setting `usage.aiCreditsUsed = 0` and `usage.messagingCreditsUsed = 0` in the `SubscriptionUsage` record.
+</Note>
+
+## Entity Specifications
+
+### SubscriptionPlan
+
+```typescript
+@Entity()
+export class SubscriptionPlan {
+  @PrimaryKey()
+  id: string = randomUUID();
+
+  @Property()
+  name: string; // 'Free', 'Starter', 'Professional', 'Business'
+
+  @Property()
+  monthlyPrice: number; // USD cents
+
+  @Property()
+  yearlyPrice: number; // USD cents
+
+  @Property({ type: 'jsonb' })
+  features: Record<string, any>; // Feature flags + limits
+
+  @Property()
+  managerSeatsIncluded: number;
+
+  @Property()
+  agentSeatsIncluded: number;
+
+  @Property()
+  managerSeatPrice: number; // USD cents/month
+
+  @Property()
+  agentSeatPrice: number; // USD cents/month
+
+  @Property()
+  aiCredits: number; // Monthly allowance
+
+  @Property()
+  messagingCredits: number; // Monthly allowance
+
+  // Resource limits
+  @Property()
+  maxLeads: number; // -1 = unlimited
+
+  @Property()
+  maxContacts: number; // -1 = unlimited
+
+  @Property()
+  maxDeals: number; // -1 = unlimited
+
+  @Property()
+  maxCompanies: number; // -1 = unlimited
+
+  @Property()
+  maxStorageBytes: number; // -1 = unlimited
+
+  @Property()
+  stripeMonthlyPriceId: string;
+
+  @Property()
+  stripeYearlyPriceId: string;
+
+  @Property()
+  stripeManagerSeatPriceId: string;
+
+  @Property()
+  stripeAgentSeatPriceId: string;
+}
+```
+
+### Subscription
+
+```typescript
+@Entity()
+export class Subscription {
+  @PrimaryKey()
+  id: string = randomUUID();
+
+  @ManyToOne(() => Organization)
+  organization!: Organization;
+
+  @ManyToOne(() => SubscriptionPlan)
+  plan!: SubscriptionPlan;
+
+  @Enum(() => SubscriptionStatus)
+  status: SubscriptionStatus = SubscriptionStatus.ACTIVE;
+
+  @Enum(() => BillingInterval)
+  billingInterval: BillingInterval = BillingInterval.MONTHLY;
+
+  @Property()
+  currentPeriodStart: Date = new Date();
+
+  @Property()
+  currentPeriodEnd: Date = new Date();
+
+  @Property({ nullable: true })
+  stripeSubscriptionId?: string;
+
+  @Property()
+  managerSeatsUsed: number = 0; // Computed from UserOrgRole
+
+  @Property()
+  agentSeatsUsed: number = 0; // Computed from UserOrgRole
+
+  @Property()
+  createdAt: Date = new Date();
+
+  @Property({ onUpdate: () => new Date() })
+  updatedAt: Date = new Date();
+
+  @OneToOne(() => SubscriptionUsage, usage => usage.subscription, { nullable: true })
+  usage?: SubscriptionUsage;
+}
+```
+
+### SubscriptionUsage
+
+```typescript
+@Entity()
+export class SubscriptionUsage {
+  @PrimaryKey()
+  id: string = randomUUID();
+
+  @OneToOne(() => Subscription, subscription => subscription.usage)
+  subscription!: Subscription;
+
+  @Property()
+  aiCreditsUsed: number = 0;
+
+  @Property()
+  messagingCreditsUsed: number = 0;
+
+  @Property()
+  leadsUsed: number = 0;
+
+  @Property()
+  contactsUsed: number = 0;
+
+  @Property()
+  dealsUsed: number = 0;
+
+  @Property()
+  companiesUsed: number = 0;
+
+  @Property()
+  storageUsed: number = 0; // bytes
+
+  @Property()
+  createdAt: Date = new Date();
+
+  @Property({ onUpdate: () => new Date() })
+  updatedAt: Date = new Date();
+}
+```
+
+### CreditPurchase
+
+```typescript
+@Entity()
+export class CreditPurchase {
+  @PrimaryKey()
+  id: string = randomUUID();
+
+  @ManyToOne(() => Organization)
+  organization!: Organization;
+
+  @Enum(() => CreditType)
+  creditType: CreditType;
+
+  @Property()
+  creditsTotal: number; // Total purchased
+
+  @Property()
+  creditsUsed: number = 0; // Used so far
+
+  @Property()
+  priceUsd: number; // USD cents
+
+  @Property({ nullable: true })
+  stripePaymentIntentId?: string;
+
+  @Property()
+  purchaseDate: Date = new Date();
+
+  get creditsRemaining(): number {
+    return this.creditsTotal - this.creditsUsed;
+  }
+}
+```
+
+### BillingEvent
+
+```typescript
+@Entity()
+export class BillingEvent {
+  @PrimaryKey()
+  id: string = randomUUID();
+
+  @Property({ unique: true })
+  stripeEventId: string; // Ensures idempotency
+
+  @Property()
+  eventType: string; // e.g., 'checkout.session.completed'
+
+  @Property({ type: 'jsonb' })
+  eventData: any; // Full Stripe event payload
+
+  @Property()
+  processed: boolean = false;
+
+  @Property()
+  createdAt: Date = new Date();
+}
+```
+
+## Stripe Integration
+
+### Configuration
+
+<CodeGroup>
+```typescript environment.ts
+export const app = {
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY, // sk_test_... or sk_live_...
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET, // whsec_...
+    priceIds: {
+      starter: {
+        monthly: process.env.STRIPE_STARTER_MONTHLY_PRICE_ID,
+        yearly: process.env.STRIPE_STARTER_YEARLY_PRICE_ID,
+        managerSeat: process.env.STRIPE_STARTER_MANAGER_SEAT_PRICE_ID,
+        agentSeat: process.env.STRIPE_STARTER_AGENT_SEAT_PRICE_ID,
+      },
+      // ... similar for professional, business
+    }
+  }
+};
+```
+
+```bash .env
+STRIPE_SECRET_KEY=sk_test_51234567890abcdef...
+STRIPE_PUBLISHABLE_KEY=pk_test_51234567890abcdef...
+STRIPE_WEBHOOK_SECRET=whsec_1234567890abcdef...
+STRIPE_STARTER_MONTHLY_PRICE_ID=price_1234567890abcdef
+STRIPE_STARTER_YEARLY_PRICE_ID=price_0987654321fedcba
+STRIPE_STARTER_MANAGER_SEAT_PRICE_ID=price_1111111111111111
+STRIPE_STARTER_AGENT_SEAT_PRICE_ID=price_2222222222222222
+```
+</CodeGroup>
+
+### Service integration
+
+The `StripeService` wraps the Stripe SDK and handles all Stripe operations:
+
+```typescript
+@Injectable()
+export class StripeService {
+  private stripe: Stripe;
+
+  constructor() {
+    if (!app.stripe.secretKey) {
+      throw new Error('STRIPE_SECRET_KEY is required');
+    }
+    this.stripe = new Stripe(app.stripe.secretKey, {
+      apiVersion: '2023-10-16',
+    });
+  }
+
+  async createCheckoutSession(params: CreateCheckoutSessionParams) {
+    return this.stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: params.lineItems,
+      success_url: params.successUrl,
+      cancel_url: params.cancelUrl,
+      client_reference_id: params.organizationId,
+    });
+  }
+
+  async swapSubscriptionPrice(subscriptionId: string, newPriceId: string) {
+    const subscription = await this.stripe.subscriptions.retrieve(subscriptionId);
+    
+    return this.stripe.subscriptions.update(subscriptionId, {
+      items: [{
+        id: subscription.items.data[0].id,
+        price: newPriceId,
+      }],
+      proration_behavior: 'create_prorations',
+    });
+  }
+}
+```
+
+### Webhook handling
+
+<Warning>
+All webhooks must verify the signature to prevent tampering and ensure they come from Stripe.
+</Warning>
+
+```typescript
+@Controller('webhooks')
+export class StripeWebhookController {
+  @Post('stripe')
+  async handleWebhook(
+    @Body() rawBody: Buffer,
+    @Headers('stripe-signature') signature: string,
+  ) {
+    const event = this.stripeService.constructEvent(rawBody, signature);
+    
+    // Idempotency check
+    const existingEvent = await this.billingEventRepo.findOne({
+      stripeEventId: event.id,
+    });
+    
+    if (existingEvent?.processed) {
+      return { received: true }; // Already processed
+    }
+
+    await this.billingEventRepo.create({
+      stripeEventId: event.id,
+      eventType: event.type,
+      eventData: event.data,
+    });
+
+    switch (event.type) {
+      case 'checkout.session.completed':
+        await this.subscriptionService.activateSubscription(event);
+        break;
+      case 'invoice.paid':
+        await this.subscriptionService.handleInvoicePaid(event);
+        break;
+      case 'invoice.payment_failed':
+        await this.subscriptionService.handleInvoicePaymentFailed(event);
+        break;
+      case 'customer.subscription.updated':
+        await this.subscriptionService.handleSubscriptionUpdated(event);
+        break;
+    }
+
+    // Mark as processed
+    await this.billingEventRepo.nativeUpdate(
+      { stripeEventId: event.id },
+      { processed: true }
+    );
+
+    return { received: true };
+  }
+}
+```
+
+## Subscription Lifecycle
+
+### Status transitions
+
+```typescript
+enum SubscriptionStatus {
+  ACTIVE = 'active',           // Paid and current
+  PAST_DUE = 'past_due',      // Payment failed, in grace period
+  SUSPENDED = 'suspended',     // Grace period expired, read-only
+  CANCELLED = 'cancelled',     // User cancelled (not implemented yet)
+}
+```
+
+<Steps>
+<Step title="New organization">
+- Automatically gets Free plan subscription with `ACTIVE` status
+- No Stripe integration needed
+</Step>
+<Step title="First upgrade (Free → Paid)">
+- User clicks "Upgrade" → `/checkout` endpoint
+- Stripe Checkout session created
+- User pays → `checkout.session.completed` webhook
+- Subscription updated to paid plan with `ACTIVE` status
+</Step>
+<Step title="Successful renewals">
+- Stripe charges automatically
+- `invoice.paid` webhook → subscription stays `ACTIVE`
+- Period dates updated, credit allowances reset
+</Step>
+<Step title="Payment failures">
+- `invoice.payment_failed` webhook → status becomes `PAST_DUE`
+- Stripe automatically retries for 2 days
+- If payment succeeds → `invoice.paid` → back to `ACTIVE`
+- If all retries fail → `customer.subscription.updated` (status: unpaid) → `SUSPENDED`
+</Step>
+<Step title="Suspended organizations">
+- Read-only access: can view data but not create/edit
+- Guards block write operations
+- User must update payment method to reactivate
+</Step>
+</Steps>
+
+### Grace period behavior
+
+<Info>
+During the `PAST_DUE` status (2-day grace period), the organization retains full functionality. Only when moving to `SUSPENDED` does read-only mode activate.
+</Info>
+
+## Plan Changes (Upgrade / Downgrade)
+
+### Change-plan endpoint
+
+```http
+POST /v1/subscriptions/change-plan
+Content-Type: application/json
+
+{
+  "planId": "professional-plan-id",
+  "billingInterval": "yearly"
+}
+```
+
+### Validation rules
+
+<Steps>
+<Step title="Plan validation">
+- Target plan must exist and be different from current plan
+- Organization must have an active Stripe subscription (cannot change-plan from Free)
+</Step>
+<Step title="Seat overflow check">
+- Count current users by seat type
+- Check if new plan can accommodate current users
+- Block if `managerSeatsUsed > newPlan.managerSeatsIncluded + extraManagerSeats`
+</Step>
+<Step title="Stripe subscription update">
+- Swap main subscription price (prorated)
+- Reconcile seat line items to match new tier pricing
+- Update billing interval if changed
+</Step>
+<Step title="Local state update">
+- Update `Subscription.plan` and `billingInterval`
+- Reset credit usage if moving to higher tier with more allowances
+</Step>
+</Steps>
+
+### Proration examples
+
+**Scenario 1: Upgrade Starter → Professional on day 15 of 30-day cycle**
+- Starter: $49/month = $1.63/day
+- Professional: $149/month = $4.97/day
+- Days remaining: 15
+- Prorated credit for unused Starter: 15 × $1.63 = $24.45
+- Prorated charge for Professional: 15 × $4.97 = $74.55
+- Net charge: $74.55 - $24.45 = $50.10
+
+**Scenario 2: Add 2 agent seats mid-cycle**
+- Professional agent seat: $10/month = $0.33/day
+- Days remaining: 20
+- Prorated charge: 2 seats × 20 days × $0.33 = $13.20
+
+<Note>
+All proration calculations are handled by Stripe. The app just sets `proration_behavior: 'create_prorations'` and Stripe handles the math.
+</Note>
+
+## API Endpoints
+
+### Subscription controller
+
+<CodeGroup>
+```http Get Current Subscription
+GET /v1/subscriptions/current
+
+Response:
+{
+  "id": "subscription-id",
+  "organization": { "id": "org-id", "name": "Acme Corp" },
+  "plan": {
+    "id": "plan-id",
+    "name": "Professional",
+    "monthlyPrice": 14900,
+    "features": { "advancedAnalytics": true, ... }
+  },
+  "status": "active",
+  "billingInterval": "monthly",
+  "currentPeriodStart": "2024-01-01T00:00:00Z",
+  "currentPeriodEnd": "2024-02-01T00:00:00Z",
+  "managerSeatsUsed": 3,
+  "agentSeatsUsed": 12,
+  "usage": {
+    "aiCreditsUsed": 45,
+    "messagingCreditsUsed": 12,
+    "leadsUsed": 234,
+    "storageUsed": 1073741824
+  }
+}
+```
+
+```http Create Checkout Session
+POST /v1/subscriptions/checkout
+Content-Type: application/json
+
+{
+  "planId": "starter-plan-id",
+  "billingInterval": "yearly",
+  "successUrl": "https://app.propwise.com/billing/success",
+  "cancelUrl": "https://app.propwise.com/billing"
+}
+
+Response:
+{
+  "checkoutUrl": "https://checkout.stripe.com/c/pay/cs_test_..."
+}
+```
+
+```http Change Plan
+POST /v1/subscriptions/change-plan
+Content-Type: application/json
+
+{
+  "planId": "professional-plan-id",
+  "billingInterval": "monthly"
+}
+
+Response:
+{
+  "id": "subscription-id",
+  "plan": { ... },
+  "status": "active",
+  "billingInterval": "monthly"
+}
+```
+
+```http Purchase Credit Pack
+POST /v1/subscriptions/purchase-credits
+Content-Type: application/json
+
+{
+  "creditType": "ai",
+  "quantity": 500
+}
+
+Response:
+{
+  "paymentIntentClientSecret": "pi_test_..._secret_...",
+  "amount": 1000,
+  "currency": "usd"
+}
+```
+</CodeGroup>
+
+### Error responses
+
+| Error | Status | Condition |
+|---|---|---|
+| `SUBSCRIPTION_NOT_FOUND` | 404 | Organization has no subscription |
+| `INVALID_PLAN` | 400 | Plan doesn't exist or same as current |
+| `SEAT_OVERFLOW` | 400 | New plan can't accommodate current users |
+| `STRIPE_SUBSCRIPTION_EXISTS` | 409 | Org already has paid subscription (use change-plan) |
+| `INSUFFICIENT_CREDITS` | 402 | Credit balance too low for operation |
+
+## Guards & Decorators
+
+### Feature gating decorator
+
+```typescript
+@RequiresFeature('advancedAnalytics')
+@Get('analytics/advanced')
+async getAdvancedAnalytics() {
+  // Only accessible if plan.features.advancedAnalytics === true
+}
+```
+
+### Subscription active guard
+
+```typescript
+@UseGuards(SubscriptionActiveGuard)
+@Post('leads')
+async createLead() {
+  // Blocked if subscription status is SUSPENDED
+}
+```
+
+### Implementation
+
+<CodeGroup>
+```typescript RequiresFeature Decorator
+export const RequiresFeature = (featureFlag: string): MethodDecorator => {
+  return (target: any, propertyKey: string, descriptor: PropertyDescriptor) => {
+    const originalMethod = descriptor.value;
+
+    descriptor.value = async function (...args: any[]) {
+      const request = args.find(arg => arg.user && arg.user.organizationId);
+      if (!request) {
+        throw new UnauthorizedException('User context not found');
+      }
+
+      const subscriptionService = this.subscriptionService;
+      const hasFeature = await subscriptionService.checkFeature(
+        request.user.organizationId,
+        featureFlag
+      );
+
+      if (!hasFeature) {
+        throw new ForbiddenException(
+          `Feature '${featureFlag}' not available on current plan`
+        );
+      }
+
+      return originalMethod.apply(this, args);
+    };
+  };
+};
+```
+
+```typescript SubscriptionActiveGuard
+@Injectable()
+export class SubscriptionActiveGuard implements CanActivate {
+  constructor(private subscriptionService: SubscriptionService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const organizationId = request.user?.organizationId;
+
+    if (!organizationId) {
+      throw new UnauthorizedException('Organization context required');
+    }
+
+    const subscription = await this.subscriptionService.getByOrganizationId(
+      organizationId
+    );
+
+    if (subscription.status === SubscriptionStatus.SUSPENDED) {
+      throw new ForbiddenException(
+        'Organization subscription is suspended. Please update payment method.'
+      );
+    }
+
+    return true;
+  }
+}
+```
+</CodeGroup>
+
+## Enforcement Points
+
+### Resource limit checks
+
+Resource limits are enforced at the service layer when creating new entities:
+
+<CodeGroup>
+```typescript Lead Service
+async createLead(organizationId: string, data: CreateLeadDto): Promise<Lead> {
+  await this.subscriptionService.checkResourceLimit(
+    organizationId, 
+    'leads'
+  );
+  
+  return this.leadRepo.create({ ...data, organizationId });
+}
+```
+
+```typescript Subscription Service
+async checkResourceLimit(organizationId: string, resource: string): Promise<void> {
+  const subscription = await this.getByOrganizationId(organizationId);
+  const usage = subscription.usage;
+  const limit = subscription.plan[`max${capitalize(resource)}`];
+
+  if (limit === -1) return; // Unlimited
+
+  const currentUsage = usage[`${resource}Used`];
+  if (currentUsage >= limit) {
+    throw new ForbiddenException(
+      `${capitalize(resource)} limit exceeded. Upgrade plan to add more.`
+    );
+  }
+}
+```
+</CodeGroup>
+
+### Credit consumption
+
+Credit consumption happens synchronously during API calls that use AI or messaging:
+
+```typescript
+// In AI completion endpoint
+async generateCompletion(organizationId: string, prompt: string) {
+  // Check and consume credits before API call
+  await this.subscriptionService.consumeCredits(organizationId, 'ai', 1);
+  
+  try {
+    const result = await this.openaiService.createCompletion(prompt);
+    return result;
+  } catch (error) {
+    // If API call fails, credit is not refunded (simple approach)
+    throw error;
+  }
+}
+```
+
+## Plan Seeder
+
+The plan seeder creates the four subscription plans with their features and pricing:
+
+<CodeGroup>
+```typescript Seeder Script
+import { seedPlans } from './plan-seeder';
+
+export async function runSeeders() {
+  await seedPlans();
+  console.log('✅ Subscription plans seeded');
+}
+```
+
+```typescript Plan Configuration
+const PLAN_CONFIGS = [
+  {
+    name: 'Free',
+    monthlyPrice: 0,
+    yearlyPrice: 0,
+    managerSeatsIncluded: 1,
+    agentSeatsIncluded: 0,
+    managerSeatPrice: 0,
+    agentSeatPrice: 0,
+    aiCredits: 20,
+    messagingCredits: 0,
+    features: {
+      maxMessagingChannels: 0,
+      maxEmailIntegrations: 0,
+      auditLogRetentionDays: 0,
+    },
+    limits: {
+      maxLeads: 50,
+      maxContacts: 50,
+      maxDeals: 20,
+      maxCompanies: 10,
+      maxStorageBytes: 500 * 1024 * 1024, // 500 MB
+    }
+  },
+  {
+    name: 'Starter',
+    monthlyPrice: 4900, // $49.00
+    yearlyPrice: 47040, // ~20% off
+    managerSeatsIncluded: 2,
+    agentSeatsIncluded: 3,
+    managerSeatPrice: 2500, // $25.00
+    agentSeatPrice: 1200, // $12.00
+    aiCredits: 200,
+    messagingCredits: 100,
+    features: {
+      customPipelineStages: true,
+      maxMessagingChannels: 1,
+      maxEmailIntegrations: 1,
+      auditLogRetentionDays: 0,
+    },
+    limits: {
+      maxLeads: 1000,
+      maxContacts: 1000,
+      maxDeals: 500,
+      maxCompanies: 200,
+      maxStorageBytes: 5 * 1024 * 1024 * 1024, // 5 GB
+    }
+  }
+  // ... Professional and Business configs
+];
+```
+</CodeGroup>
+
+## Module Structure
+
+```
+src/modules/subscription/
+├── controllers/
+│   ├── subscription.controller.ts       # Main subscription endpoints
+│   └── stripe-webhook.controller.ts     # Webhook handling
+├── services/
+│   ├── subscription.service.ts          # Core subscription logic
+│   ├── credit.service.ts                # Credit consumption/purchasing
+│   └── stripe.service.ts                # Stripe SDK wrapper
+├── entities/
+│   ├── subscription-plan.entity.ts      # Plan definitions
+│   ├── subscription.entity.ts           # Org subscription
+│   ├── subscription-usage.entity.ts     # Usage tracking
+│   ├── credit-purchase.entity.ts        # Credit pack purchases
+│   └── billing-event.entity.ts          # Webhook event log
+├── guards/
+│   ├── requires-feature.decorator.ts    # @RequiresFeature('flag')
+│   └── subscription-active.guard.ts     # Blocks suspended orgs
+├── dtos/
+│   ├── create-checkout-session.dto.ts   # Checkout request
+│   ├── change-plan.dto.ts               # Plan change request
+│   └── purchase-credits.dto.ts          # Credit purchase request
+├── seeders/
+│   └── plan.seeder.ts                   # Creates default plans
+└── subscription.module.ts               # Module definition
+```
+
+## Environment Configuration
+
+<Tabs>
+<Tab title="Required Variables">
+```bash
+# Stripe configuration (required for billing features)
+STRIPE_SECRET_KEY=sk_test_51234567890abcdef...
+STRIPE_PUBLISHABLE_KEY=pk_test_51234567890abcdef...
+STRIPE_WEBHOOK_SECRET=whsec_1234567890abcdef...
+
+# Stripe Price IDs for each plan and seat type
+STRIPE_STARTER_MONTHLY_PRICE_ID=price_1234567890abcdef
+STRIPE_STARTER_YEARLY_PRICE_ID=price_0987654321fedcba
+STRIPE_STARTER_MANAGER_SEAT_PRICE_ID=price_1111111111111111
+STRIPE_STARTER_AGENT_SEAT_PRICE_ID=price_2222222222222222
+# ... similar for Professional and Business plans
+```
+</Tab>
+<Tab title="Optional Variables">
+```bash
+# Billing portal configuration
+STRIPE_BILLING_PORTAL_RETURN_URL=https://app.propwise.com/billing
+
+# Credit pack pricing (if different from defaults)
+AI_CREDIT_PACK_PRICE=1000  # $10.00 for 500 AI credits
+MESSAGING_CREDIT_PACK_PRICE=800  # $8.00 for 500 messaging credits
+```
+</Tab>
+<Tab title="Development Setup">
+```bash
+# Test mode (uses Stripe test keys)
+NODE_ENV=development
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_PUBLISHABLE_KEY=pk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+# Use Stripe CLI for local webhook testing
+stripe listen --forward-to localhost:3000/webhooks/stripe
+```
+</Tab>
+</Tabs>
+
+## Integration with Other Modules
+
+### User management
+
+```typescript
+// When inviting a user with Admin role
+await this.subscriptionService.checkSeatAvailability(
+  organizationId, 
+  SeatType.MANAGER
+);
+
+// When user accepts invitation
+await this.subscriptionService.reconcileSeats(organizationId);
+```
+
+### RBAC module
+
+```typescript
+// When changing user role (Basic → Admin)
+const oldSeatType = this.subscriptionService.getSeatTypeForRole(oldRole);
+const newSeatType = this.subscriptionService.getSeatTypeForRole(newRole);
+
+if (oldSeatType !== newSeatType) {
+  await this.subscriptionService.checkSeatAvailability(
+    organizationId, 
+    newSeatType
+  );
+}
+```
+
+### CRM entities (Leads, Contacts, etc.)
+
+```typescript
+// Before creating a new lead
+await this.subscriptionService.checkResourceLimit(organizationId, 'leads');
+
+// After successful creation
+await this.subscriptionService.incrementUsage(organizationId, 'leadsUsed');
+```
+
+### AI/Messaging services
+
+```typescript
+// Before making AI API call
+await this.subscriptionService.consumeCredits(organizationId, 'ai', 1);
+
+// Before sending message
+await this.subscriptionService.consumeCredits(organizationId, 'messaging', 1);
+```
+
+<Check>
+The subscription module is fully integrated across the application, providing seamless billing and feature gating for all PropWise CRM functionality.
+</Check>
