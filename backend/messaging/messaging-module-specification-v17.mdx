@@ -1,0 +1,752 @@
+---
+title: "Messaging Module Specification v17"
+description: "Comprehensive specification for the unified messaging system supporting WhatsApp, Instagram, and Facebook Messenger with shared entities, queue infrastructure, and WebSocket architecture."
+---
+
+<Note>
+**Last Updated:** 2026-04-15  
+**Status:** Active
+</Note>
+
+## Overview
+
+The Messaging module provides a unified, channel-agnostic messaging system for WhatsApp, Instagram, and Facebook Messenger. It replaces the separate per-channel modules with shared entities, a shared queue, and a single WebSocket namespace.
+
+### Problem → Solution
+
+| Problem | Solution |
+|---------|----------|
+| Duplicated logic across WhatsApp and Instagram modules | Single `MessagingModule` with channel providers |
+| No webhook signature validation (security gap) | Shared `MetaWebhookGuard` validates `X-Hub-Signature-256` |
+| Inconsistent WebSocket auth (Instagram gateway has no JWT) | Single `/messaging` gateway with JWT auth |
+| No Facebook Messenger support | Third channel provider |
+| Separate entity schemas per channel | Unified entities: `Conversation`, `Message`, `ChannelAccount` |
+| No shared queue infrastructure | Shared `PgBossQueueService` for messaging + notifications |
+
+### Key Design Decisions
+
+<AccordionGroup>
+<Accordion title="Queue Infrastructure">
+**pg-boss over BullMQ** — Project already uses pg-boss for notifications. No new Redis dependency. Interface-based design (`IQueueService`) allows swapping later.
+</Accordion>
+
+<Accordion title="CRM Integration">
+**Direct PersonChannel FK on Conversation** — Conversations link directly to the CRM's `PersonChannel` via FK. Simpler model, no bidirectional sync overhead. The lead FK was moved from Conversation to Lead (`Lead.sourceConversation`).
+</Accordion>
+
+<Accordion title="Archive Pattern">
+**Archive as boolean, not status** — `Conversation.isArchived` is orthogonal to `status` (OPEN/CLOSED), following `ARCHIVE_SYSTEM_SPECIFICATION.md`.
+</Accordion>
+
+<Accordion title="Assignment System">
+**`ConversationAssignment` entity (not `entity_stakeholder`)** — Conversations use a dedicated `conversation_assignment` table instead of the CRM `entity_stakeholder` pattern. Each assignment is one row with nullable `user_id` and `team_id`.
+</Accordion>
+
+<Accordion title="Message Delivery">
+**Transactional outbox** — Outbound messages use an outbox table written in the same DB transaction as the Message entity, guaranteeing at-least-once delivery.
+</Accordion>
+</AccordionGroup>
+
+## Architecture & Module Structure
+
+```mermaid
+flowchart TD
+    A[Meta Platform Webhooks] --> B[POST /messaging/webhook]
+    B --> C[@PublicEndpoint + MetaWebhookGuard]
+    C --> D[WebhookEventLog]
+    D --> E[pg-boss Queue]
+    E --> F[Queue Worker]
+    F --> G[Channel Provider]
+    G --> H[PersonChannel Match/Create]
+    H --> I[Conversation & Message]
+    I --> J[WebSocket Events]
+```
+
+### Module Structure
+
+```
+src/modules/meta-platform/    ← Top-level infra module
+  meta-platform.module.ts
+  meta-graph-api.service.ts
+  meta-api.error.ts
+  meta-webhook.guard.ts
+  meta-oauth.service.ts
+  webhook-event-log.entity.ts
+
+src/modules/messaging/
+  messaging.module.ts
+  entities/               ← Core entities
+  enums/                  ← Channel, MessageType, etc.
+  services/               ← Core services + providers/
+    providers/            ← WhatsApp, Instagram, Messenger
+  controllers/            ← API endpoints
+  gateways/               ← WebSocket gateway
+  queues/                 ← Queue workers
+  dto/                    ← Request/response DTOs
+```
+
+## Multi-Tenancy Patterns
+
+<Warning>
+The messaging module introduces unique multi-tenancy challenges because webhooks arrive without org context.
+</Warning>
+
+### Two-Step RLS Bypass (Webhook Processing)
+
+The webhook controller receives events for ALL organizations from a single Meta App. Org context is unknown at arrival time.
+
+<Steps>
+<Step title="Find Organization">
+```typescript
+// Step 1: Find which org owns this account (bypass RLS)
+const account = await this.tenantContext.executeReadOnlyWithBypass(async (em) => {
+  return em.findOne(ChannelAccount, { externalAccountId: job.data.accountId });
+});
+```
+</Step>
+
+<Step title="Process in Context">
+```typescript
+// Step 2: Process within that org's context
+await this.tenantContext.executeInOrg(
+  account.organization.id,
+  async (em) => {
+    await this.processMessageInTransaction(em, job.data);
+  },
+  { userId: undefined }, // system action, no user
+);
+```
+</Step>
+</Steps>
+
+## Entities
+
+### Core Entities
+
+<CardGroup cols={2}>
+<Card title="ChannelAccount" icon="user">
+Organization-level or personal account configuration for each messaging channel
+</Card>
+<Card title="Conversation" icon="comments">
+Unified conversation thread linking to PersonChannel with assignments and AI mode
+</Card>
+<Card title="Message" icon="message">
+Individual messages with rich content support and metadata
+</Card>
+<Card title="MessageTemplate" icon="file-text">
+Reusable message templates with variable support
+</Card>
+</CardGroup>
+
+### ChannelAccount Entity
+
+```typescript
+@Entity('channel_account')
+export class ChannelAccount {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ type: 'enum', enum: Channel })
+  channel: Channel;
+
+  @Column({ name: 'external_account_id' })
+  externalAccountId: string; // WhatsApp phone number ID, IG account ID, FB page ID
+
+  @Column({ nullable: true, name: 'page_id' })
+  pageId?: string; // Facebook Page ID for Instagram
+
+  @Column({ name: 'display_name' })
+  displayName: string;
+
+  @Column({ name: 'profile_picture_url', nullable: true })
+  profilePictureUrl?: string;
+
+  @Column({ name: 'access_token', nullable: true })
+  accessToken?: string; // Personal accounts only
+
+  @Column({ name: 'webhook_verification_token', nullable: true })
+  webhookVerificationToken?: string;
+
+  @Column({ name: 'is_active', default: true })
+  isActive: boolean;
+
+  @Column({ 
+    type: 'enum', 
+    enum: AiMode, 
+    name: 'default_ai_mode',
+    default: AiMode.OFF 
+  })
+  defaultAiMode: AiMode;
+
+  @ManyToOne(() => Organization)
+  @JoinColumn({ name: 'organization_id' })
+  organization: Organization;
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'personal_account_user_id' })
+  personalAccountUser?: User; // null = org account
+}
+```
+
+### Conversation Entity
+
+```typescript
+@Entity('conversation')
+export class Conversation {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'external_thread_id', nullable: true })
+  externalThreadId?: string;
+
+  @ManyToOne(() => ChannelAccount)
+  @JoinColumn({ name: 'channel_account_id' })
+  channelAccount: ChannelAccount;
+
+  @ManyToOne(() => PersonChannel)
+  @JoinColumn({ name: 'person_channel_id' })
+  personChannel: PersonChannel;
+
+  @ManyToOne(() => Contact, { nullable: true })
+  @JoinColumn({ name: 'contact_id' })
+  contact?: Contact;
+
+  @Column({ 
+    type: 'enum', 
+    enum: ConversationStatus, 
+    default: ConversationStatus.OPEN 
+  })
+  status: ConversationStatus;
+
+  @Column({ name: 'is_archived', default: false })
+  isArchived: boolean;
+
+  @Column({ 
+    type: 'enum', 
+    enum: AiMode, 
+    name: 'ai_mode',
+    nullable: true 
+  })
+  aiMode?: AiMode; // Cascades from account/org defaults
+
+  @Column({ name: 'last_message_at', nullable: true })
+  lastMessageAt?: Date;
+
+  @OneToMany(() => ConversationAssignment, assignment => assignment.conversation)
+  assignments: ConversationAssignment[];
+}
+```
+
+## Enums
+
+<Tabs>
+<Tab title="Channel">
+```typescript
+export enum Channel {
+  WHATSAPP = 'whatsapp',
+  INSTAGRAM = 'instagram',
+  MESSENGER = 'messenger',
+}
+```
+</Tab>
+
+<Tab title="MessageType">
+```typescript
+export enum MessageType {
+  TEXT = 'text',
+  IMAGE = 'image',
+  AUDIO = 'audio',
+  VIDEO = 'video',
+  DOCUMENT = 'document',
+  LOCATION = 'location',
+  CONTACT = 'contact',
+  STICKER = 'sticker',
+  REACTION = 'reaction',
+  STORY_MENTION = 'story_mention',
+  STORY_REPLY = 'story_reply',
+  TEMPLATE = 'template',
+  INTERACTIVE = 'interactive',
+  SYSTEM = 'system',
+}
+```
+</Tab>
+
+<Tab title="MessageStatus">
+```typescript
+export enum MessageStatus {
+  PENDING = 'pending',
+  SENT = 'sent',
+  DELIVERED = 'delivered',
+  READ = 'read',
+  FAILED = 'failed',
+}
+```
+</Tab>
+
+<Tab title="ConversationStatus">
+```typescript
+export enum ConversationStatus {
+  OPEN = 'open',
+  CLOSED = 'closed',
+}
+```
+</Tab>
+</Tabs>
+
+## Message Flows
+
+### Inbound Message Flow
+
+<Steps>
+<Step title="Webhook Receipt">
+Meta platform sends webhook to `POST /messaging/webhook`
+- `@PublicEndpoint()` with `MetaWebhookGuard`
+- Validates `X-Hub-Signature-256`
+- Returns 200 immediately
+</Step>
+
+<Step title="Queue Processing">
+pg-boss worker processes webhook event
+- Check idempotency via `externalEventId`
+- Find organization using RLS bypass
+- Execute within org context
+</Step>
+
+<Step title="Channel Routing">
+Route to appropriate channel provider:
+- WhatsAppProvider
+- InstagramProvider  
+- MessengerProvider
+</Step>
+
+<Step title="Entity Resolution">
+Match or create entities in order:
+1. PersonChannel (contact identity)
+2. Person + Lead (CRM integration)
+3. Conversation (message thread)
+4. Message (actual message)
+</Step>
+
+<Step title="Event Emission">
+Emit events for real-time updates:
+- WebSocket events to `/messaging` namespace
+- Notification events via queue
+</Step>
+</Steps>
+
+### Outbound Message Flow
+
+<Steps>
+<Step title="API Request">
+Client sends message via `POST /messaging/conversations/{id}/messages`
+</Step>
+
+<Step title="Transactional Write">
+Single transaction creates:
+- Message entity
+- MessageOutbox entry
+</Step>
+
+<Step title="Queue Processing">
+message-sender worker:
+- Calls Meta Graph API
+- Updates message status
+- Removes outbox entry on success
+</Step>
+
+<Step title="WebSocket Update">
+Emit `message-sent` event with updated status
+</Step>
+</Steps>
+
+## Business Rules
+
+### Conversation Assignment
+
+<Info>
+Conversations support multiple assignment types through the `ConversationAssignment` entity.
+</Info>
+
+**Assignment Types:**
+- `user + null` = Direct assignment to specific agent
+- `user + team` = Agent working on behalf of team  
+- `null + team` = Team pool (unassigned within team)
+
+**Assignment Rules:**
+- Multiple assignments per conversation are allowed
+- Team managers can assign within their teams
+- Personal account owners have automatic access
+- `MESSAGING_MANAGE` permission grants full access
+
+### AI Mode Cascade
+
+AI mode settings cascade through multiple levels:
+
+1. **Conversation level** — `conversation.aiMode` (highest priority)
+2. **Account level** — `channelAccount.defaultAiMode`
+3. **Organization level** — Organization default setting
+4. **System default** — `AiMode.OFF`
+
+### Message Validation
+
+<Warning>
+All outbound messages must pass channel-specific validation before sending.
+</Warning>
+
+**WhatsApp Rules:**
+- Text messages: 4096 character limit
+- Media messages require valid MIME types
+- Template messages need approved templates
+
+**Instagram Rules:**  
+- Text messages: 1000 character limit
+- Story replies must reference valid story
+- No template messages supported
+
+**Messenger Rules:**
+- Text messages: 2000 character limit  
+- Rich media support varies by message type
+- Persistent menu configuration available
+
+## RBAC Permissions & Access Control
+
+### Permission Levels
+
+<CardGroup cols={3}>
+<Card title="MESSAGING_MANAGE" icon="shield-check">
+Full access to all messaging operations including assignment and archiving
+</Card>
+<Card title="MESSAGING_WRITE" icon="pen">
+Can view conversations and send replies, but cannot manage assignments
+</Card>
+<Card title="Team Permissions" icon="users">
+Team-specific messaging permissions for pool management
+</Card>
+</CardGroup>
+
+### Resource Permissions
+
+Conversations return `ResourcePermissionsDto` with computed permissions:
+
+```typescript
+export interface ConversationPermissions {
+  canView: boolean;      // Based on assignment or global perms
+  canReply: boolean;     // Can send messages
+  canEdit: boolean;      // Can modify conversation (MANAGE only)
+  canTransfer: boolean;  // Can reassign (MANAGE only)
+  canArchive: boolean;   // Can archive/unarchive (MANAGE only)
+  canAssign: boolean;    // Can assign within managed teams
+}
+```
+
+**Permission Logic:**
+- `MESSAGING_MANAGE` → `fullAccess()`
+- `MESSAGING_WRITE` → `canView + canReply`
+- Personal account owner → `canView + canReply`
+- Assigned agent → `canView` + assignment's `canReply`
+- Team member → `canView` + team assignment's `canReply`
+
+## WebSocket Events & Room Architecture
+
+### Namespace: `/messaging`
+
+All messaging WebSocket events use the `/messaging` namespace with JWT authentication.
+
+### Room Structure
+
+<Tabs>
+<Tab title="Organization Rooms">
+```typescript
+// All users in org receive general updates
+`org:${orgId}`
+
+// Team members receive team-specific updates  
+`team:${teamId}`
+```
+</Tab>
+
+<Tab title="Conversation Rooms">
+```typescript
+// Users with conversation access
+`conversation:${conversationId}`
+
+// Personal account rooms
+`personal:${userId}`
+```
+</Tab>
+</Tabs>
+
+### Event Types
+
+<CodeGroup>
+```typescript Events
+// Conversation events
+'conversation-created'
+'conversation-updated' 
+'conversation-assigned'
+'conversation-archived'
+
+// Message events
+'message-received'
+'message-sent'
+'message-status-updated'
+
+// Typing indicators
+'typing-start'
+'typing-stop'
+
+// AI events
+'ai-suggestion-generated'
+'ai-draft-created'
+```
+
+```typescript Event Payloads
+interface MessageReceivedEvent {
+  conversationId: string;
+  message: MessageDetailDto;
+  conversation: ConversationSummaryDto;
+}
+
+interface ConversationAssignedEvent {
+  conversationId: string;
+  previousAssignments: AssignmentDto[];
+  newAssignments: AssignmentDto[];
+  assignedBy: UserSummaryDto;
+}
+```
+</CodeGroup>
+
+## API Endpoints
+
+### Webhook Endpoints
+
+<Warning>
+Webhook endpoints use `@PublicEndpoint()` and require signature validation.
+</Warning>
+
+```http
+POST /messaging/webhook
+GET /messaging/webhook  # Verification challenge
+```
+
+### Conversation Management
+
+```http
+GET /messaging/conversations           # List conversations
+GET /messaging/conversations/{id}      # Get conversation details
+POST /messaging/conversations/{id}/messages  # Send message
+PUT /messaging/conversations/{id}/assign      # Assign conversation
+PUT /messaging/conversations/{id}/archive     # Archive/unarchive
+PUT /messaging/conversations/{id}/ai-mode     # Update AI mode
+```
+
+### Channel Account Management
+
+```http
+GET /messaging/channel-accounts        # List accounts
+POST /messaging/channel-accounts       # Create account
+PUT /messaging/channel-accounts/{id}   # Update account
+DELETE /messaging/channel-accounts/{id} # Delete account
+```
+
+### Templates
+
+```http
+GET /messaging/templates               # List templates  
+POST /messaging/templates              # Create template
+PUT /messaging/templates/{id}          # Update template
+DELETE /messaging/templates/{id}       # Delete template
+```
+
+## Error Handling & Retry Strategy
+
+### Queue Retry Logic
+
+<Steps>
+<Step title="Exponential Backoff">
+Failed jobs retry with exponential backoff:
+- Attempt 1: Immediate
+- Attempt 2: 30 seconds  
+- Attempt 3: 2 minutes
+- Attempt 4: 8 minutes
+- Attempt 5: 32 minutes (final)
+</Step>
+
+<Step title="Dead Letter Queue">
+Jobs failing all retries move to DLQ for manual investigation
+</Step>
+
+<Step title="Idempotency">
+All webhook processing is idempotent using `externalEventId`
+</Step>
+</Steps>
+
+### API Error Responses
+
+```typescript
+// Standard error format
+{
+  "error": {
+    "code": "CONVERSATION_NOT_FOUND",
+    "message": "Conversation not found or access denied",
+    "details": {
+      "conversationId": "uuid"
+    }
+  }
+}
+```
+
+### Common Error Codes
+
+- `WEBHOOK_SIGNATURE_INVALID` - Invalid Meta webhook signature
+- `CHANNEL_ACCOUNT_NOT_FOUND` - Referenced account doesn't exist
+- `CONVERSATION_ACCESS_DENIED` - User lacks conversation permissions
+- `MESSAGE_SEND_FAILED` - Meta API error during send
+- `TEMPLATE_NOT_APPROVED` - Attempting to use unapproved template
+
+## Deployment Considerations
+
+### Database Changes
+
+<Check>
+**Migration Safe** - All new tables and columns use safe migration patterns
+</Check>
+
+**New Tables:**
+- `channel_account` 
+- `conversation`
+- `message`
+- `conversation_assignment`
+- `message_template`
+- `message_outbox`
+- `automation_rule`
+
+**Modified Tables:**
+- `webhook_event_log` - Made org_id nullable
+- `lead` - Added `source_conversation_id` FK
+
+### Environment Variables
+
+```env
+# Meta Platform
+META_APP_ID=your_app_id
+META_APP_SECRET=your_app_secret
+META_WEBHOOK_VERIFY_TOKEN=your_verify_token
+
+# WhatsApp Business API
+WHATSAPP_BUSINESS_ACCOUNT_ID=your_waba_id  
+WHATSAPP_ACCESS_TOKEN=your_permanent_token
+
+# Queue Configuration
+PGBOSS_POLL_INTERVAL=2000
+PGBOSS_MAX_WORKERS=10
+```
+
+### Feature Flags
+
+The messaging module supports gradual rollout via feature flags:
+
+- `messaging_module_enabled` - Enable new messaging endpoints
+- `webhook_processing_enabled` - Enable webhook queue processing
+- `websocket_events_enabled` - Enable real-time events
+
+## Testing Strategy
+
+<Tabs>
+<Tab title="Unit Tests">
+**Service Tests:**
+- Channel provider message processing
+- Permission calculation logic
+- Queue job processing
+- Template variable resolution
+
+**Guard Tests:**
+- Webhook signature validation
+- Personal account access control
+- Conversation permission checks
+</Tab>
+
+<Tab title="Integration Tests">
+**API Tests:**
+- End-to-end conversation flows
+- Message sending and status updates
+- Assignment and transfer operations
+- Template CRUD operations
+
+**Queue Tests:**
+- Webhook processing with real payloads
+- Retry and error handling
+- Idempotency verification
+</Tab>
+
+<Tab title="E2E Tests">
+**WebSocket Tests:**
+- Real-time event delivery
+- Room membership and isolation
+- Connection handling and auth
+
+**Webhook Tests:**
+- Meta platform webhook simulation
+- Multi-tenant event routing
+- Error recovery scenarios
+</Tab>
+</Tabs>
+
+## Module Dependencies
+
+### Internal Dependencies
+
+<CardGroup cols={2}>
+<Card title="CRM Module" icon="address-book">
+PersonChannel, Person, Contact, Lead integration
+</Card>
+<Card title="Auth Module" icon="lock">
+User authentication and RBAC permissions
+</Card>
+<Card title="Organization Module" icon="building">
+Multi-tenant context and settings
+</Card>
+<Card title="Notification Module" icon="bell">
+Shared queue infrastructure
+</Card>
+</CardGroup>
+
+### External Dependencies
+
+- **Meta Graph API** - WhatsApp, Instagram, Messenger APIs
+- **pg-boss** - Queue processing and job management
+- **Socket.io** - WebSocket event delivery
+- **Bull Dashboard** - Queue monitoring (optional)
+
+## Future Phases
+
+<Info>
+The messaging module is designed for extensibility with planned enhancements.
+</Info>
+
+### Phase 2: Advanced Features
+
+- **Message Analytics** - Delivery rates, response times, engagement metrics
+- **Automation Rules** - Advanced workflow automation beyond simple AI modes
+- **Message Scheduling** - Delayed message sending capabilities
+- **Rich Media CDN** - Optimized media handling and storage
+
+### Phase 3: Additional Channels
+
+- **SMS/MMS** - Direct SMS integration via Twilio/AWS SNS
+- **Email** - Unified inbox including email conversations
+- **Live Chat** - Website chat widget integration
+- **Voice Calls** - Integration with VoIP providers
+
+### Phase 4: AI Enhancements
+
+- **Sentiment Analysis** - Real-time conversation sentiment tracking
+- **Intent Recognition** - Automatic conversation categorization
+- **Smart Routing** - AI-powered agent assignment
+- **Conversation Summarization** - AI-generated conversation summaries
+
+---
+
+<Tip>
+For implementation details and code examples, refer to the source files in the Key Files Reference section.
+</Tip>
