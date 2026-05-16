@@ -1,130 +1,129 @@
 ---
 title: "Calendar System Deep Dive"
-description: "Comprehensive architecture review and operating guide for the CRM calendar system, covering feed APIs, external integrations, OAuth flows, webhooks, and sync mechanisms"
+description: "Comprehensive technical deep dive into the calendar system architecture, including CRM calendar feeds, Google/Outlook integration, OAuth flows, webhooks, sync mechanisms, and operational considerations."
 ---
-
-This document explains how the current calendar system actually works. It is intentionally blunt: the calendar integration is not a simple "push event to Google" feature. It is a distributed sync system with two hostile external providers, eventually consistent mailboxes, webhook retries, token expiry, RLS, notifications, and user actions happening from both CRM and external calendars.
 
 ## Executive Summary
 
-The system has three calendar layers:
-
-<CardGroup cols={3}>
-  <Card title="CRM Calendar Feed" icon="calendar">
-    Primary routes for personal workload, organization stacked calendar, and team calendars
-  </Card>
-  <Card title="CRM Events" icon="calendar-days">
-    EventService owns internal event source of truth, invitees, RSVP status, and notifications
-  </Card>
-  <Card title="Calendar Integrations" icon="link">
-    Google and Outlook drivers push CRM events outward and process provider webhooks
-  </Card>
-</CardGroup>
-
-### Calendar Feed Routes
-
-The CRM calendar system provides several API endpoints:
-
-- **`GET /v1/calendar/me`** - Personal workload: CRM tasks/subtasks + CRM events + external items when viewing yourself
-- **`GET /v1/calendar/org`** - Organization stacked calendar: 1–10 other org members, returns `{ rosterUserIds, itemsByUserId }`
-- **`GET /v1/calendar/teams/:teamId`** - Team calendar for members with appropriate permissions
-- **`GET /v1/calendar/me/agenda`** - Personal merged agenda list with forward scan
-- **`GET /v1/calendar/me/agenda/timeline`** - CRM web agenda list with day-window pagination
-
-<Note>
-Legacy `GET /v1/calendar` and `GET /v1/calendar/agenda` delegate to the same handlers as `/me` endpoints.
-</Note>
-
-### Intended Model
-
-The calendar system follows these principles:
-
-- CRM events are the canonical business record
-- Creator calendar copies can update CRM event details when changed externally
-- Invitee calendar copies can update RSVP only
-- External-only items are displayed read-only and are not imported into CRM
-- Provider echoes are suppressed with change IDs, fingerprints, ETags, and short time windows
+The calendar system operates as a distributed sync system with three distinct layers, managing complex interactions between CRM events and external calendar providers.
 
 <Warning>
-The biggest risk is that the system is trying to make two different calendar providers behave like one coherent event bus. That is inherently fragile.
+The calendar integration is not a simple "push event to Google" feature. It's a distributed sync system with two hostile external providers, eventually consistent mailboxes, webhook retries, token expiry, RLS, notifications, and user actions happening from both CRM and external calendars.
 </Warning>
 
-## Security & Authentication
+### System Architecture
 
-### Webhook Authenticity
+The system has three calendar layers:
 
-<Tabs>
-  <Tab title="Google Calendar">
-    Google stores a **separate** `watchChannelVerifyToken` (sent as the `token` in `events.watch` and echoed as `X-Goog-Channel-Token`). It is not the same as the channel `id`—legacy rows may still equate the two.
+1. **CRM calendar feed**: Primary routes for personal workload, organization stacked calendar, and team calendars
+2. **CRM events**: Internal event source of truth with invitees, RSVP status, and notifications
+3. **Calendar integrations**: Google and Outlook drivers for bidirectional sync
 
-    When `watchResourceId` is present, inbound notifications must also match `X-Goog-Resource-Id`.
-  </Tab>
-  <Tab title="Outlook">
-    Outlook requires `clientState` to equal the integration UUID.
+## CRM Calendar Feed Endpoints
 
-    When Microsoft Graph includes `validationTokens` on a change-notification batch, JWTs are verified (JWKS) before the handler returns `202` (audience: `app.outlookCalendar.webhookValidationAudience`, defaulting to the calendar app client id).
-  </Tab>
-</Tabs>
+### Personal Calendar (`/me`)
 
-<Check>
-In **production** (`buildAppConfig().isProduction`), `GOOGLE_CALENDAR_WEBHOOK_URL` and `OUTLOOK_CALENDAR_WEBHOOK_URL` must be **https** and must not target localhost.
-</Check>
+<CodeGroup>
+```http GET /v1/calendar/me
+GET /v1/calendar/me
+```
+</CodeGroup>
 
-### Row Level Security
+Returns personal workload including:
+- CRM tasks/subtasks
+- CRM events 
+- External items (when viewing yourself)
+
+### Organization Calendar (`/org`)
+
+<CodeGroup>
+```http GET /v1/calendar/org
+GET /v1/calendar/org?userIds=1,2,3
+```
+</CodeGroup>
+
+Returns stacked calendar for 1-10 other org members:
+- Response format: `{ rosterUserIds, itemsByUserId }`
+- Personal-scope tasks/subtasks + CRM events per subject
+- No external items included
+- Viewer ID in query is ignored
+
+### Team Calendar (`/teams/:teamId`)
+
+<CodeGroup>
+```http GET /v1/calendar/teams/:teamId
+GET /v1/calendar/teams/123
+```
+</CodeGroup>
+
+Access requires:
+- `team.admin`, `team_crm.*`, or `team_sales.*` permissions on that team
+- OR org admin/owner role
+
+Returns CRM-only items per roster member (authenticated user excluded from roster).
+
+<Note>
+Use `/me` endpoint for self-calendar access.
+</Note>
+
+### Agenda Endpoints
+
+#### Personal Agenda (`/me/agenda`)
+
+<CodeGroup>
+```http GET /v1/calendar/me/agenda
+GET /v1/calendar/me/agenda?from=2024-01-01T00:00:00Z
+```
+</CodeGroup>
+
+Serves personal merged agenda list:
+- Optional inclusive `from` parameter
+- Forward scan up to server lookahead cap
+- **No** `limit`/`cursor` pagination
+- Response includes `truncated: boolean` flag
 
 <Info>
-`calendar_sync_outbox` is RLS-protected like other org tables (`Migration20260428180000_EnableCalendarSyncOutboxRls`).
+`truncated: true` indicates the merge loop exited before reaching lookahead horizon. `truncated: false` means full lookahead window was scanned.
 </Info>
 
-## Personal Agenda Timeline
+#### Timeline Agenda (`/me/agenda/timeline`)
 
-The `GET /v1/calendar/me/agenda/timeline` endpoint is used by the CRM web **agenda** view for infinite scroll.
+<CodeGroup>
+```http GET /v1/calendar/me/agenda/timeline
+GET /v1/calendar/me/agenda/timeline?cursor=eyJ2IjoxLCJuZXh0RGF5IjoiMjAyNC0wMS0wMiJ9
+```
+</CodeGroup>
 
-### Request Requirements
+Serves CRM web agenda list with **day-window pagination**:
 
 <Steps>
-  <Step title="Timezone Header">
-    Requires the standard **`Time-Zone`** request header (IANA). Invalid/missing values default to `UTC`.
-  </Step>
-  <Step title="Sorting Logic">
-    - Tasks by **due** (`startDate` on the DTO mirrors due)
-    - CRM events and externals by **start**
-    - Stable tie-break by source + id
-  </Step>
+<Step title="Merged Probe">
+Fetch merged window from page anchor day + 60 days lookahead
+</Step>
+<Step title="Local Window">
+Convert to viewer `Time-Zone` header for `fromDay`/`toDay`
+</Step>
+<Step title="Authoritative Refetch">
+Full refetch for that day window
+</Step>
+<Step title="Next Cursor">
+Generate `nextCursor` for following page
+</Step>
 </Steps>
 
-### Processing Flow
-
-<AccordionGroup>
-  <Accordion title="Probe Phase">
-    From the page anchor day, fetch a merged window of `CALENDAR_TIMELINE_PROBE_LOOKAHEAD_DAYS` (default 60) days, merge-sort, apply the first-page visibility rule (`max(from, now)` for tasks; events/externals also kept when they overlap the viewer's local "today").
-  </Accordion>
-  <Accordion title="Day Span Calculation">
-    Union of local calendar days each row touches. `fromDay` is floored at the page anchor to prevent cursor repetition. `D_min` / `D_max` are clamped to `CALENDAR_TIMELINE_MAX_DAY_SPAN` days.
-  </Accordion>
-  <Accordion title="Authoritative Fetch">
-    `collectMergedCalendarItems` for `[startOf(D_min), endOf(D_max)]` in the viewer zone. CRM events use interval overlap in `EventService.getCalendarEvents`.
-  </Accordion>
-</AccordionGroup>
-
-### Response Format
-
+Response format:
 ```json
 {
   "window": {
-    "fromDay": "2024-01-15",
-    "toDay": "2024-02-14",
+    "fromDay": "2024-01-01",
+    "toDay": "2024-01-31", 
     "timeZone": "America/New_York"
   },
   "items": [...],
-  "nextCursor": "base64-encoded-cursor",
+  "nextCursor": "eyJ2IjoxLCJuZXh0RGF5IjoiMjAyNC0wMi0wMSJ9",
   "hasMore": true
 }
 ```
-
-<Note>
-The legacy `GET /v1/calendar/me/agenda` endpoint remains for callers that want a single forward scan without pagination.
-</Note>
 
 ## Data Model
 
@@ -133,140 +132,345 @@ The legacy `GET /v1/calendar/me/agenda` endpoint remains for callers that want a
 The `calendar_integration` table stores one active external calendar account per user, organization, and provider.
 
 <Tabs>
-  <Tab title="Core Fields">
-    - `user`: CRM user who connected the calendar
-    - `organization`: tenant boundary
-    - `provider`: `google` or `outlook`
-    - `calendarEmail`: external account email for display and attendee matching
-  </Tab>
-  <Tab title="Security Fields">
-    - `encryptedAccessToken`: AES-GCM encrypted access token (nullable after disconnect)
-    - `encryptedRefreshToken`: AES-GCM encrypted refresh token when issued
-    - `tokenExpiresAt`: refresh threshold source
-  </Tab>
-  <Tab title="Google Fields">
-    - `watchChannelId`: Google push watch channel ID
-    - `watchChannelVerifyToken`: Opaque secret echoed as `X-Goog-Channel-Token`
-    - `watchResourceId`: Google resource identifier
-    - `watchExpiration`: Watch expiration timestamp
-    - `googleSyncToken`: Google incremental sync token
-  </Tab>
-  <Tab title="Outlook Fields">
-    - `outlookSubscriptionId`: Microsoft Graph subscription ID
-    - `outlookSubscriptionExpiration`: Subscription expiration timestamp
-  </Tab>
-  <Tab title="Health Fields">
-    - `lastInboundWebhookAt`: Last successful webhook processing
-    - `lastOutboundSyncAt`: Last successful CRM→provider push
-    - `lastSyncErrorAt`: Last provider/webhook/processing failure
-    - `lastSyncErrorMessage`: Bounded error message
-    - `isActive`, `isDeleted`: Connection status and soft delete
-  </Tab>
+<Tab title="Core Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `user` | FK | CRM user who connected the calendar |
+| `organization` | FK | Tenant boundary |
+| `provider` | enum | `google` or `outlook` |
+| `calendarEmail` | string | External account email |
+| `encryptedAccessToken` | string | AES-GCM encrypted access token (nullable after disconnect) |
+| `encryptedRefreshToken` | string | AES-GCM encrypted refresh token |
+| `tokenExpiresAt` | timestamp | Refresh threshold |
+</Tab>
+
+<Tab title="Google Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `watchChannelId` | string | Google push notification channel ID |
+| `watchChannelVerifyToken` | string | Opaque secret for webhook validation |
+| `watchResourceId` | string | Google resource identifier |
+| `watchExpiration` | timestamp | Channel expiration time |
+| `googleSyncToken` | string | Incremental sync token |
+</Tab>
+
+<Tab title="Outlook Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `outlookSubscriptionId` | string | Microsoft Graph subscription ID |
+| `outlookSubscriptionExpiration` | timestamp | Subscription expiration |
+</Tab>
+
+<Tab title="Status Fields">
+| Field | Type | Description |
+|-------|------|-------------|
+| `lastInboundWebhookAt` | timestamp | Last successful webhook processing |
+| `lastOutboundSyncAt` | timestamp | Last CRM→provider push |
+| `lastSyncErrorAt` | timestamp | Last failure timestamp |
+| `lastSyncErrorMessage` | string | Bounded error message |
+| `isActive` | boolean | Connection status |
+| `isDeleted` | boolean | Soft delete flag |
+</Tab>
 </Tabs>
 
-## File Structure
+### Calendar Event Mapping
+
+The `calendar_event_mapping` table links CRM events to external calendar events:
+
+- `eventId`: CRM event reference
+- `calendarIntegration`: Provider connection
+- `externalEventId`: Provider-specific event ID
+- `iCalUid`: Universal event identifier
+- `lastOutboundFingerprint`: Change detection for sync loops
+
+## Webhook Security
+
+<Warning>
+Webhook authenticity verification is critical for security. Each provider has different validation mechanisms.
+</Warning>
+
+### Google Calendar Webhooks
+
+Google uses separate verification tokens:
+
+<CodeGroup>
+```typescript Google Webhook Validation
+// watchChannelVerifyToken is sent in events.watch
+// and echoed as X-Goog-Channel-Token
+const incomingToken = req.headers['x-goog-channel-token'];
+const expectedToken = integration.watchChannelVerifyToken;
+
+if (incomingToken !== expectedToken) {
+  throw new UnauthorizedException('Invalid webhook token');
+}
+
+// Also verify resource ID when present
+const resourceId = req.headers['x-goog-resource-id'];
+if (integration.watchResourceId && resourceId !== integration.watchResourceId) {
+  throw new UnauthorizedException('Invalid resource ID');
+}
+```
+</CodeGroup>
+
+<Note>
+`watchChannelVerifyToken` is **separate** from channel `id`. Legacy rows may incorrectly equate the two.
+</Note>
+
+### Outlook Calendar Webhooks
+
+Outlook requires `clientState` validation and JWT verification:
+
+<CodeGroup>
+```typescript Outlook Webhook Validation
+// clientState must equal integration UUID
+const clientState = notification.clientState;
+if (clientState !== integration.id) {
+  throw new UnauthorizedException('Invalid client state');
+}
+
+// Verify JWTs when validationTokens present
+if (body.validationTokens?.length) {
+  await verifyMicrosoftGraphWebhookTokens(
+    body.validationTokens,
+    audience // defaults to calendar app client ID
+  );
+}
+```
+</CodeGroup>
+
+<Warning>
+In **production** environments, `GOOGLE_CALENDAR_WEBHOOK_URL` and `OUTLOOK_CALENDAR_WEBHOOK_URL` must be **https** and cannot target localhost.
+</Warning>
+
+## OAuth Flow
+
+### Authentication Process
+
+<Steps>
+<Step title="Initialize OAuth">
+Generate signed state parameter with TTL and redirect to provider
+</Step>
+<Step title="Provider Authorization">
+User authorizes application access to calendar
+</Step>
+<Step title="Callback Handling">
+Validate state, exchange code for tokens, store encrypted credentials
+</Step>
+<Step title="Setup Integration">
+Create calendar integration record and establish webhook subscriptions
+</Step>
+</Steps>
+
+### Google OAuth
+
+<CodeGroup>
+```http Google OAuth Initiation
+GET /oauth/google-calendar/authorize
+```
+
+```http Google OAuth Callback  
+GET /oauth/google-calendar/callback?code=...&state=...
+```
+</CodeGroup>
+
+### Outlook OAuth
+
+<CodeGroup>
+```http Outlook OAuth Initiation
+GET /oauth/outlook-calendar/authorize
+```
+
+```http Outlook OAuth Callback
+GET /oauth/outlook-calendar/callback?code=...&state=...
+```
+</CodeGroup>
+
+## Sync Mechanisms
+
+### Event Sync Model
+
+The intended sync model follows these principles:
+
+<Check>
+**CRM events are the canonical business record**
+</Check>
+
+<Check>
+**Creator calendar copies can update CRM event details when changed externally**
+</Check>
+
+<Check>
+**Invitee calendar copies can update RSVP only**
+</Check>
+
+<Check>
+**External-only items are displayed read-only and not imported into CRM**
+</Check>
+
+<Check>
+**Provider echoes are suppressed with change IDs, fingerprints, ETags, and time windows**
+</Check>
+
+### Outbound Sync
+
+When CRM events change, the system pushes updates to connected calendars:
+
+<CodeGroup>
+```typescript Outbound Sync Flow
+// 1. Event change detected
+const changeFingerprint = generateEventFingerprint(crmEvent);
+
+// 2. Check for mapping
+const mapping = await findEventMapping(crmEvent.id);
+
+// 3. Push to provider
+if (mapping) {
+  await calendarDriver.updateEvent(mapping.externalEventId, crmEvent);
+} else {
+  const externalId = await calendarDriver.createEvent(crmEvent);
+  await createEventMapping(crmEvent.id, externalId);
+}
+
+// 4. Update fingerprint
+mapping.lastOutboundFingerprint = changeFingerprint;
+```
+</CodeGroup>
+
+### Inbound Sync
+
+Provider webhooks trigger processing of external changes:
+
+<CodeGroup>
+```typescript Inbound Webhook Processing
+// 1. Authenticate webhook
+await validateWebhookSignature(req);
+
+// 2. Process change notifications
+for (const notification of notifications) {
+  const mapping = await findMappingByExternalId(notification.eventId);
+  
+  if (mapping) {
+    // Update existing CRM event
+    await syncExternalChangesToCrm(mapping, notification);
+  }
+  // External-only events are not imported
+}
+
+// 3. Update sync tokens
+await updateProviderSyncToken(integration, newSyncToken);
+```
+</CodeGroup>
+
+## Operational Considerations
+
+### Sync Health Monitoring
+
+The system tracks sync health through several metrics:
+
+<Tabs>
+<Tab title="Timestamps">
+- `lastInboundWebhookAt`: Last successful webhook processing
+- `lastOutboundSyncAt`: Last successful CRM→provider push
+- `lastSyncErrorAt`: Most recent error occurrence
+</Tab>
+
+<Tab title="Error Tracking">
+- `lastSyncErrorMessage`: Bounded error description
+- Webhook retry mechanisms with exponential backoff
+- Token refresh handling for expired credentials
+</Tab>
+
+<Tab title="Watch Renewal">
+- Google: Automatic channel renewal before expiration
+- Outlook: Subscription lifecycle management
+- Proactive monitoring of watch health
+</Tab>
+</Tabs>
+
+### Known Risk Areas
+
+<Warning>
+The biggest risk is that the system is trying to make two different calendar providers behave like one coherent event bus. This is inherently fragile.
+</Warning>
+
+Critical risk areas include:
+
+<AccordionGroup>
+<Accordion title="In-Memory Cache">
+Cache invalidation issues can cause stale data to be served or synced
+</Accordion>
+
+<Accordion title="Outbound Sync Without Durable Queue">
+Listener path lacks durability guarantees for CRM-originated changes
+</Accordion>
+
+<Accordion title="Provider-Specific Edge Cases">
+- Recurring event handling differences
+- All-day event timezone interpretation
+- Deleted invitee management
+- Outlook mailbox-local event IDs
+</Accordion>
+
+<Accordion title="Race Conditions">
+Simultaneous updates from CRM and external calendars can create conflicts
+</Accordion>
+</AccordionGroup>
+
+### Durable Operations
+
+<Info>
+**Outlook shadow mapping retries are durable:** Uses `calendar_sync_outbox` with operation `outlook-shadow-reconcile` and pg-boss worker with backoff, not in-process timers.
+</Info>
+
+The `calendar_sync_outbox` table provides durable queuing for certain operations:
+- RLS-protected like other org tables
+- Handles retry logic with exponential backoff
+- Ensures operations survive service restarts
+
+## File Organization
 
 ### Core Integration Module
 
-```
-src/modules/integrations/calendar-integration/
-├── calendar-integration.module.ts
-├── calendar-integration.service.ts
-├── event-calendar-sync.service.ts
-├── calendar-webhook.service.ts
-├── calendar-webhook.controller.ts
-├── calendar-watch-renewal.handler.ts
-└── microsoft-graph-webhook-validation.util.ts
-```
+<CardGroup cols={2}>
+<Card title="Main Service" href="#main-service">
+`calendar-integration.service.ts` - Core integration logic
+</Card>
+<Card title="Sync Service" href="#sync-service">
+`event-calendar-sync.service.ts` - Bidirectional sync handling
+</Card>
+<Card title="Webhook Service" href="#webhook-service">
+`calendar-webhook.service.ts` - Inbound webhook processing
+</Card>
+<Card title="Watch Renewal" href="#watch-renewal">
+`calendar-watch-renewal.handler.ts` - Subscription maintenance
+</Card>
+</CardGroup>
 
 ### Provider Drivers
 
-```
-src/modules/integrations/calendar-integration/drivers/
-├── calendar-driver.interface.ts
-├── calendar-driver.registry.ts
-├── google-calendar.driver.ts
-└── outlook-calendar.driver.ts
-```
+<CardGroup cols={2}>
+<Card title="Driver Interface" href="#driver-interface">
+`calendar-driver.interface.ts` - Common provider interface
+</Card>
+<Card title="Google Driver" href="#google-driver">
+`google-calendar.driver.ts` - Google Calendar API integration
+</Card>
+<Card title="Outlook Driver" href="#outlook-driver">
+`outlook-calendar.driver.ts` - Microsoft Graph integration  
+</Card>
+<Card title="Driver Registry" href="#driver-registry">
+`calendar-driver.registry.ts` - Provider resolution
+</Card>
+</CardGroup>
 
-### OAuth Controllers
-
-```
-src/modules/integrations/oauth/
-├── calendar-oauth-flow.service.ts
-├── google-calendar-oauth.controller.ts
-└── outlook-calendar-oauth.controller.ts
-```
-
-### CRM Calendar Services
-
-```
-src/modules/crm/calendar/
-├── calendar.service.ts
-├── calendar-agenda.constants.ts
-├── calendar-agenda-cursor.util.ts
-├── calendar-timeline.constants.ts
-├── calendar-timeline.util.ts
-├── calendar-timeline-cursor.util.ts
-├── calendar-cache.service.ts
-└── calendar.dto.ts
-```
-
-### Event Management
-
-```
-src/modules/crm/event/
-├── event.service.ts
-├── event-notification-recipients.util.ts
-├── event-change-detection.util.ts
-└── calendar-sync.constants.ts
-```
-
-## Database Migrations
-
-<Warning>
-`migrations/.snapshot-neondb.json` is the baseline for `npx mikro-orm migration:check` / `migration:create`. If `migration:check` reports a large diff unrelated to your change, the snapshot has drifted from the entity metadata.
-</Warning>
-
-Key migrations include:
-
-- `Migration20260422100000_AddCalendarIntegration.ts` - Initial calendar integration tables
-- `Migration20260427140000_OutlookCalendarProviderAndSchema.ts` - Outlook support
-- `Migration20260428140000_CalendarSyncOutbox.ts` - Durable sync outbox
-- `Migration20260428180000_EnableCalendarSyncOutboxRls.ts` - Row level security
-- `Migration20260428200000_CalendarIntegrationSyncHealthColumns.ts` - Health monitoring
-
-## Known Risks & Considerations
+### Database Migrations
 
 <Tip>
-The code has several good guardrails, but some areas are still production-dangerous.
+MikroORM snapshot hygiene is critical. If `migration:check` reports large diffs unrelated to your changes, refresh the snapshot using the standard process.
 </Tip>
 
-### High-Risk Areas
-
-- **In-memory cache** - Can lead to inconsistencies
-- **CRM-originated outbound sync without durable queue** - Listener path vulnerability
-- **Provider-specific edge cases** around:
-  - Recurring events
-  - All-day events
-  - Deleted invitees
-  - Outlook mailbox-local event IDs
-
-### Outlook Shadow Mapping
-
-<Check>
-Outlook shadow mapping retries are durable: `calendar_sync_outbox` operation `outlook-shadow-reconcile` + pg-boss execute worker (with backoff), not in-process timers.
-</Check>
-
-## Constants & Configuration
-
-All calendar-related constants are centralized in dedicated files:
-
-- `src/common/constants/event-calendar-sync.constants.ts` - Timeouts, backoff, HTTP status aliases
-- `src/modules/crm/calendar/calendar-agenda.constants.ts` - Agenda forward-window expansion
-- `src/modules/crm/calendar/calendar-timeline.constants.ts` - Timeline pagination settings
-- `src/modules/crm/event/calendar-sync.constants.ts` - Event sync configuration
-
-<Note>
-No magic numbers should appear in `event-calendar-sync.service.ts` - all values should be imported from constants files.
-</Note>
+Key migrations include:
+- `Migration20260422100000_AddCalendarIntegration.ts` - Initial schema
+- `Migration20260427140000_OutlookCalendarProviderAndSchema.ts` - Outlook support
+- `Migration20260428140000_CalendarSyncOutbox.ts` - Durable queue
+- `Migration20260428180000_EnableCalendarSyncOutboxRls.ts` - RLS protection

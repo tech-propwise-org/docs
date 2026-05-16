@@ -74,6 +74,7 @@ enum ResourceType {
   EVENT = "EVENT",
   CHANNEL_ACCOUNT = "CHANNEL_ACCOUNT",
   CONVERSATION = "CONVERSATION",
+  IMPORT_JOB = "IMPORT_JOB",
 }
 ```
 
@@ -83,82 +84,27 @@ enum ResourceType {
 enum ResourceAction {
   ACCESS = "ACCESS", // Can view
   MODIFY = "MODIFY", // Can update
-  DELETE = "DELETE", // Can delete
 }
 ```
 
-### Messaging resources and permissions
+**Import Job Access Control:**
 
-**Messaging Resources:**
-- `CHANNEL_ACCOUNT` - Channel accounts (WhatsApp, Instagram, Messenger)
-- `CONVERSATION` - Individual messaging conversations with contacts
-
-**Messaging Permissions:**
-- `messaging.view` - View conversations and messages
-- `messaging.write` - Send messages, update conversations, and basic conversation operations
-- `messaging.manage` - Full conversation management including assignment and transfer, channel account management
-- `messaging.admin` - Channel account setup and template management
-
-### Channel account access control
-
-Channel account resource checks use ownership-based logic:
-
-- **Personal accounts** (`level = PERSONAL`): The account owner can ACCESS, MODIFY, and DELETE their own accounts without needing `messaging.manage` permission.
-- **Organization accounts** (`level = ORGANIZATION`): No resource-level access — requires `messaging.manage` permission via RBAC.
-
-The delete endpoint and sync controller both use **OR mode**: users with `messaging.manage` can operate on any account, OR personal account owners can operate on their own accounts.
+Import jobs are tenant-scoped resources created by `POST /leads/import/jobs` and `POST /contacts/import/jobs`. The generic read endpoints use OR-mode `@CheckAccess`:
 
 ```typescript
-// Delete account — OR mode: messaging.manage OR personal account owner
-@Delete(':id')
 @CheckAccess({
-  permissions: [OrgPermissionKey.MESSAGING_MANAGE],
-  resource: { type: ResourceType.CHANNEL_ACCOUNT, action: ResourceAction.DELETE },
-})
-async delete(@Param('id') id: string) {}
-
-// Sync controller — OR mode: messaging.manage OR personal account owner
-@Controller('messaging/sync/:channelAccountId')
-@CheckAccess({
-  permissions: [OrgPermissionKey.MESSAGING_MANAGE],
-  resource: { type: ResourceType.CHANNEL_ACCOUNT, action: ResourceAction.ACCESS, paramName: 'channelAccountId' },
+  permissions: [OrgPermissionKey.SYSTEM_ADMIN],
+  resource: { type: ResourceType.IMPORT_JOB, action: ResourceAction.ACCESS, paramName: 'id' },
 })
 ```
 
-### Conversation access control
+`system.admin` can inspect any import job in the current organization through the permission branch. Users without `system.admin` must pass the resource branch, which allows `ACCESS` only when `import_job.created_by_id` matches the requesting user.
 
-Conversation access follows a multi-tier system:
+Import workers must not trust persisted request snapshots. `ImportJobQueueHandler` resolves the actor from `import_job.options.requestUserId` (falling back to legacy `options.requestUser.id` or `created_by_id`), then `ImportJobService.loadCurrentRequestUserForProcessing()` rebuilds the current `RequestUser` from active organization membership and live RBAC data before row processing. If the user was removed from the organization, deactivated, or no longer has permission required by the queued operation, the job is marked failed and no rows are processed.
 
-- **Tier 1a (Broad permissions)**: Users with any org messaging permission (`MESSAGING_VIEW`, `MESSAGING_WRITE`, or `MESSAGING_MANAGE`) can access all org conversations
-- **Tier 1b (Reply permissions)**: Only agents with `canReply=true` assignments may send messages, react to messages, or toggle AI mode
-- **Tier 2 (Personal account ownership)**: Users who own the personal channel account
-- **Tier 3 (Assignment-based)**: Users with active (non-deleted) assignments
-- **Tier 3b (Team membership)**: Users who are members of a team that has an active assignment on the conversation
-- **Tier 4 (CRM stakeholder)**: Users who are stakeholders on linked leads/deals
-- **Tier 5 (Team leader scope)**: Team leaders can only assign and remove assignments within their own team scope
+Contact import is permission-gated twice: `POST /contacts/import/jobs` requires `crm.manage` at enqueue time, and the worker re-checks current `crm.manage` before executing the job. Lead import remains available to authenticated CRM users, but all finance, assignment, and duplicate-update decisions are evaluated from the freshly loaded `RequestUser` at row-processing time.
 
-All conversation-scoped endpoints use `@CheckAccess` with `ResourceType.CONVERSATION` and `ResourceAction.ACCESS`. In **OR mode** (default), users with any org messaging permission bypass the resource check; users without org permissions fall through to the resource check, which uses a single SQL query testing all 5 access paths (personal owner, direct assignment, team assignment, lead stakeholder, deal stakeholder). This eliminates the need for manual `assertConversationAccess` calls in controller methods.
-
-Message search (`GET /messaging/messages/search`) requires `conversationId` as a mandatory query parameter and uses `@CheckAccess` with `ResourceType.CONVERSATION` to enforce access at the guard level.
-
-### Task calendar assignee filtering
-
-The system includes specialized permissions for filtering task calendars by assignee user:
-
-**Policy:** Users may filter task calendars by assignee (`GET /tasks/calendar?userId=`) under these conditions:
-
-- **Self**: Always allowed when `userId` matches the viewer
-- **Org-wide managers**: `system.admin` / `system.owner` / `crm.manage` can filter by any active org member
-- **Team administrators**: `team.admin` can filter by members of their managed teams
-- **Otherwise**: 403 Forbidden
-
-This policy is enforced by `AccessService.canViewerFilterTasksByAssigneeUserInTransaction()` and bulk-resolved via `listTaskCalendarFilterTargetUserIdsInTransaction()`.
-
-### Event access control
-
-**Resource Type:** `EVENT`
-
-**Access Model:** Events use a creator-based access pattern where only the event creator can view and modify their events by default.
+Lead import duplicate updates are authorized at row-processing time rather than by blocking the job creation endpoint. When a lead import row matches an existing lead and requests `duplicateAction=update`, `LeadImportService` applies the same lead `MODIFY` policy used by normal lead updates: org `crm.manage` bypasses, otherwise the importer needs direct `WRITE`/`FULL` stakeholder access.
 
 ## Implementation structure
 
@@ -200,7 +146,7 @@ The `@CheckAccess` decorator combines permission and resource checks:
   permissions: string[],           // RBAC permissions (any match = pass)
   resource?: {
     type: ResourceType,            // Entity type
-    action: ResourceAction,        // ACCESS, MODIFY, DELETE
+    action: ResourceAction,        // ACCESS, MODIFY
     paramName?: string,            // Route param name (default: 'id')
   },
   mode?: AccessMode,               // OR (default) or AND
@@ -242,13 +188,6 @@ async findOne(@Param('id') id: string) {}
   resource: { type: ResourceType.LEAD, action: ResourceAction.MODIFY },
 })
 async update(@Param('id') id: string, @Body() dto: UpdateLeadDto) {}
-
-@Delete(':id')
-@CheckAccess({
-  permissions: ['crm.manage'],
-  resource: { type: ResourceType.LEAD, action: ResourceAction.DELETE },
-})
-async remove(@Param('id') id: string) {}
 ```
 
 </Tab>
@@ -537,7 +476,6 @@ Different entity types have different access patterns based on their stakeholder
 **Stakeholder-based access:**
 - `ACCESS`: Can view lead if user is stakeholder with any access level
 - `MODIFY`: Can update lead if user is stakeholder with `MODIFY` access level
-- `DELETE`: Can delete lead if user is stakeholder with `MODIFY` access level
 
 **Team pool logic:** Leads assigned to teams (team-only stakeholder) are accessible to all team members for claiming.
 </Tab>
@@ -548,7 +486,6 @@ Different entity types have different access patterns based on their stakeholder
 **Stakeholder-based access:**
 - `ACCESS`: Can view deal if user is stakeholder with any access level
 - `MODIFY`: Can update deal if user is stakeholder with `MODIFY` access level  
-- `DELETE`: Can delete deal if user is stakeholder with `MODIFY` access level
 
 **Same patterns as leads** but uses sales permissions (`SALES_MANAGE`, `TEAM_SALES_MANAGE`).
 </Tab>
@@ -559,7 +496,6 @@ Different entity types have different access patterns based on their stakeholder
 **Stakeholder-based access:**
 - `ACCESS`: Can view contact if user is stakeholder
 - `MODIFY`: Can update contact if user is stakeholder with modify permissions
-- `DELETE`: Can delete contact if user is stakeholder with modify permissions
 
 **Organization-wide visibility:** Some contacts may have broader access patterns depending on business requirements.
 </Tab>
@@ -569,7 +505,7 @@ Different entity types have different access patterns based on their stakeholder
 
 **Stakeholder-based access follows same pattern:**
 - Users can access entities they're stakeholders on
-- Modify/delete requires appropriate access levels
+- Modify requires appropriate access levels
 - Org admins have blanket access via permissions
 
 **Relationship access:** Access may be inherited through relationships (e.g., access to company grants access to associated contacts).
@@ -581,20 +517,18 @@ Different entity types have different access patterns based on their stakeholder
 **Creator-based access:**
 - `ACCESS`: Can view task/event if user is the creator or assignee
 - `MODIFY`: Can update task/event if user is the creator or has appropriate permissions
-- `DELETE`: Can delete task/event if user is the creator or has admin permissions
 
 **Calendar filtering:** Tasks support specialized permissions for assignee-based filtering.
 </Tab>
 
-<Tab title="Conversations">
-**Resource Type:** `ResourceType.CONVERSATION`
+<Tab title="Import Jobs">
+**Resource Type:** `ResourceType.IMPORT_JOB`
 
-**Messaging-specific access:**
-- `ACCESS`: Can view conversation if user is stakeholder or has messaging permissions
-- `MODIFY`: Can manage conversation if user has modify access or messaging.manage
-- `DELETE`: Can delete conversation if user has appropriate messaging permissions
+**Creator-based access:**
+- `ACCESS`: Can view import job if user created it or has system.admin permission
+- `MODIFY`: Can update import job if user created it or has system.admin permission
 
-**Channel-based rules:** Access patterns may vary based on communication channel type.
+**Permission gating:** Import jobs use permission + resource OR mode for read endpoints.
 </Tab>
 </Tabs>
 
@@ -1060,40 +994,40 @@ if (lead.permissions.canEdit) {
 
 ### Adding @CheckAccess to a new endpoint
 
-<AccordionGroup>
-<Accordion title="Step 1: Determine access pattern">
-- [ ] **List/create endpoint?** → Use permission-only check
-- [ ] **Single resource endpoint?** → Use permission OR resource check
-- [ ] **Bulk operation?** → Use bulk resource check
-- [ ] **Administrative function?** → Use permission-only check
-- [ ] **Team-scoped?** → Add teamCheck configuration
-</Accordion>
+<Steps>
+<Step title="Determine access pattern">
+- **List/create endpoint?** → Use permission-only check
+- **Single resource endpoint?** → Use permission OR resource check
+- **Bulk operation?** → Use bulk resource check
+- **Administrative function?** → Use permission-only check
+- **Team-scoped?** → Add teamCheck configuration
+</Step>
 
-<Accordion title="Step 2: Choose permissions">
-- [ ] Identify relevant org permissions (e.g., `CRM_MANAGE`, `SALES_VIEW`)
-- [ ] Include team permissions if applicable (e.g., `TEAM_CRM_MANAGE`)
-- [ ] Consider read vs write vs admin permission levels
-</Accordion>
+<Step title="Choose permissions">
+- Identify relevant org permissions (e.g., `CRM_MANAGE`, `SALES_VIEW`)
+- Include team permissions if applicable (e.g., `TEAM_CRM_MANAGE`)
+- Consider read vs write vs admin permission levels
+</Step>
 
-<Accordion title="Step 3: Configure resource check">
-- [ ] Determine resource type (`LEAD`, `DEAL`, `CONVERSATION`, etc.)
-- [ ] Choose action (`ACCESS`, `MODIFY`, `DELETE`)
-- [ ] Set correct paramName if not `:id`
-- [ ] Choose access mode (`OR` default, `AND` for sensitive operations)
-</Accordion>
+<Step title="Configure resource check">
+- Determine resource type (`LEAD`, `DEAL`, `CONVERSATION`, etc.)
+- Choose action (`ACCESS`, `MODIFY`)
+- Set correct paramName if not `:id`
+- Choose access mode (`OR` default, `AND` for sensitive operations)
+</Step>
 
-<Accordion title="Step 4: Test access scenarios">
-- [ ] Test with org admin (should have access via permissions)
-- [ ] Test with team manager (should have access via team permissions)
-- [ ] Test with stakeholder (should have access via resource check)
-- [ ] Test with unauthorized user (should get 403)
-</Accordion>
-</AccordionGroup>
+<Step title="Test access scenarios">
+- Test with org admin (should have access via permissions)
+- Test with team manager (should have access via team permissions)
+- Test with stakeholder (should have access via resource check)
+- Test with unauthorized user (should get 403)
+</Step>
+</Steps>
 
 ### Adding response permissions to a new entity
 
-<AccordionGroup>
-<Accordion title="Step 1: Create permission DTO">
+<Steps>
+<Step title="Create permission DTO">
 ```typescript
 interface EntityPermissionsDto {
   canView: boolean;
@@ -1102,9 +1036,9 @@ interface EntityPermissionsDto {
   // Add entity-specific permissions
 }
 ```
-</Accordion>
+</Step>
 
-<Accordion title="Step 2: Update entity DTOs">
+<Step title="Update entity DTOs">
 ```typescript
 interface EntityListItemDto {
   id: string;
@@ -1116,9 +1050,9 @@ interface EntityDetailDto extends EntityListItemDto {
   // ... additional detail fields
 }
 ```
-</Accordion>
+</Step>
 
-<Accordion title="Step 3: Implement computation service">
+<Step title="Implement computation service">
 ```typescript
 // Add methods to PermissionComputeService
 async computeEntityPermissions(entity: Entity, user: User): Promise<EntityPermissionsDto> {
@@ -1129,9 +1063,9 @@ async computeBulkEntityPermissions(entities: Entity[], user: User): Promise<Map<
   // Implement bulk computation
 }
 ```
-</Accordion>
+</Step>
 
-<Accordion title="Step 4: Integrate into service">
+<Step title="Integrate into service">
 ```typescript
 // Update service methods to compute and attach permissions
 async findById(id: string, user: User): Promise<EntityDetailDto> {
@@ -1140,8 +1074,8 @@ async findById(id: string, user: User): Promise<EntityDetailDto> {
   return { ...this.mapToDetailDto(entity), permissions };
 }
 ```
-</Accordion>
-</AccordionGroup>
+</Step>
+</Steps>
 
 ## Related documentation
 
