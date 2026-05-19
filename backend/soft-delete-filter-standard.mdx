@@ -1,40 +1,43 @@
 ---
-title: "Soft Delete Filter Standard"
-description: "Mandatory project-wide standard for preventing silent data loss with MikroORM's filter system and soft-deletable entities"
+title: "Soft-Delete Filter Standard"
+description: "Project-wide mandatory standard for handling soft-delete filters with MikroORM to prevent silent data loss"
 ---
 
 <Warning>
 **Status:** Project-wide standard — MANDATORY for all entities, services, and DTOs
+
+This document is the authoritative reference for the soft-delete / archive filter pattern. See `QUERY_OPTIMIZATION_PATTERNS.md` §5.5 for MikroORM internals.
 </Warning>
 
-This project uses **MikroORM v6** with `loadStrategy: JOINED`, `autoJoinRefsForFilters: true`, and `filtersOnRelations: true`. Combined with our `isDeleted` and `active` entity filters, this produces a **silent data-loss bug** if entities are not declared correctly.
+## TL;DR — What every backend dev needs to know
+
+This project uses **MikroORM v6** with `loadStrategy: JOINED`, `autoJoinRefsForFilters: true`, and `filtersOnRelations: true`. Combined with our `isDeleted` and `active` entity filters, this produces a **silent data-loss bug** if entities are not declared correctly:
 
 <Note>
-**The Core Problem:** A row whose own `is_deleted = false` will silently disappear from every query if any of its non-nullable owner relations points at a soft-deleted target.
+A row whose own `is_deleted = false` will silently disappear from every query if any of its non-nullable owner relations points at a soft-deleted target.
 </Note>
 
-## Quick Reference
+The fix is **structural** and lives on the entity declaration. Every new entity MUST follow it.
 
-Every backend developer must follow these rules:
+### Quick Reference Table
 
 | What | Rule |
-| --- | --- |
-| Non-nullable `@ManyToOne` / `@OneToOne(owner)` to an entity with `@Filter({ name: 'isDeleted', ... })` | Add `{ filters: { isDeleted: false } }` to the relation options |
+|------|------|
+| Non-nullable `@ManyToOne` / `@OneToOne(owner)` to an entity that declares `@Filter({ name: 'isDeleted', ... })` | Add `{ filters: { isDeleted: false } }` to the relation options |
 | `@Filter({ name: 'active', ... })` on a soft-deletable + archivable entity | `cond` MUST be `{ isArchived: false }` only — NEVER `{ isDeleted: false, isArchived: false }` |
-| Bulk re-point inside a merge service (`em.nativeUpdate(...)`) | Pass `{ filters: false }` so the re-point hits archived AND soft-deleted children |
-| `{ filters: false }` anywhere else | Allowed only in explicit-business-intent categories (merge/restore/conflict-detection/audit-timeline/notification/admin/seed) |
-| User reference on a new entity | Classify per audit ref (Tier 1) vs business owner (Tier 2/3) rules |
-| DTO with a Tier-3 owner relation | If `populated.isDeleted === true` → use placeholder/omit/4xx strategies |
+| Bulk re-point inside a merge service (`em.nativeUpdate(...)` that re-points children of an entity that is about to be soft-deleted) | Pass `{ filters: false }` so the re-point hits archived AND soft-deleted children |
+| `{ filters: false }` anywhere else | Allowed only in the explicit-business-intent categories in §2.3. Every call site MUST have a code comment naming the category |
+| User reference on a new entity | Classify per §3.1.1 — `createdBy`/`updatedBy`/`archivedBy`/etc. are Tier 1 (audit ref); `assignedTo`/`owner`/`recipient`/`user` are Tier 2 or 3 |
+| DTO with a Tier-3 owner relation (`person`, `organization`) | If `populated.isDeleted === true` → DTO MUST use placeholder / omit / 4xx (Strategies A / B / C in §3.3.1) |
+| New entity with non-nullable owners | Update audit table + extend `DataIntegrityAuditService` + add mandatory tests |
 
 <Warning>
-If you skip any of these rules, the regression will not show up in unit tests — it surfaces as "this row exists in the DB but the API returns nothing" weeks later.
+If you skip any of these, the regression will not show up in unit tests — it surfaces as "this row exists in the DB but the API returns nothing" weeks later.
 </Warning>
 
-## Why Rows Silently Disappear
+## 1. Cause — Why rows silently disappear
 
-### MikroORM v6 Behavior
-
-MikroORM v6 has three defaults that interact badly with soft-deletable graphs:
+MikroORM v6 (`@mikro-orm/core@6.6.7`) has three defaults that interact badly with soft-deletable graphs:
 
 ```typescript
 // mikro-orm.config.ts (defaults — NOT to be disabled globally)
@@ -43,11 +46,20 @@ autoJoinRefsForFilters: true;            // auto-add :ref JOIN for any relation 
 filtersOnRelations: true;                // apply target-entity filters via JOIN ON
 ```
 
-For every non-nullable M:1 / 1:1-owner relation, MikroORM adds an auto `:ref` JOIN to apply the target entity's filters, even if you didn't populate the relation.
+For every M:1 / 1:1-owner relation on the queried entity, MikroORM checks whether the target entity declares any default-enabled filters (e.g. `@Filter({ name: 'isDeleted', default: true, cond: { isDeleted: false } })`). If so, it adds an auto `:ref` JOIN to that relation **even if you did not populate it**, so the filter can be applied as a JOIN `ON` condition.
 
-### The Failure Mode
+For a **non-nullable** M:1 the resulting JOIN type is `INNER JOIN`:
 
-A simple query like `em.find(Lead, { id: leadId })` becomes:
+```typescript
+const mandatoryToOneProperty =
+  [ReferenceKind.MANY_TO_ONE, ReferenceKind.ONE_TO_ONE].includes(prop.kind) && !prop.nullable;
+const joinType =
+  (hint.filter && !prop.nullable) || mandatoryToOneProperty ? INNER_JOIN : LEFT_JOIN;
+```
+
+### The failure mode
+
+`em.find(Lead, { id: leadId })` becomes:
 
 ```sql
 SELECT lead.*
@@ -58,26 +70,30 @@ SELECT lead.*
    AND lead.is_deleted = false;
 ```
 
-<Warning>
-If **any** of those non-nullable joined targets fails the filter (e.g. `Person.isDeleted = true`), the **lead row is silently dropped** — even though `lead.is_deleted = false`.
-</Warning>
+If **any** of those non-nullable joined targets fails the filter (e.g. `Person.isDeleted = true` because the lead's person was merged into another person), the **lead row is silently dropped** — even though `lead.is_deleted = false`.
 
-### Real Production Examples
+<Info>
+For nullable relations the JOIN is `LEFT JOIN` and the relation hydrates to `null` instead of dropping the row.
+</Info>
+
+### Real production examples
 
 | Scenario | Symptom |
-| --- | --- |
-| Two persons merged → secondary `Person.isDeleted = true` | The archived Lead pointing at the secondary Person became invisible |
-| `DealStage` cleanup → custom stage soft-deleted | The Deal vanished from list endpoints |
-| Agent leaves org → `User.isDeleted = true` | Every Deal/Contact they `createdBy` would vanish |
+|----------|---------|
+| Two persons merged → secondary `Person.isDeleted = true` → an archived Lead still pointing at the secondary Person | The archived Lead was invisible everywhere even though it existed in the DB |
+| `DealStage` cleanup → custom stage soft-deleted while a Deal still pointed at it | The Deal vanished from list endpoints |
+| Agent leaves the org → `User.isDeleted = true` → every Deal / Contact / Company / Listing they `createdBy` would have vanished if we shipped the relation override blindly without the Tier-1 carve-out |
 
-## The Three-Part Fix
+## 2. The fix — Three coordinated parts
 
-<Steps>
-<Step title="Per-relation filter override (MANDATORY)">
+The fix has **three** parts. Skipping any one of them re-introduces the bug.
+
+### 2.1 Per-relation `{ filters: { isDeleted: false } }` override (MANDATORY structural)
 
 Declare `{ filters: { isDeleted: false } }` on **every non-nullable** `@ManyToOne` / `@OneToOne(owner)` whose target entity has an `isDeleted` filter:
 
-```typescript
+<CodeGroup>
+```typescript Correct Implementation
 // ✅ CORRECT — surgical, structural, zero side effects on standalone queries
 @ManyToOne(() => Person, { filters: { isDeleted: false } })
 person!: Person;
@@ -89,143 +105,158 @@ organization!: Organization;
 createdBy!: User;
 ```
 
-<Info>
-This disables the target's `isDeleted` filter **only** for the auto-`:ref` JOIN MikroORM adds for this relation. Standalone queries still apply the target's `isDeleted` filter.
-</Info>
+```typescript Incorrect Implementation
+// ❌ WRONG — missing filter override
+@ManyToOne(() => Person)
+person!: Person;
 
-**Side effect:** When you explicitly populate this relation (`populate: ['person']`), a soft-deleted populated row will hydrate fully instead of being filtered out. Each Tier-2/Tier-3 relation MUST add a DTO warn-log.
-</Step>
+@ManyToOne(() => Organization)
+organization!: Organization;
+```
+</CodeGroup>
 
-<Step title="Active filter cleanup (MANDATORY)">
+This disables the target's `isDeleted` filter **only** for the auto-`:ref` JOIN MikroORM adds for this relation. Standalone `em.find(Person, ...)` / `em.findOne(Organization, ...)` queries still apply the target's `isDeleted` filter — the override is local to this relation site.
+
+<Warning>
+**Side effect to be aware of:** when you explicitly populate this relation (`populate: ['person']`), the populate JOIN ALSO loses the target's `isDeleted` filter. A soft-deleted populated row will hydrate fully instead of being filtered out. This is acceptable but each Tier-2/Tier-3 relation MUST add a DTO warn-log.
+</Warning>
+
+### 2.2 `active` filter cleanup (MANDATORY for archivable entities)
 
 Every archivable entity should have **two** entity-level filters:
 
-```typescript
+<CodeGroup>
+```typescript Correct Filter Setup
 @Entity()
 @Filter({ name: 'isDeleted', default: true, cond: { isDeleted: false } })
 @Filter({ name: 'active', default: true, cond: { isArchived: false } })  // ← NOT { isDeleted: false, isArchived: false }
 export class Lead { ... }
 ```
 
-<Warning>
-The `active` filter MUST omit `isDeleted` because the standalone `isDeleted` filter already handles soft-delete exclusion.
-</Warning>
+```typescript Incorrect Filter Setup
+@Entity()
+@Filter({ name: 'isDeleted', default: true, cond: { isDeleted: false } })
+@Filter({ name: 'active', default: true, cond: { isDeleted: false, isArchived: false } })  // ❌ WRONG — redundant isDeleted
+export class Lead { ... }
+```
+</CodeGroup>
 
-**Filter Usage Invariants:**
-- Never disable `isDeleted` while keeping `active` — that would return soft-deleted records
-- To include archived rows, use `{ filters: { active: false } }`
-- To include soft-deleted rows, use `{ filters: { isDeleted: false } }`
-- To include both, use `{ filters: false }` (only in specific business intent categories)
-</Step>
-
-<Step title="Restrict filters: false usage">
-
-`{ filters: false }` disables BOTH `isDeleted` and `active` filters. Use only when the code path **explicitly intends** to read soft-deleted or archived rows.
+Both filters default to `true`, so all standard queries apply `isDeleted = false AND isArchived = false`. The `active` filter MUST omit `isDeleted` because the standalone `isDeleted` filter already handles soft-delete exclusion.
 
 <Note>
-**Every call site MUST have a code comment naming the category.**
+**INVARIANTS** (already documented inline on every fixed entity):
+
+- Never disable `isDeleted` while keeping `active` — that would return soft-deleted records
+- To include archived rows, use `{ filters: { active: false } }`
+- To include soft-deleted rows, use `{ filters: { isDeleted: false } }` (rare — typically only in repair scripts and merge code)
+- To include both, use `{ filters: false }` (only valid in merge / cascade / RLS-bypass paths)
 </Note>
-</Step>
-</Steps>
 
-## When `filters: false` Is Legitimate
+### 2.3 `filters: false` is reserved for explicit business intent (MANDATORY framing)
 
-<AccordionGroup>
-<Accordion title="Merge / repair / cascade">
-Re-pointing or cascading children of a row about to be soft-deleted.
+`{ filters: false }` disables BOTH `isDeleted` and `active` filters at once. It is **never** a workaround for the `autoJoinRefsForFilters` symptom from §1 — the per-relation override in §2.1 is the structural fix for that.
 
-**Example:** `PersonService.mergePersons`, `ContactService.mergeContacts`
+#### When `{ filters: false }` IS legitimate
 
-```typescript
-// ✅ CORRECT — merge: re-point archived AND soft-deleted children
+A request handler / service / job may use `{ filters: false }` if and only if it falls into one of these categories. **Every call site MUST have a code comment naming the category.**
+
+| Category | When to use | Canonical example |
+|----------|-------------|-------------------|
+| **Merge / repair / cascade** | Re-pointing or cascading children of a row about to be soft-deleted, so archived/soft-deleted children get re-pointed too | `PersonService.mergePersons`, `ContactService.mergeContacts` |
+| **Restore / unarchive / revive** | Resolver / endpoint that must find a soft-archived row to bring it back | `ContactService` archive resolver, `unarchive*` endpoints |
+| **Conflict detection on re-create** | Looking up a soft-deleted row by unique key to prevent constraint violation | `TeamMembershipService.create*` |
+| **Audit / timeline / history rendering** | Fetching deleted stages / users / rules so historical entries render correctly | `audit-timeline.resolver.ts`, `escalation-timeline.resolver.ts` |
+| **Notification fan-out across deleted/archived parents** | Loading archived deals/leads so their creators are still notified | `ContactService.removeStakeholder*` |
+| **Admin / system-admin maintenance** | System-admin tools that intentionally surface soft-deleted records | `system-admin.service.ts` |
+| **Seed / migration / fixture / repair scripts** | Seeders, migrations, repair CLI scripts | `CrmFakerSeeder`, `UserSeeder`, `repair-orphaned-lead-persons.ts` |
+
+#### Canonical merge example
+
+<CodeGroup>
+```typescript Correct Merge Implementation
+// ✅ CORRECT — merge: re-point archived AND soft-deleted children before soft-deleting secondary.
+//    `filters: false` is required so the re-point hits archived/soft-deleted leads too;
+//    without it those rows would become orphans pointing at a soft-deleted Person and would
+//    silently disappear the next time something queries them.
 await em.nativeUpdate(
   'Lead',
   { person: { $in: uniqueSecondaryIds } },
   { person: primaryPersonId },
-  { filters: false }, // Required so re-point hits archived/soft-deleted leads
+  { filters: false }, // merge: re-point all children including archived/soft-deleted
 );
 
 secondary.isDeleted = true;
 ```
-</Accordion>
 
-<Accordion title="Restore / unarchive / revive">
-Resolver/endpoint that must find a soft-archived row to bring it back.
-
-**Example:** `ContactService` archive resolver, `unarchive*` endpoints
-</Accordion>
-
-<Accordion title="Conflict detection on re-create">
-Looking up a soft-deleted row by unique key to prevent constraint violation.
-
-**Example:** `TeamMembershipService.create*` (find soft-deleted membership before re-add)
-</Accordion>
-
-<Accordion title="Audit / timeline / history rendering">
-Fetching deleted stages/users/rules so historical entries render correctly.
-
-**Example:** `audit-timeline.resolver.ts`, `escalation-timeline.resolver.ts`
-</Accordion>
-
-<Accordion title="Notification fan-out across deleted/archived parents">
-Loading archived deals/leads so their creators are still notified.
-
-**Example:** `ContactService.removeStakeholder*`, `CompanyService` notification fan-out
-</Accordion>
-
-<Accordion title="Admin / system-admin maintenance">
-System-admin tools that intentionally surface soft-deleted records.
-
-**Example:** `system-admin.service.ts`
-</Accordion>
-
-<Accordion title="Seed / migration / fixture / repair scripts">
-Seeders, migrations, repair CLI scripts.
-
-**Example:** `CrmFakerSeeder`, `UserSeeder`, `repair-orphaned-lead-persons.ts`
-</Accordion>
-</AccordionGroup>
-
-## What NOT to Use `filters: false` For
-
-<Warning>
-**Never use `filters: false` to "fix" a list endpoint** that is silently dropping rows. The right fix is the per-relation override on the entity declaration, not at the query site.
-</Warning>
-
-```typescript
-// ❌ NEVER — using `filters: false` to "fix" a list endpoint
+```typescript Incorrect Usage
+// ❌ NEVER — using `filters: false` to "fix" a list endpoint that is silently dropping rows.
+//    The right fix is the per-relation override in §2.1 on the entity declaration, not at the
+//    query site. `filters: false` here would also leak soft-deleted populated rows to the response.
 async getLeads(...) {
   return em.find(Lead, { ... }, { filters: false });
 }
 
-// ❌ NEVER — using `filters: false` on an unauthenticated public endpoint
+// ❌ NEVER — using `filters: false` on an unauthenticated public endpoint. It bypasses BOTH
+//    the soft-delete guard AND the archive guard, and combined with `executeReadOnlyWithBypass`
+//    it bypasses RLS too. That is a data-leak vector across tenants.
 @Get('search')
 @PublicEndpoint()
 async publicSearch(...) {
   return em.find(Entity, { ... }, { filters: false });
 }
 ```
+</CodeGroup>
 
-## Alternative Approaches by Intent
+#### What to use instead, by intent
 
-<CardGroup cols={2}>
-<Card title="Active rows only (default)" icon="check">
+<AccordionGroup>
+<Accordion title="Active rows only (default behavior)">
 No options — both filters are on by default
-</Card>
+</Accordion>
 
-<Card title="Active + archived rows" icon="archive">
-`{ filters: { active: false } }` — keeps `isDeleted = false` enforced
-</Card>
+<Accordion title="Active + archived rows">
+Use `{ filters: { active: false } }` — keeps `isDeleted = false` enforced
 
-<Card title="Soft-deleted rows on specific lookup" icon="trash">
-`{ filters: { isDeleted: false } }` on the standalone query
-</Card>
+Example: Detail page that shows archived items too
+</Accordion>
 
-<Card title="Both archived AND soft-deleted" icon="warning">
-`{ filters: false }` with explicit business intent category comment
-</Card>
-</CardGroup>
+<Accordion title="Soft-deleted rows on specific lookup">
+Use `{ filters: { isDeleted: false } }` on the standalone query — be explicit about why
 
-<Info>
-For detailed query optimization patterns and MikroORM internals, see `QUERY_OPTIMIZATION_PATTERNS.md` §5.5.
-</Info>
+Example: Revive flow that needs to find soft-deleted entities
+</Accordion>
+
+<Accordion title="Both archived AND soft-deleted">
+Use `{ filters: false }` with proper categorization from the table above
+
+Example: Merge / repair / audit / notification fan-out
+</Accordion>
+</AccordionGroup>
+
+## Implementation checklist
+
+<Steps>
+<Step title="Entity Declaration">
+Add `{ filters: { isDeleted: false } }` to all non-nullable relations pointing to soft-deletable entities
+</Step>
+
+<Step title="Filter Configuration">
+Ensure `active` filter only checks `{ isArchived: false }`, not both `isDeleted` and `isArchived`
+</Step>
+
+<Step title="Service Layer">
+Review all uses of `{ filters: false }` and ensure they have proper categorization comments
+</Step>
+
+<Step title="DTO Layer">
+Add appropriate handling for Tier-2/Tier-3 relations when populated entities are soft-deleted
+</Step>
+
+<Step title="Testing">
+Add the two mandatory tests for entities with non-nullable owners (see audit requirements)
+</Step>
+</Steps>
+
+<Check>
+Following this standard prevents the "exists in DB but API returns nothing" silent data loss pattern that has affected production systems.
+</Check>

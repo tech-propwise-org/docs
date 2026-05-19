@@ -1,0 +1,331 @@
+---
+title: "Queue Module Specification v19"
+description: "Comprehensive queue module specification for PostgreSQL-based job processing with pg-boss, including worker management, job deduplication, and priority handling"
+---
+
+## Overview
+
+The Queue module provides a centralized job queue system for PropWise CRM using PostgreSQL-based job processing via the pg-boss library. This module enables asynchronous processing of background tasks such as notifications, data processing, and other long-running operations that should be decoupled from HTTP request/response cycles.
+
+The module implements a queue service abstraction that allows other modules to enqueue jobs for background processing while providing features like job retries, priorities, batching, and worker management.
+
+<Info>
+**Last Updated:** 2026-04-29  
+**Status:** Active
+</Info>
+
+## Architecture
+
+### Design Decisions
+
+The Queue module follows several key architectural principles:
+
+- **PostgreSQL-based queuing**: Uses pg-boss library for reliability and ACID compliance
+- **Interface-driven design**: Implements `IQueueService` interface for potential future queue provider swapping
+- **Global module**: Available throughout the application without explicit imports
+- **Worker abstraction**: Provides flexible worker registration with configurable options
+- **Lifecycle management**: Properly handles startup and shutdown of queue connections
+
+### Queue Provider Selection
+
+<Note>
+The module uses pg-boss as the underlying queue implementation because:
+
+- Leverages existing PostgreSQL infrastructure
+- Provides ACID guarantees for job persistence
+- Supports advanced features like job scheduling, retries, and priorities
+- No additional infrastructure dependencies
+</Note>
+
+## Core Interfaces
+
+### QueueJob
+
+Represents a job in the queue system:
+
+```typescript
+interface QueueJob<T> {
+  id: string; // Unique job identifier
+  data: T; // Job payload data
+  retryCount: number; // Current retry attempt count
+  retryLimit: number; // Maximum retry attempts allowed
+}
+```
+
+### QueueJobOptions
+
+Configuration options for job enqueueing:
+
+```typescript
+interface QueueJobOptions {
+  retryLimit?: number; // Max retry attempts (default: 3)
+  retryDelay?: number; // Delay between retries in seconds
+  retryBackoff?: boolean; // Use exponential backoff for retries
+  expireInSeconds?: number; // Job expiration time
+  singletonKey?: string; // Ensure only one job with this key exists
+  priority?: number; // Job priority (higher = more priority)
+}
+```
+
+### QueuePolicy
+
+Controls how `singletonKey` deduplication is enforced at the database level:
+
+```typescript
+type QueuePolicy =
+  | 'standard' // No dedup — singletonKey stored but no unique constraint
+  | 'short' // ≤ 1 job per singletonKey in `created` state
+  | 'singleton' // ≤ 1 job per singletonKey in `active` state
+  | 'stately' // ≤ 1 job per singletonKey in created | retry | active
+  | 'exclusive' // Same uniqueness as stately, different fetch semantics
+  | 'key_strict_fifo';
+```
+
+<Warning>
+**Critical:** The default `'standard'` policy applies **no unique index** on `singleton_key`. Any queue that uses `singletonKey` for deduplication **must** be created with `policy: 'stately'` (or `'exclusive'`), otherwise `ON CONFLICT DO NOTHING` never fires and every insert creates a new row regardless of how many pending jobs already exist for the same key.
+</Warning>
+
+### Worker Configuration
+
+<Tabs>
+  <Tab title="Single Job Workers">
+    ```typescript
+    interface WorkerOptions {
+      concurrency?: number; // Independent worker invocations (default: 1)
+      pollingIntervalSeconds?: number; // How often to poll for new jobs
+    }
+    ```
+  </Tab>
+  <Tab title="Batch Workers">
+    ```typescript
+    interface BatchWorkerOptions {
+      batchSize?: number; // Jobs per handler invocation (default: 1)
+      pollingIntervalSeconds?: number; // How often to poll for new jobs
+      policy?: QueuePolicy; // Queue policy — REQUIRED for singletonKey dedup
+    }
+    ```
+    
+    <Note>
+    `policy` is enforced by `ensureQueue` inside `registerBatchWorker`. Use `'stately'` whenever jobs are submitted with `singletonKey` and you need "at most one pending/active job per key".
+    </Note>
+  </Tab>
+</Tabs>
+
+## IQueueService Interface
+
+The core queue service contract provides the following methods:
+
+| Method | Description |
+|--------|-------------|
+| `enqueue<T>(queueName, data, options?)` | Add single job to queue |
+| `enqueueBatch<T>(queueName, data[], options?)` | Add multiple jobs to queue |
+| `registerWorker<T>(queueName, handler, options?)` | Register job processor |
+| `schedule(queueName, cron, data?)` | Register recurring cron (pg-boss `schedule`) |
+| `unschedule(queueName, key?)` | Remove recurring schedule (pg-boss `unschedule`) |
+| `start()` | Start queue processing |
+| `stop()` | Stop queue processing |
+
+## Service Implementation
+
+### PgBossQueueService
+
+The main service implementation using pg-boss:
+
+```typescript
+@Injectable()
+export class PgBossQueueService implements IQueueService, OnModuleInit, OnModuleDestroy
+```
+
+<AccordionGroup>
+  <Accordion title="Key Features">
+    - **Automatic queue creation tracking** via `createdQueues` Set
+    - **Database connection** configured via `ConfigService` from centralized `app.database.*` config
+    - **Lifecycle hooks** for proper startup/shutdown
+    - **Worker registration** with type-safe job handlers
+    - **Parallel per-job processing** via `localConcurrency`
+    - **Test-only utilities** for E2E testing scenarios
+  </Accordion>
+  
+  <Accordion title="Connection Management">
+    Database connection is configured via `ConfigService` from centralized configuration:
+    - `app.database.url` - PostgreSQL connection string
+    - `app.database.ssl` - SSL configuration
+    
+    <Note>
+    pg-boss uses the owner/superuser URL because it creates and manages queue tables.
+    </Note>
+  </Accordion>
+  
+  <Accordion title="Lifecycle Management">
+    Proper startup/shutdown handling requires `src/main.ts` to call `app.enableShutdownHooks()` so SIGTERM/SIGINT trigger `onModuleDestroy()` and allow pg-boss to stop gracefully.
+  </Accordion>
+  
+  <Accordion title="Test Utilities">
+    **Test-only `__test__offWork(queueName)`** (throws unless `NODE_ENV=test`): wraps pg-boss `offWork()`, detaching all workers subscribed to that queue so jobs remain queued without being fetched. Used by distribution E2E tests for building backlogs and verifying priority ordering.
+  </Accordion>
+</AccordionGroup>
+
+## Business Rules
+
+### Job Processing Rules
+
+<Steps>
+  <Step title="Retry Logic">
+    Jobs can be configured with retry limits and backoff strategies for handling failures gracefully.
+  </Step>
+  
+  <Step title="Job Uniqueness">
+    `singletonKey` deduplication is only enforced when the queue is created with `policy: 'stately'` (or `'exclusive'`). With the default `'standard'` policy the key is stored but no DB constraint prevents duplicate inserts.
+  </Step>
+  
+  <Step title="Priority Processing">
+    Higher priority jobs are processed first in the queue.
+  </Step>
+  
+  <Step title="Job Expiration">
+    Jobs can expire if not processed within specified time limits.
+  </Step>
+  
+  <Step title="Batch Processing">
+    Workers can process multiple jobs simultaneously with configurable batch sizes.
+  </Step>
+</Steps>
+
+### Authorization for User-Initiated Jobs
+
+<Warning>
+Queue payloads should carry stable identifiers, not trusted authorization snapshots. Workers that perform user-initiated writes must reload current organization membership and RBAC permissions before execution, then fail the domain job if the actor was removed, deactivated, or lost the permission needed for that queued operation.
+</Warning>
+
+The `import-job` worker uses this pattern for lead/contact imports to ensure security.
+
+### Queue Management
+
+1. **Queue Creation**: Queues are created automatically when first used
+2. **Worker Registration**: Each queue can have multiple workers with different configurations
+3. **Connection Management**: Single pg-boss instance per service lifetime
+4. **Signal Handling**: Application bootstrap enables Nest shutdown hooks for graceful shutdown
+
+## Integration Points
+
+### Module Dependencies
+
+<CardGroup cols={2}>
+  <Card title="Database" icon="database">
+    Requires PostgreSQL connection via `app.database.url`. pg-boss uses the owner/superuser URL for table management.
+  </Card>
+  <Card title="Configuration" icon="gear">
+    Uses NestJS `ConfigService` for connection setup from `src/config/app.config.ts`.
+  </Card>
+  <Card title="Logging" icon="file-lines">
+    Integrates with NestJS Logger for operational monitoring.
+  </Card>
+  <Card title="Lifecycle" icon="arrows-rotate">
+    Implements `OnModuleInit` and `OnModuleDestroy` for proper startup/shutdown.
+  </Card>
+</CardGroup>
+
+### Consumer Modules
+
+The queue module is designed to be consumed by:
+
+- **NotificationModule**: For sending notifications asynchronously
+- **MessagingModule**: For processing messaging workflows  
+- **AuditModule**: For background audit log processing
+- **Real Estate Module**: For data processing tasks
+
+### Global Registration
+
+<Info>
+The `QueueModule` is decorated with `@Global()` so all application modules can inject the queue service without explicitly importing `QueueModule`.
+</Info>
+
+```typescript
+@Global()
+@Module({
+  providers: [
+    PgBossQueueService,
+    {
+      provide: QUEUE_SERVICE,
+      useExisting: PgBossQueueService,
+    },
+  ],
+  exports: [QUEUE_SERVICE],
+})
+export class QueueModule {}
+```
+
+Any module can inject the queue service:
+
+```typescript
+// Any module can inject without importing QueueModule
+constructor(@Inject(QUEUE_SERVICE) private readonly queueService: IQueueService) {}
+```
+
+## Testing Strategy
+
+### E2E Queue Testing
+
+<Tip>
+`jest-e2e-queue.json` runs distribution, escalation, and misc queue E2E against a live pg-boss instance via `pnpm test:e2e:queue`.
+</Tip>
+
+The testing strategy includes:
+
+- **Isolated Testing**: Each test domain gets its own ephemeral Neon branch
+- **Queue Domain Matrix**: Distribution, escalation, and misc queue specs run independently
+- **Distribution Sharding**: Split into two file-count shards to avoid timeout issues
+- **Escalation Controls**: `ESCALATION_SKIP_PGBOSS_WORKERS=true` for controlled testing
+
+### Test Environment Configuration
+
+During queue runs, specific environment variables control worker behavior:
+
+- `ESCALATION_SKIP_PGBOSS_WORKERS=true` - Always set to skip cron dispatcher registration
+- `RUN_REAL_CRON=1` - Opt-in for escalation cron testing
+- `RUN_BATCH_TEST=1` - Enables batch processing tests
+
+### Queue Harness
+
+The `EscalationQueueHarness` provides shared abstractions for:
+- Queue flushing
+- Job dispatch
+- Awaiting completion
+- Worker management during tests
+
+<Check>
+See `Docs/ESCALATION_MODULE_SPECIFICATION.md` section 13.6 for detailed harness usage patterns.
+</Check>
+
+## Auto-Creation Pattern
+
+`PgBossQueueService` lazily creates queues on first use via a private `ensureQueue(queueName, policy?)` method. A `createdQueues` Set tracks which queues have been created in the current process lifetime so `createQueue()` is called at most once per queue name, while policy enforcement still runs whenever a caller supplies an explicit policy.
+
+<CodeGroup>
+```typescript Pattern Usage
+private async ensureQueue(queueName: string, policy?: QueuePolicy): Promise<void> {
+  if (this.createdQueues.has(queueName)) {
+    if (policy) {
+      await this.enforceQueuePolicy(queueName, policy);
+    }
+    return;
+  }
+  
+  await this.pgBoss.createQueue(queueName, { policy });
+  this.createdQueues.add(queueName);
+}
+```
+
+```typescript Worker Registration
+async registerWorker<T>(
+  queueName: string,
+  handler: (job: QueueJob<T>) => Promise<void>,
+  options?: WorkerOptions
+): Promise<void> {
+  await this.ensureQueue(queueName, options?.policy);
+  // Register worker logic...
+}
+```
+</CodeGroup>
+
+This pattern ensures queues exist before workers are registered while maintaining efficient creation tracking.
