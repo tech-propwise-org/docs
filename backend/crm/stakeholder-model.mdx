@@ -9,7 +9,7 @@ This document specifies the API endpoints and service functions for managing lea
 Last Updated: 2026-03-26 | Status: Finalized (Transfer System V2 implemented)
 </Note>
 
-## Stakeholder Sync Feature (v2 — Entity Independence)
+## Stakeholder Sync Feature (v2 — Full Bidirectional)
 
 ### Overview
 
@@ -25,7 +25,9 @@ Leads and deals **no longer share stakeholder state** after deal creation. Sourc
 6. **Deal Creation Gate**: A deal can be created from an active source lead/contact only when the requester can use that source at write level. `crm.manage` can use any active org source record; otherwise the requester needs `WRITE`/`FULL` stakeholder access directly or through a `team_crm.manage` team context. `crm.view` / `team_crm.view` are visibility-only and do not allow deal creation from that source.
 7. **Deal Stakeholder Invariant**: A deal must always have at least one stakeholder. Deal stakeholder sync rejects `stakeholders: []`; deals do not have an unassign-to-pool operation.
 8. **Transfer Permission Parity**: Lead and deal `canTransfer` response permissions follow the same actor model: the primary user stakeholder can initiate transfer, and a team manager can initiate transfer when their managed team holds the primary team-only row.
-9. **DONE Stage Auto-Transitions** (v3.5): When a deal reaches a terminal stage (CLOSED_WON or CLOSED_LOST), every lead referenced by `deal_contact.originating_lead_id` moves to the `DONE` stage (unless already terminal or archived). Conversely, reopening the deal moves those participant-originating leads back to `QUALIFIED`.
+9. **Transfer Timeline Visibility**: Lead and deal timelines include related transfer request audit events. Request, approval, rejection, and cancellation rows from `entity_transfer` are surfaced on the owning lead/deal timeline with the transfer reason or rejection reason when present.
+10. **DONE Stage Auto-Transitions** (v3.5): When a deal reaches a terminal stage (CLOSED_WON or CLOSED_LOST), every lead referenced by `deal_contact.originating_lead_id` moves to the `DONE` stage (unless already terminal or archived). Conversely, reopening the deal moves those participant-originating leads back to `QUALIFIED`.
+11. **Source-Linked Deal Contacts Are Preserved**: Deal contact management may edit role, side, side-scoped primary status, and notes. It may add/remove ordinary non-source contacts, but it must not remove or replace a contact row that carries `deal_contact.originating_lead_id`; changing source leads requires a dedicated source-change flow because stage auto-transitions and active-deal conflict checks depend on that lineage.
 
 ### How Stakeholder Updates Work
 
@@ -44,6 +46,8 @@ The sync endpoint applies all add/update/remove changes to the target entity and
 After changes are committed, no linked lead/deal entity is automatically mutated. `syncToLinkedEntity()` is retained as an internal no-op guard for older call paths, but lead/deal stakeholder mutations are intentionally independent.
 </Step>
 </Steps>
+
+Deal contact edits follow the same independence model: contact metadata edits do not mutate source leads or deal stakeholders. Source-linked contact rows are intentionally protected from generic removal/replacement so lead lineage remains stable for downstream deal lifecycle behavior.
 
 ### Deal Creation with Stakeholders
 
@@ -79,76 +83,19 @@ No source lead stakeholders are copied server-side.
 </Step>
 </Steps>
 
+**No bidirectional sync:** `syncToLinkedEntity()` is retained as an internal no-op guard for older call paths, but lead/deal stakeholder mutations are intentionally independent.
+
 ### Deal Creation with a Pending Unit Access Request
 
-When a deal is created with an `InventoryUnit` managed by another agent (`unit.unitManager.id !== currentUser.id`), `DealService.create()` defers the unit link and issues a `Pending` `UnitAccessRequest` in the same transaction.
+When a deal is created with a hidden `InventoryUnit` managed by another agent (`unit.unitManager.id !== currentUser.id` and `isUnitNumberHidden !== false`), `DealService.create()` defers the unit link and issues a `Pending` `UnitAccessRequest` in the same transaction unless the submitted deal stakeholders already include that unit manager. Public units and already-included unit managers link directly with no request-owned observer row and no automatic commission transfer.
 
 **Stakeholder-side rules:**
 
 - The deal's requested stakeholders are created exactly as in the normal path (explicit `dto.stakeholders[]` or creator-as-100%-primary). The pending-link path then adds one extra request-owned unit-manager observer row.
+- If `dto.stakeholders[]` already includes the unit manager, the deal links the inventory unit directly and keeps that stakeholder's submitted commission/access unchanged; the pending access commission-transfer mechanism is skipped.
 - The deal creator (current user) **must** end up as a primary user-stakeholder of the new deal — otherwise the access request has no requester to attribute and `DealService.create()` rejects the payload.
 - The proposed `unitManagerCommissionPercentage` must be `<=` the requesting primary stakeholder's commission. The check runs at deal-create time (so the deal never lands in a state that approval cannot service) **and** again at approval time on the **live** stakeholder row, in case stakeholders were re-synced between request and approval.
 - Request creation adds the unit manager as a request-owned `DEAL` stakeholder with `isPrimary=false`, `commissionPercentage=0`, and `accessLevel=READ`. `UnitAccessRequest.unitManagerStakeholder` points at this row. Each pending request gets its own observer row, even if the same unit manager has another pending request on the same deal for a different inventory unit. While the request is `Pending`, no user may edit, change access level, change commission, or remove this row through stakeholder management; the request must be approved, rejected, or cancelled.
-- If the inventory unit manager changes while the request is still `Pending`, the request is reassigned to the replacement manager and `unitManagerStakeholder` is rotated from the old manager's observer row to a new 0% READ observer row for the replacement manager. Approval must use that current request-owned observer row, never the previous manager's stakeholder.
-- Deal stakeholder DTOs may attach `unitAccess` metadata to the request-owned observer row. Its `unitLabel` is intentionally privacy-safe and never includes raw `InventoryUnit.unitNumber`; it uses project name, building name, or inventory unit ID fallback because stakeholder endpoints are not the authority for unit-number visibility.
-- Rejecting or cancelling the request soft-deletes the request-owned unit-manager observer row. Auto-cancellation paths do the same cleanup while preserving the `UnitAccessRequest` row for audit.
-- On approval, `UnitAccessService.approveRequest()` updates the request-owned observer row to transfer the proposed commission from the requesting primary stakeholder to the unit manager.
-
-### Commission Rules with Independence
-
-| Scenario | Commission Rule |
-| --- | --- |
-| Deal (always) | Must be exactly 100% |
-| Lead (any state) | 0% or 100% (0% = not yet configured) |
-| Entity independence | Lead and deal commission totals managed separately |
-
-### Organization Commission Split
-
-The total commission pool for a deal (value × commissionRate) is split between the **organization (agency)** and **agents** before individual agent percentages are applied.
-
-**Lazy resolution cascade (evaluated server-side at DTO construction and deal close):**
-
-```
-effectiveOrgCommission =
-    lead/deal.orgCommissionPercentage              // explicit per-entity override (user set it)
-    ?? UserOrgCommission.commissionOverride        // primary stakeholder's per-org rate (user_org_commission table)
-    ?? organization.defaultOrgCommissionPercentage  // org-wide default
-    ?? 0                                            // ultimate fallback
-```
-
-The cascade is implemented in `src/modules/crm/shared/org-commission-resolver.ts` (`resolveOrgCommission()`) and used by:
-- **Lead/Deal DTO construction** — provides `effectiveOrgCommissionPercentage` and `orgCommissionSource` on every response
-- **Deal close** — determines the actual org/agent split for commission payment creation
-
-**Key rules:**
-
-1. The `orgCommissionPercentage` on a lead/deal is an **explicit override only**. A `null` value means "inherited" — the cascade resolves lazily at read/close time.
-2. **Setting `orgCommissionPercentage` on a lead or deal requires `FINANCE_MANAGE` permission.** The lead and deal controllers strip this field from the DTO before calling the service if the user lacks `FINANCE_MANAGE`. Users without this permission can still create/edit leads and deals — they just cannot set the agency commission override.
-3. No automatic seeding occurs at creation, assignment, or pool claim. Only a user with `FINANCE_MANAGE` explicitly setting the field writes to this property.
-
-### Commission Payment Feedback System
-
-Commission payments now support recipient feedback on terminal-state payments (PAID or CANCELLED):
-
-**Feedback Rules:**
-
-- Only the payment recipient can submit feedback
-- Feedback is write-once - cannot be overwritten once submitted
-- `confirmed=true` means recipient acknowledges receipt/cancellation
-- `confirmed=false` means recipient disputes it (note required)
-- Feedback triggers notifications to managers via `CommissionFeedbackSubmittedEvent`
-
-**Payment History:**
-
-- All status transitions create immutable audit records in `CommissionPaymentHistory`
-- Records include actor, timestamp, reason, and payment method snapshots
-- History is accessible via `GET /commission-payments/:id/history`
-
-**Notification Integration:**
-
-- `CommissionNotificationHandler` processes confirm/dispute actions
-- Co-located with domain service for direct business logic access
-- Auto-discovered via `@NotificationActionHandler` decorator
 
 ## Team Commission Budget
 
@@ -215,21 +162,6 @@ Agent Y stakeholder: { commission: 30% }
 <Info>
 `originalTeamCommission` on each member's stakeholder records the team's total allocation (100% in this case), allowing the system to validate that the sum of team member commissions never exceeds the original team budget.
 </Info>
-
-### Claim from Team Pool
-
-When a team member claims a lead from the team pool, the team stakeholder is **preserved** as a budget placeholder (set to `isPrimary: false`, `commissionPercentage: 0`) rather than being deleted. This allows the team to retain its position on the entity for future budget allocation.
-
-The claiming user's stakeholder is created with `originalTeamCommission` set to the team's commission at the time of claim, enabling team budget enforcement even after subsequent reassignments.
-
-```
-BEFORE claim:
-└── Team A: { commission: 100%, isPrimary: true, originalTeamCommission: 100 }
-
-AFTER claim by Agent X (same team):
-├── Team A: { commission: 0%, isPrimary: false, originalTeamCommission: 100 }
-└── Agent X: { commission: 100%, isPrimary: true, originalTeamCommission: 100 }
-```
 
 ### Commission Aggregation with Dual Records
 
@@ -390,6 +322,36 @@ interface DealCreationService {
 | Primary guard | On removal | `CANNOT_REMOVE_PRIMARY` |
 | 1:1 active deal per lead | On deal creation | `MULTIPLE_ACTIVE_DEALS` |
 | Source write access | On deal creation | `INSUFFICIENT_SOURCE_ACCESS` |
+
+### Organization Commission Split
+
+The total commission pool for a deal (value × commissionRate) is split between the **organization (agency)** and **agents** before individual agent percentages are applied.
+
+**Lazy resolution cascade (evaluated server-side at DTO construction and deal close):**
+
+```
+effectiveOrgCommission =
+    lead/deal.orgCommissionPercentage              // explicit per-entity override (user set it)
+    ?? UserOrgCommission.commissionOverride        // primary stakeholder's per-org rate (user_org_commission table)
+    ?? organization.defaultOrgCommissionPercentage  // org-wide default
+    ?? 0                                            // ultimate fallback
+```
+
+<Note>
+Setting `orgCommissionPercentage` on a lead or deal requires `FINANCE_MANAGE` permission. Users without this permission can still create/edit leads and deals — they just cannot set the agency commission override.
+</Note>
+
+### Commission Payment Feedback System
+
+Commission payments now support recipient feedback on terminal-state payments (PAID or CANCELLED):
+
+**Feedback Rules:**
+
+- Only the payment recipient can submit feedback
+- Feedback is write-once - cannot be overwritten once submitted
+- `confirmed=true` means recipient acknowledges receipt/cancellation
+- `confirmed=false` means recipient disputes it (note required)
+- Feedback triggers notifications to managers via `CommissionFeedbackSubmittedEvent`
 
 ## Access Control
 
