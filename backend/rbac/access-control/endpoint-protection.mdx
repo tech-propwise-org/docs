@@ -32,12 +32,28 @@ This layer decides **whether a request is allowed to proceed**. It runs as a Nes
 | **Resource check**      | Stakeholder-based access to specific entity | Single-entity operations          |
 | **Bulk resource check** | Batch access check for multiple entities    | Bulk operations                   |
 
+### CRM directory visibility
+
+CRM directory endpoints (`/leads/directory`, `/deals/directory`, `/contacts/directory`, `/companies/directory`) are lightweight picker APIs. They use `AuthGuard` + `AccessGuard`, but record-level visibility is enforced inside each service query instead of route-level `@CheckAccess`, because directories must return a filtered page rather than fail the whole request for inaccessible rows.
+
+Lead directory supports `requiredAction=modify` for flows that need editable leads, such as contact creation from an existing lead. That filter mirrors lead response permissions: org/system manage bypass, direct `WRITE`/`FULL` stakeholder access, or `team_crm.manage` on a `WRITE`/`FULL` team stakeholder row.
+
+### Nested CRM related lists
+
+Contact panel related-list endpoints (`GET /contacts/:id/leads` and `GET /contacts/:id/deals`) are endpoint-gated by Contact access, then service-filtered by each related Lead/Deal's own `canView` policy before pagination and serialization. Inaccessible related rows are excluded from the response body, `total`, contact detail tab counts, and the linked deal value aggregate, so browser network payloads cannot disclose lead/deal IDs or counts that the actor cannot view directly.
+
+Lead panel deal history (`GET /leads/:id/deals`) follows the same nested-list model. The route is endpoint-gated by Lead access, then service-filtered by each linked Deal's own `canView` policy before pagination. A user with org `sales.view` can see all visible-org linked deals; otherwise the deal must be viewable through creator, deal stakeholder, originating-lead stakeholder, or team-sales stakeholder access. Inaccessible deals are excluded from `data`, `total`, and `totalValue`.
+
 ### Access modes
 
 | Mode    | Behavior                                               | Default |
 | ------- | ------------------------------------------------------ | ------- |
 | **OR**  | User passes if they have permission OR resource access | ✅ Yes  |
 | **AND** | User must have BOTH permission AND resource access     | No      |
+
+### System superuser bypass
+
+`system.admin` and `system.owner` are treated as organization superuser permissions. `AccessGuard` allows those users before permission, resource, bulk-resource, or team checks run, and `AccessService.getPermissionsAsSet()` expands them to all org/team permission keys for service-level checks. Programmatic `checkResourceAccess*` and `checkBulkResourceAccess*` calls also return access for these users so controller guards and service checks stay aligned.
 
 ### Permission implications
 
@@ -56,8 +72,9 @@ Examples:
 - `messaging.write` satisfies guards requiring `messaging.view`
 - `messaging.manage` satisfies guards requiring `messaging.write` or `messaging.view`
 - Team equivalents follow the same explicit map, e.g. `team_crm.manage` satisfies `team_crm.view`
+- `system.admin` / `system.owner` satisfy every permission and resource check
 
-This expansion is explicit, not suffix-based. `marketing.manage`, `system.admin`, `system.owner`, and `team.admin` do not create synthetic `*.view` permissions.
+This expansion is explicit, not suffix-based. `marketing.manage` and `team.admin` do not create synthetic `*.view` permissions; `system.admin` and `system.owner` are special superuser bypasses rather than ordinary implication-map entries.
 
 ### Resource types
 
@@ -776,436 +793,123 @@ The `canAssignLeads()` function operates at the tab level (not per-lead) so it c
 | `my-teams`                | Team leader in any team                         |
 | `lead-pool` / `team-pool` | Handled by `canAssignInPool()`                  |
 
-# Layer 2: Response Permissions
+## Performance considerations
 
-This layer tells the frontend what the user can do with each resource. It runs inside the service after data is fetched and attaches a `permissions` object to each resource in the response.
+### Database query optimization
 
-## Which entities have response permissions
-
-Response permissions are computed for entities where the frontend needs to show/hide UI elements based on user access:
-
-| Entity | DTO | Permission fields | Notes |
-|--------|-----|-------------------|--------|
-| **Lead** | `LeadDetailDto` | `canEdit`, `canDelete`, `canAssign`, `canTransfer` | Full permission set |
-| **Deal** | `DealDetailDto` | `canEdit`, `canDelete`, `canAssign`, `canTransfer` | Same as leads |
-| **Contact** | `ContactDetailDto` | `canEdit`, `canDelete` | Basic CRUD permissions |
-| **Company** | `CompanyDetailDto` | `canEdit`, `canDelete` | Basic CRUD permissions |
-| **Task** | `TaskDetailDto` | `canEdit`, `canDelete`, `canComplete` | Task-specific permissions |
-
-## Response permissions DTOs
-
-### Base permission interface
+<AccordionGroup>
+<Accordion title="Bulk permission computation">
+The `PermissionComputeService` uses optimized bulk queries to avoid N+1 problems:
 
 ```typescript
-interface ResourcePermissionsDto {
-  canEdit: boolean;
-  canDelete: boolean;
-  canAssign?: boolean;    // For stakeholder entities (leads, deals)
-  canTransfer?: boolean;  // For stakeholder entities (leads, deals)
-  canComplete?: boolean;  // For tasks
-}
+// Single query to check user permissions across all teams
+const userTeamPermissions = await this.teamPermissionRepository.find({
+  where: { userId: user.id, permission: In(['TEAM_CRM_MANAGE']) },
+});
+
+// Single query to check stakeholder relationships for all resources
+const stakeholders = await this.stakeholderRepository.find({
+  where: { 
+    resourceId: In(resourceIds), 
+    resourceType: 'LEAD',
+    userId: user.id 
+  },
+});
 ```
+</Accordion>
 
-### Entity-specific DTOs
-
-<Tabs>
-<Tab title="Lead permissions">
-```typescript
-interface LeadPermissionsDto extends ResourcePermissionsDto {
-  canEdit: boolean;      // Can update lead fields
-  canDelete: boolean;    // Can soft-delete lead
-  canAssign: boolean;    // Can manage stakeholders
-  canTransfer: boolean;  // Can transfer ownership
-}
-```
-</Tab>
-
-<Tab title="Deal permissions">
-```typescript
-interface DealPermissionsDto extends ResourcePermissionsDto {
-  canEdit: boolean;      // Can update deal fields
-  canDelete: boolean;    // Can soft-delete deal
-  canAssign: boolean;    // Can manage stakeholders
-  canTransfer: boolean;  // Can transfer ownership
-}
-```
-</Tab>
-
-<Tab title="Contact permissions">
-```typescript
-interface ContactPermissionsDto extends ResourcePermissionsDto {
-  canEdit: boolean;      // Can update contact fields
-  canDelete: boolean;    // Can soft-delete contact
-}
-```
-</Tab>
-
-<Tab title="Task permissions">
-```typescript
-interface TaskPermissionsDto extends ResourcePermissionsDto {
-  canEdit: boolean;      // Can update task fields
-  canDelete: boolean;    // Can delete task
-  canComplete: boolean;  // Can mark as complete
-}
-```
-</Tab>
-</Tabs>
-
-## PermissionComputeService
-
-**File:** `src/modules/auth/services/permission-compute.service.ts`
-
-This service computes response permissions for entities based on the user's permissions and stakeholder access.
-
-### Core methods
+<Accordion title="Permission caching">
+Consider caching user permissions for frequently accessed data:
 
 ```typescript
 @Injectable()
-export class PermissionComputeService {
-  // Single entity permission computation
-  async computeLeadPermissions(
-    lead: Lead,
-    user: RequestUser,
-  ): Promise<LeadPermissionsDto> {
-    const stakeholder = lead.stakeholders?.find(s => s.userId === user.id);
-    const hasStakeholderAccess = !!stakeholder;
-    const canModify = stakeholder?.accessLevel === StakeholderAccessLevel.MODIFY;
-    
-    const hasCrmManage = this.hasPermission(user, [OrgPermissionKey.CRM_MANAGE]);
-    const hasTeamCrmManage = this.hasTeamPermission(user, [TeamPermissionKey.TEAM_CRM_MANAGE]);
-    
-    return {
-      canEdit: hasCrmManage || canModify,
-      canDelete: hasCrmManage || canModify,
-      canAssign: hasCrmManage || hasTeamCrmManage,
-      canTransfer: hasCrmManage,
-    };
-  }
+export class CachedPermissionService {
+  constructor(private cacheService: CacheService) {}
 
-  // Bulk permission computation (optimized)
-  async computeLeadPermissionsBulk(
-    leads: Lead[],
-    user: RequestUser,
-  ): Promise<Map<string, LeadPermissionsDto>> {
-    // Bulk-optimized version that avoids N+1 queries
-    const permissionsMap = new Map<string, LeadPermissionsDto>();
+  async getUserOrgPermissions(userId: string): Promise<string[]> {
+    const cacheKey = `user-org-permissions:${userId}`;
+    let permissions = await this.cacheService.get<string[]>(cacheKey);
     
-    // Pre-compute user permissions once
-    const hasCrmManage = this.hasPermission(user, [OrgPermissionKey.CRM_MANAGE]);
-    const hasTeamCrmManage = this.hasTeamPermission(user, [TeamPermissionKey.TEAM_CRM_MANAGE]);
-    
-    // Bulk load all stakeholder relationships
-    const allStakeholders = leads.flatMap(lead => lead.stakeholders || []);
-    const userStakeholders = allStakeholders.filter(s => s.userId === user.id);
-    
-    for (const lead of leads) {
-      const stakeholder = userStakeholders.find(s => s.resourceId === lead.id);
-      const canModify = stakeholder?.accessLevel === StakeholderAccessLevel.MODIFY;
-      
-      permissionsMap.set(lead.id, {
-        canEdit: hasCrmManage || canModify,
-        canDelete: hasCrmManage || canModify,
-        canAssign: hasCrmManage || hasTeamCrmManage,
-        canTransfer: hasCrmManage,
-      });
+    if (!permissions) {
+      permissions = await this.loadUserOrgPermissions(userId);
+      await this.cacheService.set(cacheKey, permissions, 300); // 5 min TTL
     }
     
-    return permissionsMap;
+    return permissions;
   }
 }
 ```
-
-### Permission computation logic
-
-<AccordionGroup>
-<Accordion title="canEdit — Update entity fields">
-```typescript
-canEdit: boolean = 
-  hasOrgPermission('CRM_MANAGE') ||
-  (isStakeholder && stakeholder.accessLevel === 'MODIFY')
-```
-User can edit if they have org management permission OR they're a stakeholder with modify access.
 </Accordion>
 
-<Accordion title="canDelete — Soft-delete entity">
-```typescript
-canDelete: boolean = 
-  hasOrgPermission('CRM_MANAGE') ||
-  (isStakeholder && stakeholder.accessLevel === 'MODIFY')
-```
-Same logic as canEdit — requires management permission or modify stakeholder access.
-</Accordion>
+<Accordion title="Selective loading">
+Only load relations needed for permission computation:
 
-<Accordion title="canAssign — Manage stakeholders">
 ```typescript
-canAssign: boolean = 
-  hasOrgPermission('CRM_MANAGE') ||
-  hasTeamPermission('TEAM_CRM_MANAGE')
-```
-Stakeholder management requires explicit management permissions — stakeholder access alone is NOT sufficient.
-</Accordion>
+// ✅ Load only what's needed
+const leads = await this.leadRepository.find({
+  relations: ['stakeholders'], // Only load stakeholders for permission check
+  select: ['id', 'title', 'status'], // Only select needed fields
+});
 
-<Accordion title="canTransfer — Transfer ownership">
-```typescript
-canTransfer: boolean = 
-  hasOrgPermission('CRM_MANAGE')
+// ❌ Avoid loading unnecessary relations
+const leads = await this.leadRepository.find({
+  relations: ['stakeholders', 'activities', 'notes', 'attachments'], // Too much
+});
 ```
-Only org admins can transfer ownership between users/teams.
 </Accordion>
 </AccordionGroup>
 
-## API response examples
+### Request optimization
 
-### Single entity response
-
-```json
-{
-  "data": {
-    "id": "123",
-    "title": "Sample Lead",
-    "status": "new",
-    "assignedUserId": "456",
-    "stakeholders": [
-      {
-        "id": "789",
-        "userId": "456",
-        "accessLevel": "MODIFY",
-        "isPrimary": true
-      }
-    ]
-  },
-  "permissions": {
-    "canEdit": true,
-    "canDelete": true,
-    "canAssign": false,
-    "canTransfer": false
-  }
-}
-```
-
-### Paginated list response
-
-```json
-{
-  "data": [
-    {
-      "id": "123",
-      "title": "Lead 1",
-      "permissions": {
-        "canEdit": true,
-        "canDelete": true,
-        "canAssign": true,
-        "canTransfer": true
-      }
-    },
-    {
-      "id": "124", 
-      "title": "Lead 2",
-      "permissions": {
-        "canEdit": false,
-        "canDelete": false,
-        "canAssign": true,
-        "canTransfer": true
-      }
-    }
-  ],
-  "meta": {
-    "page": 1,
-    "limit": 20,
-    "total": 50,
-    "totalPages": 3
-  }
-}
-```
-
-### Bulk permissions for frontend optimization
-
-For list views that need to show/hide many action buttons, the frontend can request bulk permissions:
-
-**Request:** `GET /leads?includePermissions=true`
-
-**Response:** Each lead in the array includes its `permissions` object, computed efficiently in bulk.
-
-## Integrating response permissions into services
-
-### Service method pattern
-
-Services that return entity data should call `PermissionComputeService` to attach permissions:
+<Tip>
+Use response permissions to avoid unnecessary client-side permission checks and API calls.
+</Tip>
 
 ```typescript
-@Injectable()
-export class LeadService {
-  constructor(
-    private permissionComputeService: PermissionComputeService,
-  ) {}
-
-  async findById(id: string, user: RequestUser): Promise<LeadDetailDto> {
-    // 1. Fetch the lead data
-    const lead = await this.leadRepository.findOne({
-      where: { id },
-      relations: ['stakeholders', 'stakeholders.user'],
-    });
-
-    if (!lead) {
-      throw new NotFoundException('Lead not found');
-    }
-
-    // 2. Compute permissions for this user
-    const permissions = await this.permissionComputeService.computeLeadPermissions(lead, user);
-
-    // 3. Return DTO with permissions attached
-    return {
-      ...this.toLeadDetailDto(lead),
-      permissions,
-    };
-  }
-
-  async findAllPaginated(
-    filters: LeadFilters,
-    user: RequestUser,
-  ): Promise<PaginatedResponse<LeadListDto>> {
-    // 1. Fetch paginated leads
-    const [leads, total] = await this.leadRepository.findAndCount({
-      where: this.buildWhereClause(filters, user),
-      relations: ['stakeholders'],
-      take: filters.limit,
-      skip: (filters.page - 1) * filters.limit,
-    });
-
-    // 2. Compute permissions in bulk (optimized)
-    const permissionsMap = await this.permissionComputeService.computeLeadPermissionsBulk(leads, user);
-
-    // 3. Attach permissions to each lead
-    const data = leads.map(lead => ({
-      ...this.toLeadListDto(lead),
-      permissions: permissionsMap.get(lead.id)!,
-    }));
-
-    return {
-      data,
-      meta: {
-        page: filters.page,
-        limit: filters.limit,
-        total,
-        totalPages: Math.ceil(total / filters.limit),
-      },
-    };
-  }
-}
-```
-
-### Performance optimization
-
-<Info>
-Use bulk permission computation for list endpoints to avoid N+1 queries. The `computeLeadPermissionsBulk()` method pre-loads all stakeholder relationships and computes permissions for multiple entities in a single operation.
-</Info>
-
-### DTO transformation
-
-**Convert entity to DTO with permissions:**
-
-```typescript
-private toLeadDetailDto(lead: Lead): Omit<LeadDetailDto, 'permissions'> {
-  return {
-    id: lead.id,
-    title: lead.title,
-    status: lead.status,
-    assignedUserId: lead.assignedUserId,
-    createdAt: lead.createdAt,
-    updatedAt: lead.updatedAt,
-    stakeholders: lead.stakeholders?.map(this.toStakeholderDto),
-  };
-}
-```
-
-**Attach permissions:**
-
-```typescript
-const leadDto: LeadDetailDto = {
-  ...this.toLeadDetailDto(lead),
-  permissions: await this.permissionComputeService.computeLeadPermissions(lead, user),
-};
-```
-
-## Lead & Deal service implementation reference
-
-Both lead and deal services follow identical patterns for response permissions since they share the same stakeholder-based access model.
-
-### LeadService permissions
-
-```typescript
-// Single lead - compute permissions
-async findById(id: string, user: RequestUser): Promise<LeadDetailDto> {
-  const lead = await this.loadLeadWithStakeholders(id);
-  const permissions = await this.permissionComputeService.computeLeadPermissions(lead, user);
-  
-  return {
-    ...this.toDto(lead),
-    permissions,
-  };
+// Frontend can make decisions based on response permissions
+if (lead.permissions.canEdit) {
+  return <EditButton onClick={() => openEditModal(lead.id)} />;
 }
 
-// Lead list - bulk compute permissions
-async findAllPaginated(filters: LeadFilters, user: RequestUser): Promise<PaginatedResponse<LeadListDto>> {
-  const [leads, total] = await this.findLeadsWithFilters(filters, user);
-  const permissionsMap = await this.permissionComputeService.computeLeadPermissionsBulk(leads, user);
-  
-  const data = leads.map(lead => ({
-    ...this.toListDto(lead),
-    permissions: permissionsMap.get(lead.id)!,
-  }));
-  
-  return { data, meta: this.buildMeta(total, filters) };
-}
+// No need for separate permission check API call
+// ❌ Avoid: const canEdit = await checkLeadPermission(lead.id, 'EDIT');
 ```
 
-### DealService permissions
+## Implementation checklists
 
-```typescript
-// Single deal - compute permissions  
-async findById(id: string, user: RequestUser): Promise<DealDetailDto> {
-  const deal = await this.loadDealWithStakeholders(id);
-  const permissions = await this.permissionComputeService.computeDealPermissions(deal, user);
-  
-  return {
-    ...this.toDto(deal),
-    permissions,
-  };
-}
+### Adding @CheckAccess to a new endpoint
 
-// Deal list - bulk compute permissions
-async findAllPaginated(filters: DealFilters, user: RequestUser): Promise<PaginatedResponse<DealListDto>> {
-  const [deals, total] = await this.findDealsWithFilters(filters, user);
-  const permissionsMap = await this.permissionComputeService.computeDealPermissionsBulk(deals, user);
-  
-  const data = deals.map(deal => ({
-    ...this.toListDto(deal),
-    permissions: permissionsMap.get(deal.id)!,
-  }));
-  
-  return { data, meta: this.buildMeta(total, filters) };
-}
-```
+<Steps>
+<Step title="Determine access pattern">
+- **List/create endpoint?** → Use permission-only check
+- **Single resource endpoint?** → Use permission OR resource check
+- **Bulk operation?** → Use bulk resource check
+- **Administrative function?** → Use permission-only check
+- **Team-scoped?** → Add teamCheck configuration
+</Step>
 
-### Required database relations
+<Step title="Choose permissions">
+- Identify relevant org permissions (e.g., `CRM_MANAGE`, `SALES_VIEW`)
+- Include team permissions if applicable (e.g., `TEAM_CRM_MANAGE`)
+- Consider read vs write vs admin permission levels
+</Step>
 
-Ensure stakeholder relations are loaded for permission computation:
+<Step title="Configure resource check">
+- Determine resource type (`LEAD`, `DEAL`, `CONVERSATION`, etc.)
+- Choose action (`ACCESS`, `MODIFY`)
+- Set correct paramName if not `:id`
+- Choose access mode (`OR` default, `AND` for sensitive operations)
+</Step>
 
-```typescript
-// Lead queries must include stakeholders
-const lead = await this.leadRepository.findOne({
-  where: { id },
-  relations: ['stakeholders'], // Required for permission computation
-});
+<Step title="Test access scenarios">
+- Test with org admin (should have access via permissions)
+- Test with team manager (should have access via team permissions)
+- Test with stakeholder (should have access via resource check)
+- Test with unauthorized user (should get 403)
+</Step>
+</Steps>
 
-// Deal queries must include stakeholders  
-const deal = await this.dealRepository.findOne({
-  where: { id },
-  relations: ['stakeholders'], // Required for permission computation
-});
-```
-
-## Complete controller example
+### Complete controller example
 
 Here's a complete controller showing all access control patterns:
 
@@ -1337,192 +1041,3 @@ export class LeadController {
   }
 }
 ```
-
-## Performance considerations
-
-### Database query optimization
-
-<AccordionGroup>
-<Accordion title="Bulk permission computation">
-The `PermissionComputeService` uses optimized bulk queries to avoid N+1 problems:
-
-```typescript
-// Single query to check user permissions across all teams
-const userTeamPermissions = await this.teamPermissionRepository.find({
-  where: { userId: user.id, permission: In(['TEAM_CRM_MANAGE']) },
-});
-
-// Single query to check stakeholder relationships for all resources
-const stakeholders = await this.stakeholderRepository.find({
-  where: { 
-    resourceId: In(resourceIds), 
-    resourceType: 'LEAD',
-    userId: user.id 
-  },
-});
-```
-</Accordion>
-
-<Accordion title="Permission caching">
-Consider caching user permissions for frequently accessed data:
-
-```typescript
-@Injectable()
-export class CachedPermissionService {
-  constructor(private cacheService: CacheService) {}
-
-  async getUserOrgPermissions(userId: string): Promise<string[]> {
-    const cacheKey = `user-org-permissions:${userId}`;
-    let permissions = await this.cacheService.get<string[]>(cacheKey);
-    
-    if (!permissions) {
-      permissions = await this.loadUserOrgPermissions(userId);
-      await this.cacheService.set(cacheKey, permissions, 300); // 5 min TTL
-    }
-    
-    return permissions;
-  }
-}
-```
-</Accordion>
-
-<Accordion title="Selective loading">
-Only load relations needed for permission computation:
-
-```typescript
-// ✅ Load only what's needed
-const leads = await this.leadRepository.find({
-  relations: ['stakeholders'], // Only load stakeholders for permission check
-  select: ['id', 'title', 'status'], // Only select needed fields
-});
-
-// ❌ Avoid loading unnecessary relations
-const leads = await this.leadRepository.find({
-  relations: ['stakeholders', 'activities', 'notes', 'attachments'], // Too much
-});
-```
-</Accordion>
-</AccordionGroup>
-
-### Request optimization
-
-<Tip>
-Use response permissions to avoid unnecessary client-side permission checks and API calls.
-</Tip>
-
-```typescript
-// Frontend can make decisions based on response permissions
-if (lead.permissions.canEdit) {
-  return <EditButton onClick={() => openEditModal(lead.id)} />;
-}
-
-// No need for separate permission check API call
-// ❌ Avoid: const canEdit = await checkLeadPermission(lead.id, 'EDIT');
-```
-
-## Implementation checklists
-
-### Adding @CheckAccess to a new endpoint
-
-<Steps>
-<Step title="Determine access pattern">
-- **List/create endpoint?** → Use permission-only check
-- **Single resource endpoint?** → Use permission OR resource check
-- **Bulk operation?** → Use bulk resource check
-- **Administrative function?** → Use permission-only check
-- **Team-scoped?** → Add teamCheck configuration
-</Step>
-
-<Step title="Choose permissions">
-- Identify relevant org permissions (e.g., `CRM_MANAGE`, `SALES_VIEW`)
-- Include team permissions if applicable (e.g., `TEAM_CRM_MANAGE`)
-- Consider read vs write vs admin permission levels
-</Step>
-
-<Step title="Configure resource check">
-- Determine resource type (`LEAD`, `DEAL`, `CONVERSATION`, etc.)
-- Choose action (`ACCESS`, `MODIFY`)
-- Set correct paramName if not `:id`
-- Choose access mode (`OR` default, `AND` for sensitive operations)
-</Step>
-
-<Step title="Test access scenarios">
-- Test with org admin (should have access via permissions)
-- Test with team manager (should have access via team permissions)
-- Test with stakeholder (should have access via resource check)
-- Test with unauthorized user (should get 403)
-</Step>
-</Steps>
-
-### Adding response permissions to a service
-
-<Steps>
-<Step title="Update DTOs">
-- Add `permissions` field to detail and list DTOs
-- Define permission interface for the entity type
-- Ensure all permission fields are boolean
-</Step>
-
-<Step title="Implement permission computation">
-- Add method to `PermissionComputeService` for single entity
-- Add bulk method for list operations  
-- Define permission logic based on stakeholder access and user permissions
-</Step>
-
-<Step title="Update service methods">
-- Call permission compute service in `findById()`
-- Call bulk permission compute in list methods
-- Attach permissions to DTO before returning
-</Step>
-
-<Step title="Update database queries">
-- Ensure stakeholder relations are loaded
-- Consider adding select fields for optimization
-- Test query performance with pagination
-</Step>
-</Steps>
-
-### Testing access control
-
-<Steps>
-<Step title="Unit tests for guards">
-- Test permission checks with various user roles
-- Test resource checks with stakeholder access
-- Test bulk operations with mixed access
-- Test team-scoped endpoints
-</Step>
-
-<Step title="Integration tests for endpoints">
-- Test complete request flow with different users
-- Verify 403 responses for unauthorized access
-- Test partial results for bulk operations
-- Verify response permissions are computed correctly
-</Step>
-
-<Step title="Performance testing">
-- Measure query count for list operations
-- Test bulk permission computation efficiency
-- Verify caching works correctly
-- Monitor response times under load
-</Step>
-</Steps>
-
-## Related documentation
-
-<CardGroup cols={2}>
-<Card icon="shield" title="RBAC System" href="/backend/rbac/overview">
-  Core permission and role system that powers access control
-</Card>
-
-<Card icon="users" title="Stakeholder System" href="/backend/stakeholders/overview">
-  Resource-level access control through stakeholder relationships
-</Card>
-
-<Card icon="code" title="Guard Implementation" href="/backend/rbac/access-control/guards">
-  Technical details of NestJS guard implementation
-</Card>
-
-<Card icon="database" title="Permission Queries" href="/backend/rbac/access-control/queries">
-  Database query patterns for efficient permission checking
-</Card>
-</CardGroup>
