@@ -1,0 +1,374 @@
+---
+title: "AI Conversation System - Comprehensive Specification"
+description: "Complete specification for the AI conversation system, including customer-facing messaging AI, internal assistant boundaries, modes, and LLM integration architecture."
+---
+
+# AI Conversation System - Comprehensive Specification
+
+The AI Conversation System enables automated and AI-assisted responses within the unified messaging module. It integrates with the existing webhook processing pipeline, conversation model, and template system to provide four modes of AI interaction controlled per-conversation.
+
+<Note>
+Both the messaging AI and the internal CRM assistant must speak **"assignment" / "assignee" / "assigned to"** to users — never "stakeholder", even when the underlying DTO field is still named `stakeholders`. See `Docs/STAKEHOLDER_SYSTEM.md` → "Vocabulary" and `Docs/AI_MODULE_SPECIFICATION.md` → "Assignment vocabulary (v0.11)".
+</Note>
+
+## Internal Assistant Boundary
+
+This specification covers customer-facing messaging AI: inbound messages, conversation modes, suggestions, drafts, and optional auto-replies inside the messaging pipeline. The native Propwise CRM sidebar assistant is a separate internal-user surface under `src/modules/ai-assistant` with `POST /v1/ai-assistant/chat`.
+
+<AccordionGroup>
+<Accordion title="Internal Assistant Details">
+The internal assistant:
+
+- Uses `ai_conversation`, `ai_message`, and `ai_tool_call` tables, not the messaging `conversation` / `message` tables
+- Runs with the current user's tenant token and never uses a service-account "see everything" mode
+- Fetches CRM context through existing services and resource checks instead of accepting browser-supplied entity payloads
+- Is read-only in V1; drafts and suggestions are allowed, but sending messages or mutating CRM records requires a later explicit approval protocol
+- Enforces a **scope + refusal + groundedness + Propwise-glossary + multi-turn-follow-ups + lead-routing** system prompt (current version `AI_ASSISTANT_SYSTEM_PROMPT_VERSION = crm-assistant-v0.6-lead-routing`)
+
+Provider abstractions and cost/budget controls may converge later, but prompt versions and runtime policies remain distinct from customer messaging AI prompts.
+</Accordion>
+</AccordionGroup>
+
+## AI Modes
+
+The system supports four distinct AI interaction modes that control how the AI participates in conversations:
+
+<CardGroup cols={2}>
+<Card title="OFF Mode" icon="circle-xmark">
+No AI involvement. Messages routed to human agents only.
+</Card>
+<Card title="AUTO_REPLY Mode" icon="robot">
+AI generates and sends responses automatically as `senderType = BOT`.
+</Card>
+<Card title="SUGGEST_ONLY Mode" icon="lightbulb">
+AI generates a suggested response and emits it via WebSocket. Agent sees suggestion but must send manually.
+</Card>
+<Card title="DRAFT Mode" icon="pencil">
+AI pre-fills the reply input box. Agent can edit before sending.
+</Card>
+</CardGroup>
+
+### Mode Cascade for New Conversations
+
+When a new conversation is created, the AI mode is determined by cascade:
+
+```
+ChannelAccount.defaultAiMode ?? Organization.settings.defaultAiMode ?? AiMode.OFF
+```
+
+<Info>
+Agents can override the mode at any time via the conversation header toggle (`PUT /messaging/conversations/:id/ai-mode`).
+</Info>
+
+## AI Decision Pipeline
+
+### Interception Point
+
+AI processing occurs in **Phase B** of the webhook processor, after the message has been persisted (Phase A). This ensures:
+
+- Message persistence is never blocked by AI processing
+- AI failures are non-critical (logged, not thrown)
+- The inbound message is available for context composition
+
+### Pipeline Flow
+
+<Steps>
+<Step title="Inbound Message Received">
+Message enters the system through the webhook pipeline.
+</Step>
+
+<Step title="Phase A: Persist Message">
+Message is persisted to database with conversation update (transactional).
+</Step>
+
+<Step title="Phase B: Side-effects Processing">
+Non-critical, isolated processing begins:
+- Block 1: WebSocket events (new-message, new-conversation)
+- Block 2: Notification events (NewMessageEvent)
+- Block 3: Automation rule evaluation
+- **Block 4: AI Response Pipeline** ← NEW
+</Step>
+
+<Step title="AI Mode Evaluation">
+Check conversation.aiMode and route accordingly:
+- `OFF` → skip
+- `AUTO_REPLY` → generate + send
+- `SUGGEST_ONLY` → generate + emit WebSocket
+- `DRAFT` → generate + emit WebSocket (draft payload)
+</Step>
+
+<Step title="Escalation Check">
+Check escalation triggers before generating. If triggered → set aiMode = OFF, notify agent, skip.
+</Step>
+
+<Step title="Response Generation">
+- Compose prompt context
+- Call LLM provider
+- Process response by mode
+- Increment conversation.aiMessageCount
+</Step>
+</Steps>
+
+### Latency Budget
+
+<Warning>
+**Target:** < 5 seconds end-to-end for AI response generation
+
+**Breakdown:**
+- Context composition: < 200ms
+- LLM API call: < 4s (with timeout)
+- Response processing + send: < 800ms
+
+**Timeout handling:** If LLM call exceeds 8s, abort and log warning. Do not retry in the message pipeline — the opportunity has passed.
+</Warning>
+
+### Queue-Based Alternative (Future)
+
+For high-volume deployments, AI processing can be moved to a dedicated pg-boss queue (`ai-response`) to decouple it from the webhook worker entirely. The current Phase B approach is simpler and sufficient for initial rollout.
+
+## LLM Integration Architecture
+
+### Provider Abstraction
+
+The system uses a provider abstraction layer to support multiple LLM providers:
+
+<CodeGroup>
+```typescript Provider Interface
+interface LlmProvider {
+  generateResponse(request: LlmRequest): Promise<LlmResponse>;
+  countTokens(text: string): number;
+}
+
+interface LlmRequest {
+  systemPrompt: string;
+  messages: LlmMessage[];
+  maxTokens: number;
+  temperature: number;
+}
+
+interface LlmMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface LlmResponse {
+  content: string;
+  tokensUsed: { prompt: number; completion: number };
+  model: string;
+  finishReason: string;
+}
+```
+</CodeGroup>
+
+### Supported Providers
+
+| Provider      | SDK                     | Notes                 |
+| ------------- | ----------------------- | --------------------- |
+| OpenAI        | `openai` npm package    | GPT-4o, GPT-4o-mini   |
+| Google Gemini | `@google/generative-ai` | Gemini 2.0 Flash, Pro |
+| Anthropic     | `@anthropic-ai/sdk`     | Claude Sonnet, Haiku  |
+
+Provider selection is configured per organization via `Organization.settings`:
+
+<CodeGroup>
+```typescript Organization Settings
+interface OrganizationSettings {
+  defaultAiMode?: AiMode;
+  ai?: {
+    provider: 'openai' | 'gemini' | 'anthropic';
+    model: string;
+    apiKey: string; // encrypted at rest
+    maxTokensPerResponse: number; // default 500
+    temperature: number; // default 0.7
+  };
+}
+```
+</CodeGroup>
+
+### Conversation Context Composition
+
+The AI context window is built from multiple sources, ordered by priority:
+
+<Steps>
+<Step title="System Prompt">
+From the matched AI_PROMPT MessageTemplate (via `findAiPromptTemplate`); when no template matches, the hardcoded fallback string is used.
+</Step>
+
+<Step title="Knowledge Context">
+Relevant chunks from the RAG pipeline via `EmbeddingService.generateEmbedding(query, apiKey)` + pgvector cosine search on `knowledge_chunks`.
+</Step>
+
+<Step title="CRM Context">
+Person name, lead details (budget, timeline, intent), property interests.
+</Step>
+
+<Step title="Conversation History">
+Last N messages (configurable, default 20), formatted as user/assistant turns.
+</Step>
+</Steps>
+
+### Token Budget Management
+
+<CodeGroup>
+```
+Total Budget = Organization.settings.ai.maxTokensPerResponse (completion)
+                + calculated prompt tokens (context)
+
+Context Priority (when trimming needed):
+1. System prompt (never trimmed)
+2. Last 5 messages (never trimmed)
+3. CRM context (trimmed second)
+4. Knowledge context (trimmed first)
+5. Older messages (trimmed by removing oldest first)
+```
+</CodeGroup>
+
+<Tip>
+- Token counting uses the provider's tokenizer (tiktoken for OpenAI, approximate for others)
+- Maximum context window: 8,000 tokens for prompt (conservative default)
+- If total context exceeds budget, trim knowledge chunks first, then older messages
+</Tip>
+
+## AI Response Generation Service
+
+### Service Configuration
+
+**Module:** `src/modules/messaging/services/ai-response.service.ts`
+**Registered in:** `MessagingModule.providers`
+
+### Method: `processInboundMessage`
+
+<CodeGroup>
+```typescript Method Signature
+async processInboundMessage(
+  conversation: Conversation,
+  inboundMessage: Message,
+  em: EntityManager,
+): Promise<void>
+```
+</CodeGroup>
+
+### Processing Flow
+
+<Steps>
+<Step title="Mode Check">
+If `conversation.aiMode === AiMode.OFF`, return immediately.
+</Step>
+
+<Step title="Escalation Check">
+Evaluate escalation triggers before generating. If triggered, abort.
+</Step>
+
+<Step title="Find AI Prompt Template">
+<CodeGroup>
+```typescript Template Lookup
+const template = await templateService.findAiPromptTemplate(
+  conversation.organization.id,
+  conversation.channelAccount.id,
+  conversation.tags,
+);
+const systemPrompt = template?.systemPrompt?.prompt ?? template?.body ?? DEFAULT_SYSTEM_PROMPT;
+```
+</CodeGroup>
+</Step>
+
+<Step title="Build Context">
+- Load last N messages for conversation
+- Load PersonChannel → Person → Lead context (if linked)
+- Query knowledge base for relevant chunks (if EmbeddingService available)
+- Compose `LlmRequest` with token budget enforcement
+</Step>
+
+<Step title="Call LLM Provider">
+<CodeGroup>
+```typescript LLM Call
+const llmResponse = await llmProvider.generateResponse(request);
+```
+</CodeGroup>
+</Step>
+
+<Step title="Process by Mode">
+<Tabs>
+<Tab title="AUTO_REPLY">
+- Create outbound Message with `senderType = SenderType.BOT`
+- Create MessageOutbox entry (transactional outbox pattern)
+- Update conversation stats (lastMessageAt, lastMessagePreview)
+- Emit WebSocket `new-message` event
+</Tab>
+
+<Tab title="SUGGEST_ONLY">
+Emit WebSocket event `ai-suggestion` to the conversation room:
+<CodeGroup>
+```typescript AI Suggestion Event
+{
+  conversationId: string;
+  suggestion: string;
+  generatedAt: Date;
+}
+```
+</CodeGroup>
+Agent sees the suggestion in the UI and can accept/modify/dismiss
+</Tab>
+
+<Tab title="DRAFT">
+Emit WebSocket event `ai-draft` to the conversation room:
+<CodeGroup>
+```typescript AI Draft Event
+{
+  conversationId: string;
+  draft: string;
+  generatedAt: Date;
+}
+```
+</CodeGroup>
+Frontend pre-fills the reply input with the draft text
+</Tab>
+</Tabs>
+</Step>
+
+<Step title="Update Counters">
+<CodeGroup>
+```typescript Counter Update
+conversation.aiMessageCount += 1;
+await em.flush();
+```
+</CodeGroup>
+</Step>
+</Steps>
+
+### Error Handling
+
+<Warning>
+**Error Handling Guidelines:**
+
+- **LLM API errors:** Log with full context, do not throw. Agent is not blocked.
+- **Token limit exceeded:** Trim context and retry once with reduced context.
+- **Provider unavailable:** Log error, emit WebSocket event `ai-error` to notify the agent.
+- **Rate limiting:** Respect provider rate limits. If rate-limited, skip and log.
+</Warning>
+
+### Default Fallback Prompt
+
+When `findAiPromptTemplate(...)` finds no matching `AI_PROMPT` `MessageTemplate` for the conversation, the conversation pipeline falls back to this hardcoded string:
+
+<CodeGroup>
+```text Default Prompt
+You are a helpful real estate assistant for {organization_name}. 
+
+Your goal is to assist potential buyers and sellers with their real estate needs in a professional, friendly, and informative manner. 
+
+Guidelines:
+- Always be polite and professional
+- Provide helpful information about properties and real estate processes
+- Ask clarifying questions when needed
+- If you don't know something specific, acknowledge it and offer to connect them with a human agent
+- Keep responses concise but complete
+- Focus on being helpful rather than pushy
+
+Current conversation context will be provided below.
+```
+</CodeGroup>
+
+<Note>
+This is **not** a DB row — the `SystemPrompt` entity that previously stored an org-overridable default has been removed.
+</Note>
