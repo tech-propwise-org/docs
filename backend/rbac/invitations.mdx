@@ -342,6 +342,43 @@ private async applyInvitationRbacAssignments(
   
   await bypassEm.flush();
 }
+
+private async addUserToOrganization(
+  bypassEm: EntityManager,
+  user: User,
+  invitation: Invitation
+): Promise<void> {
+  // Check if user is already a member
+  const existingMembership = await bypassEm.findOne(OrganizationUser, {
+    user,
+    organization: invitation.organization
+  });
+
+  if (!existingMembership) {
+    // Generate unique public ID for this organization
+    const publicId = await this.generateUserPublicId(
+      bypassEm, 
+      invitation.organization.id
+    );
+    
+    // Create organization membership
+    const orgUser = bypassEm.create(OrganizationUser, {
+      user,
+      organization: invitation.organization,
+      publicId,
+      fallbackAvatarColor: this.generateFallbackAvatarColor(),
+      addedBy: invitation.invitedBy,
+      joinedAt: new Date()
+    });
+    await bypassEm.persist(orgUser);
+  }
+  
+  // Update user's selected organization if not set
+  if (!user.selectedOrganizationId) {
+    user.selectedOrganizationId = invitation.organization.id;
+    await bypassEm.persist(user);
+  }
+}
 ```
 
 ## Token security and validation
@@ -380,6 +417,28 @@ private generateSecureToken(): string {
   // 64-character hex string (256 bits of entropy)
   return crypto.randomBytes(32).toString('hex');
 }
+
+private async isTokenUnique(token: string): Promise<boolean> {
+  const existing = await this.em.findOne(Invitation, { token });
+  return !existing;
+}
+
+private async generateUniqueToken(): Promise<string> {
+  let token: string;
+  let attempts = 0;
+  const maxAttempts = 10;
+
+  do {
+    token = this.generateSecureToken();
+    attempts++;
+    
+    if (attempts > maxAttempts) {
+      throw new Error('Failed to generate unique token after maximum attempts');
+    }
+  } while (!(await this.isTokenUnique(token)));
+
+  return token;
+}
 ```
 
 <Note>
@@ -388,6 +447,7 @@ private generateSecureToken(): string {
 - Globally unique tokens enforced by database constraint
 - Automatic expiry validation during token checks
 - Single-use tokens that cannot be reused after acceptance
+- Retry mechanism for token generation to handle collisions
 </Note>
 
 ## System roles integration
@@ -512,6 +572,21 @@ if (invitation.expiresAt && new Date() > invitation.expiresAt) {
   await this.em.persistAndFlush(invitation);
   throw new BadRequestException('Invitation has expired');
 }
+
+// Cleanup expired invitations
+async cleanupExpiredInvitations(): Promise<number> {
+  const expiredInvitations = await this.em.find(Invitation, {
+    status: InvitationStatus.PENDING,
+    expiresAt: { $lte: new Date() }
+  });
+
+  for (const invitation of expiredInvitations) {
+    invitation.status = InvitationStatus.EXPIRED;
+  }
+
+  await this.em.flush();
+  return expiredInvitations.length;
+}
 ```
 </Accordion>
 
@@ -534,6 +609,15 @@ const role = await this.em.findOne(Role, {
   ],
   isDeleted: false
 });
+
+if (!role) {
+  throw new BadRequestException(`Invalid role assignment: ${roleAssignment.roleId}`);
+}
+
+// Validate role scope compatibility
+if (role.scope === RoleScope.TEAM && !teamContext) {
+  throw new BadRequestException('Team role requires team context');
+}
 ```
 </Accordion>
 
@@ -550,6 +634,33 @@ const userOrgRole = bypassEm.create(UserOrgRole, {
   role: { id: roleAssignment.roleId },
   organization: invitation.organization, // Org-specific assignment
   assignedBy: invitation.invitedBy
+});
+```
+</Accordion>
+
+<Accordion title="Security constraints">
+- Email verification required for new user accounts
+- Token-based authentication prevents replay attacks
+- RLS bypass requires elevated service context
+- Audit trail maintained for all role assignments
+
+```typescript
+// Security validations
+if (!this.isValidEmail(invitation.email)) {
+  throw new BadRequestException('Invalid email format');
+}
+
+if (invitation.invitedById === invitation.acceptedById) {
+  throw new BadRequestException('Cannot accept own invitation');
+}
+
+// Audit logging
+await this.auditService.logInvitationAcceptance({
+  invitationId: invitation.id,
+  userId: user.id,
+  organizationId: invitation.organizationId,
+  rolesAssigned: invitation.orgRoleAssignments.map(r => r.roleId),
+  timestamp: new Date()
 });
 ```
 </Accordion>
@@ -588,6 +699,33 @@ class InvitationService {
     
     return user;
   }
+  
+  // Helper method to execute queries with proper bypass context
+  private async withBypass<T>(operation: (em: EntityManager) => Promise<T>): Promise<T> {
+    return this.tenantContext.executeWithBypass(operation);
+  }
+}
+
+// Tenant context service implementation
+@Injectable()
+export class TenantContext {
+  constructor(@Inject(EntityManager) private readonly em: EntityManager) {}
+
+  async executeWithBypass<T>(operation: (em: EntityManager) => Promise<T>): Promise<T> {
+    const bypassEm = this.em.fork();
+    
+    // Disable RLS for this entity manager instance
+    await bypassEm.getConnection().execute('SET row_security = off');
+    
+    try {
+      const result = await operation(bypassEm);
+      await bypassEm.flush();
+      return result;
+    } finally {
+      // Re-enable RLS
+      await bypassEm.getConnection().execute('SET row_security = on');
+    }
+  }
 }
 ```
 
@@ -614,22 +752,26 @@ Common database operations for invitation management and RBAC integration:
 <AccordionGroup>
 <Accordion title="Find pending invitations by organization">
 ```sql
-SELECT i.*, u.first_name || ' ' || u.last_name as invited_by_name,
-       o.name as organization_name
+SELECT i.*, 
+       u.first_name || ' ' || u.last_name as invited_by_name,
+       o.name as organization_name,
+       t.name as team_name
 FROM invitations i
 INNER JOIN users u ON i.invited_by_id = u.id
 INNER JOIN organizations o ON i.organization_id = o.id
+LEFT JOIN teams t ON i.team_id = t.id
 WHERE i.organization_id = $1 
   AND i.status = 'pending'
   AND (i.expires_at IS NULL OR i.expires_at > NOW())
-ORDER BY i.created_at DESC;
+ORDER BY i.created_at DESC
+LIMIT $2 OFFSET $3;
 ```
 </Accordion>
 
 <Accordion title="Validate invitation role assignments">
 ```sql
 -- Validate organizational roles
-SELECT r.id, r.name, r.scope
+SELECT r.id, r.name, r.scope, r.is_system
 FROM roles r
 WHERE r.id = ANY($1::uuid[])  -- roleIds from invitation
   AND r.scope = 'ORG'
@@ -637,25 +779,31 @@ WHERE r.id = ANY($1::uuid[])  -- roleIds from invitation
   AND r.is_deleted = false;
 
 -- Validate team roles
-SELECT r.id, r.name, r.scope
+SELECT r.id, r.name, r.scope, r.is_system,
+       t.id as team_id, t.name as team_name
 FROM roles r
+CROSS JOIN teams t
 WHERE r.id = ANY($1::uuid[])  -- roleIds from invitation
   AND r.scope = 'TEAM'
-  AND (r.organization_id = $2 OR r.organization_id IS NULL)
-  AND r.is_deleted = false;
+  AND t.id = ANY($2::uuid[])  -- teamIds from invitation
+  AND (r.organization_id = $3 OR r.organization_id IS NULL)
+  AND r.is_deleted = false
+  AND t.is_deleted = false;
 ```
 </Accordion>
 
 <Accordion title="Cleanup expired invitations">
 ```sql
+-- Update expired invitations
 UPDATE invitations 
-SET status = 'expired'
+SET status = 'expired', updated_at = NOW()
 WHERE status = 'pending'
   AND expires_at IS NOT NULL
   AND expires_at < NOW();
 
--- Return count
-SELECT COUNT(*) FROM invitations 
+-- Return cleanup count
+SELECT COUNT(*) as expired_count
+FROM invitations 
 WHERE status = 'expired' 
   AND updated_at >= $1;  -- timestamp from update
 ```
@@ -664,40 +812,100 @@ WHERE status = 'expired'
 <Accordion title="Get invitation with complete role details">
 ```sql
 SELECT i.*,
-       json_agg(DISTINCT jsonb_build_object(
-         'id', r_org.id,
-         'name', r_org.name,
-         'scope', r_org.scope,
-         'isSystem', r_org.is_system
-       )) FILTER (WHERE r_org.id IS NOT NULL) as org_roles,
-       json_agg(DISTINCT jsonb_build_object(
-         'teamId', t.id,
-         'teamName', t.name,
-         'roles', team_roles.roles
-       )) FILTER (WHERE t.id IS NOT NULL) as team_assignments
+       o.name as organization_name,
+       u.first_name || ' ' || u.last_name as invited_by_name,
+       t.name as primary_team_name,
+       COALESCE(
+         json_agg(DISTINCT jsonb_build_object(
+           'id', r_org.id,
+           'name', r_org.name,
+           'scope', r_org.scope,
+           'isSystem', r_org.organization_id IS NULL
+         )) FILTER (WHERE r_org.id IS NOT NULL), 
+         '[]'::json
+       ) as org_roles,
+       COALESCE(
+         json_agg(DISTINCT jsonb_build_object(
+           'teamId', team_info.team_id,
+           'teamName', team_info.team_name,
+           'roles', team_info.roles
+         )) FILTER (WHERE team_info.team_id IS NOT NULL),
+         '[]'::json
+       ) as team_assignments
 FROM invitations i
+INNER JOIN organizations o ON i.organization_id = o.id
+INNER JOIN users u ON i.invited_by_id = u.id
+LEFT JOIN teams t ON i.team_id = t.id
 LEFT JOIN jsonb_array_elements(i.org_role_assignments) ora(role_assignment) ON true
 LEFT JOIN roles r_org ON r_org.id = (ora.role_assignment->>'roleId')::uuid
-LEFT JOIN jsonb_array_elements(i.team_role_assignments) tra(team_assignment) ON true
-LEFT JOIN teams t ON t.id = (tra.team_assignment->>'teamId')::uuid
 LEFT JOIN LATERAL (
-  SELECT json_agg(jsonb_build_object(
-    'id', r_team.id,
-    'name', r_team.name,
-    'scope', r_team.scope
-  )) as roles
-  FROM jsonb_array_elements_text(tra.team_assignment->'roleIds') role_id
-  INNER JOIN roles r_team ON r_team.id = role_id::uuid
-) team_roles ON true
+  SELECT tra.team_assignment->>'teamId' as team_id,
+         tra.team_assignment->>'teamName' as team_name,
+         json_agg(jsonb_build_object(
+           'id', r_team.id,
+           'name', r_team.name,
+           'scope', r_team.scope
+         )) as roles
+  FROM jsonb_array_elements(i.team_role_assignments) tra(team_assignment)
+  LEFT JOIN jsonb_array_elements_text(tra.team_assignment->'roleIds') role_id ON true
+  LEFT JOIN roles r_team ON r_team.id = role_id::uuid
+  GROUP BY tra.team_assignment->>'teamId', tra.team_assignment->>'teamName'
+) team_info ON true
 WHERE i.token = $1
-GROUP BY i.id;
+GROUP BY i.id, o.name, u.first_name, u.last_name, t.name;
+```
+</Accordion>
+
+<Accordion title="Find user's existing organizations">
+```sql
+-- Check if user already belongs to organization
+SELECT ou.organization_id, o.name as organization_name,
+       COUNT(uor.id) as role_count
+FROM organization_users ou
+INNER JOIN organizations o ON ou.organization_id = o.id
+LEFT JOIN user_org_roles uor ON uor.user_id = ou.user_id 
+  AND uor.organization_id = ou.organization_id
+WHERE ou.user_id = $1
+  AND ou.organization_id = $2
+GROUP BY ou.organization_id, o.name;
+```
+</Accordion>
+
+<Accordion title="Audit invitation activity">
+```sql
+-- Get invitation history with role changes
+SELECT i.id as invitation_id,
+       i.email,
+       i.status,
+       i.created_at as invited_at,
+       i.accepted_at,
+       u1.first_name || ' ' || u1.last_name as invited_by,
+       u2.first_name || ' ' || u2.last_name as accepted_by,
+       COUNT(uor.id) as org_roles_assigned,
+       COUNT(tmr.id) as team_roles_assigned
+FROM invitations i
+INNER JOIN users u1 ON i.invited_by_id = u1.id
+LEFT JOIN users u2 ON i.accepted_by_id = u2.id
+LEFT JOIN user_org_roles uor ON uor.user_id = i.accepted_by_id 
+  AND uor.organization_id = i.organization_id
+  AND uor.created_at >= i.accepted_at
+LEFT JOIN team_membership_roles tmr ON tmr.team_membership_id IN (
+  SELECT tm.id FROM team_memberships tm 
+  WHERE tm.user_id = i.accepted_by_id 
+    AND tm.organization_id = i.organization_id
+    AND tm.joined_at >= i.accepted_at
+)
+WHERE i.organization_id = $1
+GROUP BY i.id, i.email, i.status, i.created_at, i.accepted_at, 
+         u1.first_name, u1.last_name, u2.first_name, u2.last_name
+ORDER BY i.created_at DESC;
 ```
 </Accordion>
 </AccordionGroup>
 
-## Service implementation
+## Service implementation patterns
 
-Core business logic with comprehensive RBAC integration:
+Core business logic with comprehensive RBAC integration and error handling:
 
 ```typescript
 @Injectable()
@@ -707,7 +915,8 @@ export class InvitationService {
     private readonly authService: AuthService,
     private readonly emailService: EmailService,
     private readonly tenantContext: TenantContext,
-    private readonly rbacService: RbacService
+    private readonly rbacService: RbacService,
+    private readonly auditService: AuditService
   ) {}
 
   async createInvitation(dto: CreateInvitationDto): Promise<Invitation> {
@@ -730,7 +939,7 @@ export class InvitationService {
     }
 
     // Generate secure token and create invitation
-    const token = this.generateSecureToken();
+    const token = await this.generateUniqueToken();
     const invitation = this.em.create(Invitation, {
       ...dto,
       token,
@@ -739,8 +948,84 @@ export class InvitationService {
     });
 
     await this.em.persistAndFlush(invitation);
-    await this.sendInvitationEmail(invitation);
     
+    // Send invitation email
+    try {
+      await this.sendInvitationEmail(invitation);
+    } catch (error) {
+      // Log email failure but don't fail invitation creation
+      console.error('Failed to send invitation email:', error);
+      
+      // Optionally update invitation status to indicate email failure
+      invitation.emailSent = false;
+      await this.em.persistAndFlush(invitation);
+    }
+    
+    return invitation;
+  }
+
+  async acceptInvitation(token: string, userData: AcceptInvitationDto): Promise<User> {
+    const invitation = await this.validateInvitationToken(token);
+    
+    // Check if user already exists
+    const existingUser = await this.authService.findUserByEmail(invitation.email);
+    if (existingUser) {
+      throw new ConflictException('User already exists. Use existing user acceptance flow.');
+    }
+    
+    // Create new user
+    const user = await this.authService.register({
+      email: invitation.email,
+      firstName: userData.firstName,
+      lastName: userData.lastName,
+      password: userData.password,
+      phoneNumber: userData.phoneNumber,
+      languages: userData.languages
+    });
+
+    // Apply RBAC assignments with bypass context
+    await this.tenantContext.executeWithBypass(async (bypassEm) => {
+      await this.applyInvitationRbacAssignments(bypassEm, user, invitation);
+    });
+
+    // Audit log
+    await this.auditService.logInvitationAcceptance({
+      invitationId: invitation.id,
+      userId: user.id,
+      organizationId: invitation.organizationId,
+      timestamp: new Date()
+    });
+
+    return user;
+  }
+
+  async acceptInvitationExisting(token: string, user: User): Promise<Invitation> {
+    const invitation = await this.validateInvitationToken(token);
+    
+    if (invitation.email !== user.email) {
+      throw new BadRequestException('Email mismatch between invitation and authenticated user');
+    }
+
+    // Check if user is already a member of the organization
+    const existingMembership = await this.em.findOne(OrganizationUser, {
+      user,
+      organization: invitation.organization
+    });
+
+    // Apply RBAC assignments
+    await this.tenantContext.executeWithBypass(async (bypassEm) => {
+      await this.applyInvitationRbacAssignments(bypassEm, user, invitation);
+    });
+
+    // Audit log
+    await this.auditService.logInvitationAcceptance({
+      invitationId: invitation.id,
+      userId: user.id,
+      organizationId: invitation.organizationId,
+      wasExistingUser: true,
+      timestamp: new Date()
+    });
+
     return invitation;
   }
 
@@ -750,9 +1035,10 @@ export class InvitationService {
     teamRoleAssignments: TeamRoleAssignment[]
   ): Promise<void> {
     // Validate organizational roles
-    for (const roleAssignment of orgRoleAssignments) {
-      const role = await this.em.findOne(Role, {
-        id: roleAssignment.roleId,
+    const orgRoleIds = orgRoleAssignments.map(ra => ra.roleId);
+    if (orgRoleIds.length > 0) {
+      const validOrgRoles = await this.em.find(Role, {
+        id: { $in: orgRoleIds },
         scope: RoleScope.ORG,
         $or: [
           { organization: organizationId }, // Custom role
@@ -761,13 +1047,17 @@ export class InvitationService {
         isDeleted: false
       });
       
-      if (!role) {
-        throw new BadRequestException(`Invalid org role: ${roleAssignment.roleId}`);
+      if (validOrgRoles.length !== orgRoleIds.length) {
+        const invalidIds = orgRoleIds.filter(id => 
+          !validOrgRoles.find(role => role.id === id)
+        );
+        throw new BadRequestException(`Invalid org roles: ${invalidIds.join(', ')}`);
       }
     }
     
     // Validate team roles and teams
     for (const teamAssignment of teamRoleAssignments) {
+      // Validate team exists
       const team = await this.em.findOne(Team, {
         id: teamAssignment.teamId,
         organization: organizationId,
@@ -778,26 +1068,120 @@ export class InvitationService {
         throw new BadRequestException(`Invalid team: ${teamAssignment.teamId}`);
       }
       
-      for (const roleId of teamAssignment.roleIds) {
-        const role = await this.em.findOne(Role, {
-          id: roleId,
-          scope: RoleScope.TEAM,
-          $or: [
-            { organization: organizationId },
-            { organization: null }
-          ],
-          isDeleted: false
-        });
-        
-        if (!role) {
-          throw new BadRequestException(`Invalid team role: ${roleId}`);
-        }
+      // Validate team roles
+      const validTeamRoles = await this.em.find(Role, {
+        id: { $in: teamAssignment.roleIds },
+        scope: RoleScope.TEAM,
+        $or: [
+          { organization: organizationId },
+          { organization: null }
+        ],
+        isDeleted: false
+      });
+      
+      if (validTeamRoles.length !== teamAssignment.roleIds.length) {
+        const invalidIds = teamAssignment.roleIds.filter(id =>
+          !validTeamRoles.find(role => role.id === id)
+        );
+        throw new BadRequestException(`Invalid team roles: ${invalidIds.join(', ')}`);
       }
     }
   }
 
-  private generateSecureToken(): string {
-    return crypto.randomBytes(32).toString('hex');
+  private async sendInvitationEmail(invitation: Invitation): Promise<void> {
+    const template = await this.emailService.getTemplate('invitation');
+    
+    const emailData = {
+      to: invitation.email,
+      subject: `Invitation to join ${invitation.organization.name}`,
+      template: 'invitation',
+      context: {
+        organizationName: invitation.organization.name,
+        invitedByName: `${invitation.invitedBy.firstName} ${invitation.invitedBy.lastName}`,
+        welcomeMessage: invitation.welcomeMessage,
+        acceptUrl: `${process.env.FRONTEND_URL}/invitations/accept/${invitation.token}`,
+        expiresAt: invitation.expiresAt,
+        orgRoles: invitation.orgRoleAssignments,
+        teamAssignments: invitation.teamRoleAssignments
+      }
+    };
+
+    await this.emailService.send(emailData);
+  }
+
+  async cancelInvitation(invitationId: string, cancelledById: string): Promise<void> {
+    const invitation = await this.em.findOne(Invitation, {
+      id: invitationId,
+      status: InvitationStatus.PENDING
+    });
+
+    if (!invitation) {
+      throw new NotFoundException('Pending invitation not found');
+    }
+
+    invitation.status = InvitationStatus.CANCELLED;
+    invitation.cancelledBy = { id: cancelledById } as User;
+    invitation.cancelledAt = new Date();
+
+    await this.em.persistAndFlush(invitation);
+
+    // Audit log
+    await this.auditService.logInvitationCancellation({
+      invitationId,
+      cancelledById,
+      organizationId: invitation.organizationId,
+      timestamp: new Date()
+    });
+  }
+
+  async cleanupExpiredInvitations(): Promise<number> {
+    const expiredInvitations = await this.em.find(Invitation, {
+      status: InvitationStatus.PENDING,
+      expiresAt: { $lte: new Date() }
+    });
+
+    for (const invitation of expiredInvitations) {
+      invitation.status = InvitationStatus.EXPIRED;
+    }
+
+    if (expiredInvitations.length > 0) {
+      await this.em.flush();
+    }
+
+    return expiredInvitations.length;
+  }
+
+  async resendInvitation(invitationId: string, requestedById: string): Promise<void> {
+    const invitation = await this.em.findOne(
+      Invitation,
+      { id: invitationId, status: InvitationStatus.PENDING },
+      { populate: ['organization', 'invitedBy'] }
+    );
+
+    if (!invitation) {
+      throw new NotFoundException('Pending invitation not found');
+    }
+
+    // Check if invitation has expired
+    if (invitation.expiresAt && new Date() > invitation.expiresAt) {
+      throw new BadRequestException('Cannot resend expired invitation');
+    }
+
+    // Generate new token for security
+    invitation.token = await this.generateUniqueToken();
+    invitation.resentAt = new Date();
+    invitation.resentBy = { id: requestedById } as User;
+
+    await this.em.persistAndFlush(invitation);
+    await this.sendInvitationEmail(invitation);
+
+    // Audit log
+    await this.auditService.logInvitationResend({
+      invitationId,
+      resentById: requestedById,
+      organizationId: invitation.organizationId,
+      timestamp: new Date()
+    });
   }
 }
 ```
@@ -815,18 +1199,25 @@ export class InvitationController {
   @Post()
   @UseGuards(JwtAuthGuard, PermissionGuard)
   @RequirePermissions('invitations:create')
+  @ApiOperation({ summary: 'Create a new invitation' })
   async createInvitation(
     @Body() dto: CreateInvitationDto,
-    @CurrentUser() user: User
+    @CurrentUser() user: User,
+    @CurrentOrganization() organizationId: string
   ): Promise<Invitation> {
-    return this.invitationService.createInvitation({ ...dto, invitedById: user.id });
+    return this.invitationService.createInvitation({ 
+      ...dto, 
+      invitedById: user.id,
+      organizationId 
+    });
   }
 
   @Get()
   @UseGuards(JwtAuthGuard, PermissionGuard)
   @RequirePermissions('invitations:read')
+  @ApiOperation({ summary: 'Get organization invitations' })
   async getInvitations(
-    @Query() query: PaginationDto,
+    @Query() query: PaginationDto & InvitationFilterDto,
     @CurrentOrganization() organizationId: string
   ): Promise<{ invitations: Invitation[]; total: number }> {
     return this.invitationService.getPendingInvitations(organizationId, query);
@@ -834,18 +1225,31 @@ export class InvitationController {
 
   @Get(':token')
   @ApiOperation({ summary: 'Get invitation details by token (public endpoint)' })
-  async getInvitationByToken(@Param('token') token: string): Promise<Invitation> {
-    return this.invitationService.getInvitationByToken(token);
+  @ApiParam({ name: 'token', description: 'Invitation token' })
+  async getInvitationByToken(@Param('token') token: string): Promise<InvitationDetailsDto> {
+    const invitation = await this.invitationService.getInvitationByToken(token);
+    
+    return {
+      id: invitation.id,
+      email: invitation.email,
+      organizationName: invitation.organization.name,
+      invitedByName: `${invitation.invitedBy.firstName} ${invitation.invitedBy.lastName}`,
+      welcomeMessage: invitation.welcomeMessage,
+      expiresAt: invitation.expiresAt,
+      orgRoles: invitation.orgRoleAssignments,
+      teamAssignments: invitation.teamRoleAssignments
+    };
   }
 
   @Post('accept/:token')
   @ApiOperation({ summary: 'Accept invitation - new user registration' })
+  @ApiParam({ name: 'token', description: 'Invitation token' })
   async acceptInvitation(
     @Param('token') token: string,
     @Body() userData: AcceptInvitationDto
   ): Promise<AuthResponse> {
     const user = await this.invitationService.acceptInvitation(token, userData);
-    const authToken = await this.authService.generateTokens(user);
+    const authTokens = await this.authService.generateTokens(user);
     
     const invitation = await this.invitationService.getInvitationByToken(token);
     const permissions = await this.rbacService.getUserPermissions(
@@ -854,20 +1258,31 @@ export class InvitationController {
     );
     
     return { 
-      user, 
-      accessToken: authToken.accessToken,
-      refreshToken: authToken.refreshToken,
-      permissions: permissions.allPermissions
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        selectedOrganizationId: invitation.organization.id
+      },
+      accessToken: authTokens.accessToken,
+      refreshToken: authTokens.refreshToken,
+      permissions: permissions.allPermissions,
+      organization: {
+        id: invitation.organization.id,
+        name: invitation.organization.name
+      }
     };
   }
 
   @Post('accept-existing/:token')
   @UseGuards(JwtAuthGuard)
   @ApiOperation({ summary: 'Accept invitation - existing user' })
+  @ApiParam({ name: 'token', description: 'Invitation token' })
   async acceptInvitationExisting(
     @Param('token') token: string,
     @CurrentUser() user: User
-  ): Promise<InvitationResponse> {
+  ): Promise<InvitationAcceptanceResponse> {
     const invitation = await this.invitationService.acceptInvitationExisting(token, user);
     
     const permissions = await this.rbacService.getUserPermissions(
@@ -877,25 +1292,136 @@ export class InvitationController {
     
     return { 
       success: true, 
-      invitation,
-      permissions: permissions.allPermissions
+      invitation: {
+        id: invitation.id,
+        organizationName: invitation.organization.name,
+        completedAt: invitation.acceptedAt
+      },
+      permissions: permissions.allPermissions,
+      organization: {
+        id: invitation.organization.id,
+        name: invitation.organization.name
+      }
     };
   }
 
   @Patch(':id/cancel')
   @UseGuards(JwtAuthGuard, PermissionGuard)
   @RequirePermissions('invitations:cancel')
-  async cancelInvitation(@Param('id') id: string): Promise<{ success: boolean }> {
-    await this.invitationService.cancelInvitation(id);
+  @ApiOperation({ summary: 'Cancel a pending invitation' })
+  async cancelInvitation(
+    @Param('id') id: string,
+    @CurrentUser() user: User
+  ): Promise<{ success: boolean }> {
+    await this.invitationService.cancelInvitation(id, user.id);
+    return { success: true };
+  }
+
+  @Post(':id/resend')
+  @UseGuards(JwtAuthGuard, PermissionGuard)
+  @RequirePermissions('invitations:resend')
+  @ApiOperation({ summary: 'Resend invitation email' })
+  async resendInvitation(
+    @Param('id') id: string,
+    @CurrentUser() user: User
+  ): Promise<{ success: boolean }> {
+    await this.invitationService.resendInvitation(id, user.id);
     return { success: true };
   }
 
   @Delete('cleanup-expired')
   @UseGuards(JwtAuthGuard, PermissionGuard)
   @RequirePermissions('invitations:cleanup')
+  @ApiOperation({ summary: 'Cleanup expired invitations (admin only)' })
   async cleanupExpiredInvitations(): Promise<{ cleaned: number }> {
     const cleaned = await this.invitationService.cleanupExpiredInvitations();
     return { cleaned };
+  }
+
+  @Get(':id/audit')
+  @UseGuards(JwtAuthGuard, PermissionGuard)
+  @RequirePermissions('invitations:audit')
+  @ApiOperation({ summary: 'Get invitation audit trail' })
+  async getInvitationAudit(@Param('id') id: string): Promise<InvitationAuditDto[]> {
+    return this.invitationService.getInvitationAuditTrail(id);
+  }
+}
+```
+
+## Error handling and exception management
+
+Comprehensive error handling with specific exception types for different failure scenarios:
+
+```typescript
+// Custom exception types for invitation-specific errors
+export class InvitationExpiredException extends BadRequestException {
+  constructor(message = 'Invitation has expired') {
+    super({
+      error: 'INVITATION_EXPIRED',
+      message,
+      statusCode: 400
+    });
+  }
+}
+
+export class InvitationAlreadyAcceptedException extends ConflictException {
+  constructor(message = 'Invitation has already been accepted') {
+    super({
+      error: 'INVITATION_ALREADY_ACCEPTED',
+      message,
+      statusCode: 409
+    });
+  }
+}
+
+export class InvalidRoleAssignmentException extends BadRequestException {
+  constructor(roleId: string, context?: string) {
+    super({
+      error: 'INVALID_ROLE_ASSIGNMENT',
+      message: `Invalid role assignment: ${roleId}`,
+      context,
+      statusCode: 400
+    });
+  }
+}
+
+// Error handling in service methods
+async acceptInvitation(token: string, userData: AcceptInvitationDto): Promise<User> {
+  try {
+    const invitation = await this.validateInvitationToken(token);
+    
+    // Check various error conditions
+    if (invitation.status === InvitationStatus.COMPLETED) {
+      throw new InvitationAlreadyAcceptedException();
+    }
+    
+    if (invitation.expiresAt && new Date() > invitation.expiresAt) {
+      throw new InvitationExpiredException();
+    }
+    
+    const existingUser = await this.authService.findUserByEmail(invitation.email);
+    if (existingUser && !existingUser.isDeleted) {
+      throw new ConflictException('User already exists. Use existing user flow.');
+    }
+    
+    // Proceed with acceptance logic...
+    
+  } catch (error) {
+    // Log the error with context
+    this.logger.error('Failed to accept invitation', {
+      token: token.substring(0, 8) + '...',
+      email: userData.email,
+      error: error.message,
+      stack: error.stack
+    });
+    
+    // Re-throw known exceptions
+    if (error instanceof HttpException) {
+      throw error;
+    }
+    
+    // Wrap unexpected errors
+    throw new InternalServerErrorException('Failed to process invitation acceptance');
   }
 }
 ```

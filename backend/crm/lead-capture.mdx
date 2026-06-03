@@ -1,0 +1,361 @@
+---
+title: "Lead Capture"
+description: "Unified inbound lead ingestion pipeline for processing leads from all sources into the CRM system with consistent source fields, person reuse, deduplication, and assignment."
+---
+
+The Lead Capture module provides a unified, source-agnostic pipeline that processes leads from Property Finder, Bayut/dubizzle, Meta Ads, website forms, and other sources into the CRM system. It ensures consistent data handling, person reuse, deduplication, and proper assignment across all lead sources.
+
+<Note>
+This module sits above existing CRM primitives and orchestrates them rather than reimplementing core functionality like lead creation, person matching, or assignment logic.
+</Note>
+
+## Architecture Overview
+
+The Lead Capture system follows a modular adapter pattern where each lead source implements a standardized interface:
+
+```
+crm/lead-capture/
+├── lead-capture.service.ts              # Main orchestration service
+├── lead-capture-source.interface.ts     # Adapter contract
+├── captured-lead-input.ts               # Input/output types
+├── lead-capture-settings.entity.ts      # Org-level settings
+├── captured-lead.entity.ts              # Audit ledger
+└── queue/lead-ingestion.worker.ts       # Async processing
+```
+
+<Info>
+Source modules depend on lead-capture, never the reverse. This ensures clean separation where portal-syndication provides adapters for Property Finder and Bayut without creating circular dependencies.
+</Info>
+
+## Core Contracts
+
+### CapturedLeadInput
+
+The standardized input contract that all sources must provide:
+
+```typescript
+interface CapturedLeadInput {
+  orgId: string;
+  source: LeadSource;                  // Bayut | PropertyFinder | Dubizzle | Website | Instagram
+  sourceDetail?: string;               // Campaign / form / "WhatsApp message"
+  referenceId?: string;                // Listing / campaign / form id
+  externalLeadId?: string;             // Source's own lead id for idempotency
+
+  identity: {                          // Person matching in priority order
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    phone?: string;
+    channel?: { type: ChannelType; identifier: string };
+  };
+
+  intent?: LeadIntent;
+  propertyRef?: { listingId?: string; refUnitId?: number };
+  assignmentHint?: CaptureAssignmentConfig;
+  capturedAt?: Date;
+  rawPayload: unknown;                 // Stored for audit/replay
+}
+```
+
+### CaptureResult
+
+The standardized response indicating processing outcome:
+
+```typescript
+interface CaptureResult {
+  leadId: string;
+  personId: string;
+  outcome: 'created' | 'attached' | 'skipped';
+  assignment: 'agent' | 'team_pool' | 'org_pool' | 'queued' | 'none';
+}
+```
+
+### Source Adapter Interface
+
+Each lead source implements this interface:
+
+```typescript
+interface LeadCaptureSource {
+  readonly source: LeadSource;
+  toCapturedInput(raw: unknown, ctx: { orgId: string }): CapturedLeadInput | CapturedLeadInput[];
+}
+```
+
+## Processing Pipeline
+
+The `LeadCaptureService.capture()` method processes leads through six stages:
+
+<Steps>
+<Step title="Idempotency Guard">
+Check the `captured_lead` ledger by `(orgId, source, externalLeadId)` to prevent duplicate processing of the same external lead.
+</Step>
+
+<Step title="Source Field Normalization">
+Derive standardized `leadSource`, `sourceDetail`, `referenceId`, and any associated `sourceChannel`/`sourceConversation` fields.
+</Step>
+
+<Step title="Identity Resolution">
+Resolve or create a `Person` record using existing matchers in priority order:
+- Channel identifier (WhatsApp, Instagram, Messenger)
+- Email address
+- Phone number
+</Step>
+
+<Step title="Deduplication Check">
+Determine whether to create a new lead or attach to an existing open lead based on Person + source + reference matching.
+</Step>
+
+<Step title="Assignment Resolution">
+Apply assignment strategy based on org defaults, source overrides, and listing agent hints.
+</Step>
+
+<Step title="Create or Attach">
+Execute lead creation via `createLeadInTransaction` or attach re-inquiry activity, then record the audit ledger entry.
+</Step>
+</Steps>
+
+<Warning>
+The entire pipeline runs within `tenantContext.executeInOrg()` using the system actor for audit trails. Failures bubble to the worker for pg-boss retry handling.
+</Warning>
+
+## Source Field Mapping
+
+Lead capture applies consistent source field policies:
+
+| Field | Rule |
+|-------|------|
+| `Lead.leadSource` | Maps directly from `input.source` |
+| `Lead.sourceDetail` | Campaign name, agent target, or interaction type |
+| `Lead.referenceId` | Listing/campaign/form ID for attribution and deduplication |
+| `Lead.sourceChannel` | Resolved `PersonChannel` for messaging sources |
+| `Lead.sourceConversation` | Set when captured from messaging conversations |
+| `Person.originalSource` | Set only on first creation (first-touch attribution) |
+
+## Identity Resolution
+
+The system reuses existing person records to maintain unified customer profiles across lead sources:
+
+<Tabs>
+<Tab title="Channel Matching">
+```typescript
+// Priority 1: Channel identifier
+const channel = await findPersonByChannel(
+  identity.channel.type, 
+  identity.channel.identifier
+);
+```
+</Tab>
+
+<Tab title="Email Matching">
+```typescript
+// Priority 2: Email address
+const person = await PersonService.findByEmailInTransaction(
+  em, 
+  identity.email, 
+  orgId
+);
+```
+</Tab>
+
+<Tab title="Phone Matching">
+```typescript
+// Priority 3: Phone number
+const person = await PersonService.findByPhoneInTransaction(
+  em, 
+  identity.phone, 
+  orgId
+);
+```
+</Tab>
+</Tabs>
+
+<Tip>
+When a match is found, the system enriches the existing person record with any new contact information rather than creating duplicates.
+</Tip>
+
+## Deduplication Strategy
+
+The system implements two layers of deduplication:
+
+### Hard Idempotency
+Uses `externalLeadId` in the `captured_lead` ledger to prevent processing the same external lead twice, making webhook retries and poll overlaps safe.
+
+### Re-inquiry Detection
+When the same Person + leadSource + referenceId combination already has an **open** lead:
+- Attaches a re-inquiry activity to the existing lead
+- Updates the lead's `updatedAt` timestamp
+- Returns `outcome: 'attached'` instead of creating a duplicate
+
+<CodeGroup>
+```typescript Deduplication Check
+const existingLead = await LeadService.findDuplicateLeadMatchInTransaction(
+  em,
+  personId,
+  input.source,
+  input.referenceId,
+  orgId
+);
+
+if (existingLead && existingLead.status === 'active') {
+  // Attach re-inquiry activity
+  return { outcome: 'attached', leadId: existingLead.id };
+}
+```
+
+```typescript New Lead Creation
+const newLead = await LeadService.createLeadInTransaction(
+  em,
+  leadData,
+  systemActorId,
+  orgId,
+  { stakeholders, skipDistribution: false, systemInitiated: true }
+);
+```
+</CodeGroup>
+
+## Assignment Strategies
+
+Lead assignment follows a configurable strategy hierarchy:
+
+```typescript
+enum CaptureAssignmentStrategy {
+  LISTING_PUBLISHER = 'listing_publisher',  // Agent who published the listing
+  TEAM_POOL = 'team_pool',                  // Team-based distribution
+  ORG_POOL = 'org_pool',                    // Organization-wide pool
+  MANUAL = 'manual',                        // Queue for manual assignment
+  NONE = 'none'                             // No automatic assignment
+}
+```
+
+<AccordionGroup>
+<Accordion title="Listing Publisher Strategy">
+Assigns leads to the agent who published the referenced listing. Falls back to team or org pool if no listing agent is found. Uses `agentEmailHint` from the captured input when available.
+</Accordion>
+
+<Accordion title="Pool-based Strategies">
+Leverages the existing distribution engine for team-based or organization-wide assignment pools with round-robin or weighted distribution.
+</Accordion>
+
+<Accordion title="Manual Assignment">
+Queues leads for manual assignment by supervisors or team leads. Useful for high-value leads or complex scenarios.
+</Accordion>
+</AccordionGroup>
+
+## Audit and Compliance
+
+### Captured Lead Ledger
+Every processed lead creates an audit record in the `captured_lead` table:
+
+```typescript
+interface CapturedLead {
+  id: string;
+  organization: string;
+  source: LeadSource;
+  externalLeadId?: string;
+  referenceId?: string;
+  personId: string;
+  leadId?: string;
+  outcome: 'created' | 'attached' | 'skipped';
+  rawPayload: object;        // Original source payload
+  capturedAt: Date;
+}
+```
+
+<Check>
+The ledger enables replay capabilities, audit trails, and debugging of lead processing issues.
+</Check>
+
+### Query Interface
+The module provides read access to captured lead data:
+
+```typescript
+// Get leads for a specific listing
+const leads = await leadCaptureService.findCapturedLeadsForListing(
+  listingId, 
+  orgId
+);
+```
+
+## Async Processing
+
+Lead ingestion uses pg-boss queues for reliable async processing:
+
+<Steps>
+<Step title="Queue Job Creation">
+Source adapters enqueue lead data to the `lead-ingestion` queue instead of processing synchronously.
+</Step>
+
+<Step title="Worker Processing">
+The `LeadIngestionWorker` processes queued jobs through the capture pipeline with automatic retry on failure.
+</Step>
+
+<Step title="Error Handling">
+Failed jobs are retried with exponential backoff. The idempotency guard prevents duplicate processing on retry.
+</Step>
+</Steps>
+
+## Integration Examples
+
+<Tabs>
+<Tab title="Portal Syndication">
+```typescript
+// Property Finder adapter
+class PfLeadCaptureAdapter implements LeadCaptureSource {
+  readonly source = LeadSource.PropertyFinder;
+
+  toCapturedInput(raw: PfLeadPayload, ctx: { orgId: string }): CapturedLeadInput {
+    return {
+      orgId: ctx.orgId,
+      source: LeadSource.PropertyFinder,
+      sourceDetail: raw.campaign_name,
+      referenceId: await this.resolveListingId(raw.property_id),
+      externalLeadId: raw.lead_id,
+      identity: {
+        firstName: raw.first_name,
+        email: raw.email,
+        phone: raw.phone
+      },
+      rawPayload: raw
+    };
+  }
+}
+```
+</Tab>
+
+<Tab title="Messaging Integration">
+```typescript
+// WhatsApp message capture
+const capturedLead: CapturedLeadInput = {
+  orgId,
+  source: LeadSource.WhatsApp,
+  sourceDetail: 'WhatsApp message',
+  identity: {
+    firstName: contact.name,
+    channel: { 
+      type: ChannelType.WHATSAPP, 
+      identifier: contact.phone 
+    }
+  },
+  rawPayload: messageData
+};
+
+const result = await leadCaptureService.capture(capturedLead);
+```
+</Tab>
+</Tabs>
+
+## Configuration
+
+<CardGroup cols={2}>
+<Card title="Organization Settings" icon="gear">
+Configure default assignment strategies and source-specific overrides at the organization level.
+</Card>
+
+<Card title="Source Registration" icon="plug">
+Source adapters self-register during module initialization through the `LeadCaptureSourceRegistry`.
+</Card>
+</CardGroup>
+
+<Note>
+The lead capture module is designed to be extended. Future sources like Meta Ads or website forms can be added by implementing the `LeadCaptureSource` interface without modifying core pipeline logic.
+</Note>
