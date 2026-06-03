@@ -1,0 +1,323 @@
+---
+title: "Workflow Engine Specification v27"
+description: "Comprehensive specification for the rule-based automation workflow engine, covering visual workflow builder, triggers, execution phases, and messaging integration."
+---
+
+## Overview
+
+The Workflow Engine provides rule-based automation for the messaging module. It evaluates configurable automation rules against messaging events (new messages, new conversations, AI escalations) and executes actions such as assigning agents, sending templates, creating tasks, and updating lead stages.
+
+<Info>
+Rules are evaluated in **Phase B** of the webhook processor pipeline, isolated in a try-catch block so failures never affect message persistence or delivery.
+</Info>
+
+## Core concepts
+
+### Visual workflow
+
+The current workflow builder persists visual automations in the `workflow` table. Each workflow has a `triggerType`, optional `triggerConfig`, and a JSONB `graph` containing ordered step definitions and their connections.
+
+<Tabs>
+<Tab title="Save operations">
+The frontend builder uses an explicit-save model for **Save** (`PATCH /v1/workflows/:id` without lifecycle) and **Publish** / **Republish**:
+
+- **New unsaved draft**: `POST /v1/workflows` with `status: PUBLISHED` (atomic create + publish)
+- **Existing row**: `PATCH /v1/workflows/:id` with editor payload plus `status: PUBLISHED` (merge, publish-grade validation, version bump when structural fields change)
+- **Unpublish and archive**: `PATCH` with `status: DRAFT` or `status: ARCHIVED` (lifecycle-only rules apply)
+</Tab>
+
+<Tab title="Workflow creation">
+- **Start from scratch** — Opens a local draft with an empty graph and no trigger selected. User must choose a trigger before saving.
+- **Template** — Opens a local draft from a system-level `WorkflowTemplate` record, copying its trigger type and graph into an editable local workflow. Database row created only on explicit save.
+</Tab>
+</Tabs>
+
+### Workflow templates
+
+Workflow templates are stored in the database, not hardcoded in the frontend. They are:
+
+- Seeded by `WorkflowTemplateSeeder`
+- Exposed through `GET /v1/workflows/templates` 
+- Global system catalog records with no organization ownership
+- Upserted by stable slug and reactivated if a previously soft-deleted slug is seeded again
+
+<Warning>
+Seeded templates must be ready-to-publish in any organization. They may use generic steps but must not preselect organization-specific AI agents, users, teams, lead stages, or notification recipients.
+</Warning>
+
+## Workflow triggers
+
+The visual builder trigger picker exposes this reduced set:
+
+<CardGroup cols={2}>
+<Card title="FIRST_MESSAGE_RECEIVED" icon="message">
+First Message Received
+</Card>
+<Card title="MESSAGING_WINDOW_REOPENED" icon="window-restore">
+Messaging Window Reopened  
+</Card>
+<Card title="CONTACT_FIELD_UPDATED" icon="user-pen">
+Contact Field Updated
+</Card>
+<Card title="ASSIGNMENT_CHANGED" icon="user-group">
+Assignment Changed
+</Card>
+<Card title="LEAD_CREATED_FROM_CAMPAIGN" icon="bullhorn">
+Lead Created from Campaign
+</Card>
+<Card title="LIFECYCLE_UPDATED" icon="arrow-right">
+Lead Moved to Stage
+</Card>
+<Card title="INCOMING_WEBHOOK" icon="webhook">
+Webhook / Integration Event
+</Card>
+</CardGroup>
+
+<Note>
+The backend `WorkflowTriggerType` enum, frontend API enum, and database CHECK constraints are aligned to this same seven-trigger set.
+</Note>
+
+## Workflow scope and permissions
+
+Workflows can be organization-scoped or personal:
+
+### Permission model
+
+<AccordionGroup>
+<Accordion title="Organization workflows">
+- Users with `MESSAGING_MANAGE` can create organization workflows by default
+- May choose personal scope in the builder
+- Publishing is unique by `(organization_id, trigger_type)`
+- Database enforces with partial unique index `workflow_org_published_trigger_unique`
+</Accordion>
+
+<Accordion title="Personal workflows">
+- Users without `MESSAGING_MANAGE` always create personal workflows owned by the authenticated user
+- Publishing is unique by `(organization_id, owner_user_id, trigger_type)`
+- Database enforces with partial unique index `workflow_personal_published_trigger_unique`
+</Accordion>
+</AccordionGroup>
+
+### Access control
+
+Service-level enforcement uses `AccessService.assertWorkflowAccessInTransaction`:
+
+- **Organization workflows**: Require messaging view/manage for read and `MESSAGING_MANAGE` for MODIFY/DELETE
+- **Personal workflows**: Fully accessible to the owner; non-owners need messaging permissions per `ACCESS_CONTROL_SYSTEM.md`
+- **AI-triggered child workflows**: Personal agents can trigger only their owner's personal workflows; organization agents can trigger only organization workflows
+
+<Warning>
+Workflow-to-workflow chains are strict scope matches. `MESSAGING_MANAGE` does not allow a personal workflow to trigger organization workflows.
+</Warning>
+
+## Branch conditions
+
+Visual workflow branches use the structured backend `BranchCondition` schema:
+
+```json
+{
+  "category": "contact_field",
+  "field": "email",
+  "operator": "exists",
+  "value": null,
+  "stepId": null
+}
+```
+
+### Supported categories
+
+<Tabs>
+<Tab title="Contact & Lead">
+- `contact_field` - Values resolve through `PersonService` workflow branch helpers
+- `lead_stage` - Compares against organization's effective lead stages
+</Tab>
+
+<Tab title="Assignee & Messages">
+- `assignee_status` - Resolves through `WorkflowMessageStatusReaderService`
+- `last_incoming_message` / `last_outgoing_message` - Latest message fields
+- `time_since_last_incoming_message` / `time_since_last_outgoing_message` - Time-based conditions
+</Tab>
+
+<Tab title="Previous Steps">
+- `previous_step_output` - Reads from `execution.variables.steps[stepId]`
+- Publish validation requires selected `stepId` to be the Branch node's single direct previous step
+</Tab>
+</Tabs>
+
+### Operators
+
+<CodeGroup>
+```json Comparison
+{
+  "operator": "eq|neq|gt|gte|lt|lte"
+}
+```
+
+```json Text
+{
+  "operator": "contains|not_contains"  
+}
+```
+
+```json Array/Set
+{
+  "operator": "in|has_any_of|has_all_of|has_none_of"
+}
+```
+
+```json Existence
+{
+  "operator": "exists|not_exists"
+}
+```
+
+```json Range
+{
+  "operator": "between"
+}
+```
+</CodeGroup>
+
+<Note>
+Validation and runtime comparison are type-aware. `exists`/`not_exists` require no value; `in` requires a non-empty array; `between` requires a two-element bound.
+</Note>
+
+## Step execution
+
+### Execution model
+
+Step handlers can return:
+
+- `COMPLETED` - Step finished successfully, continue to next step
+- `FAILED` - Step failed, follow failure branch if configured  
+- `WAITING` - Step waiting for external event/timeout
+- `SKIPPED` - Step skipped, continue through default connection
+
+### Transaction handling
+
+<Steps>
+<Step title="Lock execution">
+`runStep()` takes a pessimistic lock on the `WorkflowExecution` row while creating or reusing a `WorkflowStepExecution` attempt
+</Step>
+
+<Step title="Execute handler">
+Most handlers execute inside that transaction for atomic workflow state and domain mutations
+</Step>
+
+<Step title="Handle long operations">
+Long or independently idempotent handlers (`SEND_MESSAGE`, `ASK_QUESTION`, `TRIGGER_ANOTHER_WORKFLOW`) are:
+- Claimed in a short transaction
+- Run outside the workflow row lock  
+- Re-lock execution to persist handler result
+</Step>
+
+<Step title="Continue execution">
+Successful steps advance `currentStepId` and enqueue the next step
+</Step>
+</Steps>
+
+### Wait step handling
+
+The Wait step stores duration as `durationMs`:
+
+<Warning>
+Frontend controls may display seconds, minutes, hours, or days, but saved workflow JSON must use milliseconds for queue worker compatibility.
+</Warning>
+
+- Wait durations must be between 1 second and 7 days
+- Handler schedules a delayed resume job for the same wait node
+- Engine completes the waiting step and continues to `connections.default`
+- If no default target exists, wait completes as terminal successful path after delay
+
+## Graph validation
+
+Publish-grade graph validation is server-side and uses `node.connections` as the executable source of truth:
+
+<Check>
+**Required validations:**
+- Exactly one entry node
+- Every connection target references an existing node  
+- No unreachable nodes
+- No regular graph cycles (except intentional loops through `JUMP_TO`)
+- `END` nodes cannot have outgoing connections
+</Check>
+
+### Connection types
+
+Branching steps must persist explicit output targets:
+
+<Tabs>
+<Tab title="Branch steps">
+- `BRANCH`: `connections.branches[].nextStepId`
+- `DATE_TIME`: `connections.inWindowBranch` and `connections.outOfWindowBranch`
+- `CHECK_TEAM_AVAILABILITY`: `connections.availableBranch` and `connections.unavailableBranch`
+</Tab>
+
+<Tab title="Failure handling">
+- Advanced failure branches: `connections.onFailure`
+- Ask Question send-failure: `connections.onMessageFailure`
+- Ask Question timeout: `connections.onTimeout`
+</Tab>
+</Tabs>
+
+## Message handling
+
+### Send message step
+
+The Send Message step supports `messageType`:
+
+- **TEXT**: Requires non-empty `content`, limited to 2,000 characters
+- **TEMPLATE**: Uses predefined message templates
+- **MEDIA**: Supports file attachments
+
+### Ask question step
+
+Ask Question steps handle interactive conversations:
+
+- Wait for user response with configurable timeout
+- Branch based on response content or timeout
+- Support validation rules for expected response format
+- Handle message delivery failures with dedicated failure branch
+
+## Integration points
+
+### Webhook processor pipeline
+
+<Info>
+Workflow evaluation occurs in **Phase B** of the webhook processor pipeline, ensuring message persistence is never affected by workflow failures.
+</Info>
+
+### AI agent integration
+
+AI-triggered workflows follow strict scope rules:
+
+- Personal AI agents → Personal workflows (same owner)
+- Organization AI agents → Organization workflows only
+- No cross-scope triggering allowed
+
+### External integrations
+
+Workflows can integrate with external systems through:
+
+- **Webhook triggers**: `INCOMING_WEBHOOK` trigger type
+- **Outbound webhooks**: Custom webhook steps in workflow graph
+- **API integrations**: Service-specific integration steps
+
+## Performance and limits
+
+### Execution limits
+
+- **Maximum step iterations**: Enforced through `WorkflowExecution.stepIterations` 
+- **Graph complexity**: Validated at publish time
+- **Concurrent executions**: Limited per organization to prevent resource exhaustion
+
+### Monitoring
+
+- Step execution attempts tracked in `WorkflowStepExecution` table
+- Execution status and progress in `WorkflowExecution` table
+- Failed executions logged with detailed error information
+- Performance metrics collected for optimization
+
+<Tip>
+Use the workflow execution logs to debug complex automation flows and identify performance bottlenecks.
+</Tip>
