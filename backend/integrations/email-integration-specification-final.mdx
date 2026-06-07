@@ -1,0 +1,346 @@
+---
+title: "Email Integration Specification"
+description: "Complete specification for Gmail and Outlook OAuth integration, including token management, API surfaces, and security requirements"
+---
+
+## Overview
+
+This specification covers Gmail and Outlook **mail** OAuth integration, token storage, refresh mechanisms, and API surfaces. Calendar OAuth is documented separately in the calendar system deep dive.
+
+<Note>
+This specification covers email integration only. Calendar OAuth flows are handled separately and documented in `CALENDAR_SYSTEM_DEEP_DIVE.md`.
+</Note>
+
+## OAuth Flow
+
+The OAuth flow operates within a tenant session context and supports both personal and organization-level integrations.
+
+### Flow steps
+
+<Steps>
+<Step title="User authentication">
+User has selected an organization and the SPA holds a **tenant JWT**.
+</Step>
+
+<Step title="OAuth initiation">
+Choose the appropriate endpoint based on integration level:
+
+- **Personal mailbox**: `POST /v1/email-integrations/oauth/:provider/authorize`
+  - `provider` = `gmail` | `outlook`
+  - Uses `EmailIntegrationLevel.PERSONAL`
+  - Standard `/v1` API authentication
+
+- **Organization mailbox**: `POST /v1/email-integrations/organization/oauth/:provider/authorize`
+  - Uses `EmailIntegrationLevel.ORGANIZATION`
+  - Requires `SYSTEM_ADMIN` or `SYSTEM_OWNER` via `@CheckAccess`
+</Step>
+
+<Step title="Authorization URL generation">
+Backend returns `{ authorizationUrl }` containing:
+- Google/Microsoft authorize URL
+- HMAC-signed `state` using `SignedPayloadService`
+- State purpose: `email.oauth.state`
+- State payload includes: `userId`, `organizationId`, `tokenVersion`, `provider`, optional `level`
+</Step>
+
+<Step title="Provider authorization">
+Browser opens `authorizationUrl` in a popup for user consent.
+</Step>
+
+<Step title="Callback handling">
+Provider redirects to public callback endpoints:
+- `GET /auth/gmail/callback`
+- `GET /auth/outlook/callback`
+
+Backend verifies `state` and exchanges `code` via provider driver.
+</Step>
+
+<Step title="Gmail access verification">
+<Warning>
+For Gmail integrations only: Backend calls `GET .../gmail/v1/users/me/profile` with the new access token. If Google returns 400 or 403, the integration is **not persisted** and the callback returns `oauth-error` with `EMAIL_OAUTH_GMAIL_ACCESS_BLOCKED_CODE`.
+</Warning>
+
+This prevents saving integrations for Google accounts that authenticate but don't expose Gmail API access.
+</Step>
+
+<Step title="Access re-verification">
+Before token persistence, backend re-checks OAuth actor against current state:
+- `User.isActive` status
+- Matching `User.tokenVersion` from signed state
+- Active `user_org_roles` for `(userId, organizationId)`
+- For `ORGANIZATION` level: current `system.admin` or `system.owner` permissions
+
+Uses `AccessService.assertOAuthCallbackOrgAccessInTransaction`.
+</Step>
+
+<Step title="Token persistence">
+On successful verification, `connectInTransaction` runs to encrypt and store tokens.
+</Step>
+
+<Step title="Response delivery">
+Response HTML uses `postMessage` with `app.postMessageTargetOrigin` (never `*`).
+</Step>
+
+<Step title="SPA handling">
+SPA invalidates `queryKeys.emailIntegrations` and handles response:
+- Success: Refresh email integration lists
+- `GMAIL_ACCESS_BLOCKED` error: Show AlertDialog
+- Refetch on popup close for dropped messages
+</Step>
+</Steps>
+
+### Integration levels and uniqueness
+
+<Tabs>
+<Tab title="Personal integrations">
+- **PERSONAL** rows store `user_id` (mailbox owner)
+- `connected_by_id = null`
+- Multiple users may connect the same mailbox address as personal
+- DB uniqueness: per user + org + provider
+</Tab>
+
+<Tab title="Organization integrations">
+- **ORGANIZATION** rows store `user_id = null`
+- `connected_by_id` = OAuth actor
+- Mailbox `email` normalized to lowercase
+- Uniqueness: `(organization_id, provider, lower(email))` among active org rows
+</Tab>
+</Tabs>
+
+<Warning>
+**Cross-level conflict prevention**: A mailbox address cannot exist at both PERSONAL and ORGANIZATION levels in the same organization. The system enforces this through database triggers and application logic.
+</Warning>
+
+### Redundant reconnect prevention
+
+If OAuth returns an email that matches an existing healthy integration, the system throws an error instead of allowing reconnection. An integration is considered healthy when:
+
+- Row is active (not deleted)
+- No `last_sync_error_at` set
+- Access token present with valid expiry beyond buffer time
+- Token not expired or inside the configured buffer window
+
+<Info>
+Buffer time is configured via `EMAIL_RECONNECT_ACCESS_TOKEN_BUFFER_MINUTES`. Unhealthy integrations allow re-OAuth for repair purposes.
+</Info>
+
+## Gmail access verification
+
+### Implementation details
+
+- **Constant**: `EMAIL_OAUTH_GMAIL_ACCESS_BLOCKED_CODE` in `src/common/constants/email-oauth.constants.ts`
+- **Timing**: Immediately after `exchangeCode`, before `connectInTransaction`
+- **Purpose**: Prevents saving broken integrations for Google accounts that authenticate but lack Gmail API access
+
+### Required scopes
+
+Gmail OAuth must include:
+- `gmail.send` - For outbound email sending
+- `gmail.metadata` - For `users.getProfile` access probe
+- `userinfo.email` - For reading profile mailbox address
+
+## Environment configuration
+
+### Redirect URIs
+
+<CodeGroup>
+```bash Gmail
+# Default: ${BACKEND_URL or http://localhost:$PORT}/auth/gmail/callback
+GMAIL_REDIRECT_URI=https://your-domain.com/auth/gmail/callback
+
+# Optional override
+GMAIL_EMAIL_REDIRECT_URI=https://your-domain.com/auth/gmail/callback
+```
+
+```bash Outlook
+# Default: ${BACKEND_URL or http://localhost:$PORT}/auth/outlook/callback
+OUTLOOK_REDIRECT_URI=https://your-domain.com/auth/outlook/callback
+
+# Optional override
+OUTLOOK_EMAIL_REDIRECT_URI=https://your-domain.com/auth/outlook/callback
+```
+</CodeGroup>
+
+<Note>
+Register these exact redirect URIs in your Google Cloud OAuth client and Azure app. The `PORT` defaults to `3002` in app config.
+</Note>
+
+### TTL configuration
+
+- **OAuth state TTL**: `EMAIL_OAUTH_STATE_TTL_MS` (15 minutes)
+- **Token buffer**: `EMAIL_RECONNECT_ACCESS_TOKEN_BUFFER_MINUTES`
+
+## API endpoints
+
+### Personal integrations
+
+<AccordionGroup>
+<Accordion title="GET /v1/email-integrations">
+Returns **PERSONAL** mailboxes for the current user only.
+
+**Response format:**
+```json
+{
+  "items": [EmailIntegrationDto],
+  "nextCursor": "opaque-string"
+}
+```
+
+**Query parameters:**
+- `cursor` - Opaque pagination cursor
+- `limit` - Items per page (default: 20, max: 50)
+
+**Ordering:** `connected_at DESC`, `id ASC` (keyset pagination)
+</Accordion>
+
+<Accordion title="GET /v1/email-integrations/send-accounts">
+Returns mailboxes available as **From** addresses in composer:
+- User's **PERSONAL** integrations in `personal` array
+- **ORGANIZATION** integrations in `organization` array (requires admin/owner)
+
+**Query parameters:**
+- `cursorPersonal` - Cursor for personal stream
+- `cursorOrganization` - Cursor for organization stream
+- `limit` - Items per page (same bounds as GET /)
+
+<Warning>
+When a stream is exhausted, pass `__exhausted__` as the cursor to prevent restarting that stream.
+</Warning>
+</Accordion>
+</AccordionGroup>
+
+### Organization integrations
+
+<AccordionGroup>
+<Accordion title="GET /v1/email-integrations/organization">
+Returns **ORGANIZATION** mailboxes only. Requires `@CheckAccess` (admin/owner).
+
+Uses `findOrganizationMailboxesPage` with `populate(['connectedBy'])` to show who performed OAuth.
+
+**Response:** Same pagination format as personal endpoints with offset pagination.
+</Accordion>
+
+<Accordion title="POST /v1/email-integrations/organization/oauth/:provider/authorize">
+Initiates OAuth flow for workspace mailbox. Requires `@CheckAccess` (admin/owner).
+
+**Parameters:**
+- `provider` - `gmail` | `outlook`
+</Accordion>
+</AccordionGroup>
+
+### Individual integration management
+
+All individual integration endpoints use `EmailIntegrationService.getAccessibleIntegrationFindWhere` for access control:
+
+<CardGroup cols={2}>
+<Card title="GET /v1/email-integrations/:id" icon="eye">
+Retrieve specific integration details
+</Card>
+<Card title="PUT /v1/email-integrations/:id" icon="pencil">
+Update integration metadata
+</Card>
+<Card title="DELETE /v1/email-integrations/:id" icon="trash">
+Remove integration
+</Card>
+<Card title="POST /v1/email-integrations/:id/send" icon="paper-plane">
+Send email via integration
+</Card>
+</CardGroup>
+
+## Data transfer objects
+
+### EmailIntegrationDto structure
+
+```typescript
+interface EmailIntegrationDto {
+  level: 'PERSONAL' | 'ORGANIZATION';
+  isDefault?: boolean; // Organization rows only
+  user?: UserDto; // When user relation is populated
+  connectedBy?: UserDto; // When connectedBy relation is populated
+  // ... other integration fields
+}
+```
+
+<Note>
+The `user` field is included only when the `user` relation is populated. Avoid deserializing `UserDto` from uninitialized MikroORM references.
+</Note>
+
+### UpdateEmailIntegrationDto
+
+Includes `metadata` field for updating integration metadata via `PUT` requests.
+
+## Access control
+
+### Read and mutation access
+
+Access control uses `EmailIntegrationService.getAccessibleIntegrationFindWhere`:
+
+<Tabs>
+<Tab title="Personal integrations">
+- **PERSONAL** rows: Only accessible when `user_id` matches JWT user
+- Admins/owners **cannot** access other members' personal integrations
+- Missing access returns 404 (same as unknown ID)
+</Tab>
+
+<Tab title="Organization integrations">
+- **ORGANIZATION** rows: Requires `SYSTEM_ADMIN` or `SYSTEM_OWNER`
+- Secondary check via `assertCanAccessIntegration` after load
+</Tab>
+</Tabs>
+
+### Send permissions
+
+<Steps>
+<Step title="Personal send">
+Only the mailbox owner may use `POST .../send` for `level=PERSONAL` rows (`user_id` must match JWT user).
+</Step>
+
+<Step title="Organization send">
+Requires `SYSTEM_ADMIN` or `SYSTEM_OWNER` permissions via `EmailIntegrationService.assertCanAccessIntegration`.
+</Step>
+</Steps>
+
+## Data model
+
+### Level-based structure
+
+<Tabs>
+<Tab title="PERSONAL level">
+- `user_id` NOT NULL (mailbox owner)
+- `connected_by_id` NULL
+- Unique constraint: `(user_id, organization_id, provider)` where `is_deleted = false` and `level = 'PERSONAL'`
+</Tab>
+
+<Tab title="ORGANIZATION level">
+- `user_id` NULL
+- `connected_by_id` NOT NULL (OAuth actor)
+- Unique constraint: `(organization_id, provider, lower(email))` where `is_deleted = false` and `level = 'ORGANIZATION'`
+- Optional `is_default` with at most one default per org
+</Tab>
+</Tabs>
+
+### Cross-level uniqueness enforcement
+
+<Warning>
+Active rows cannot mix PERSONAL and ORGANIZATION for the same `organization_id + lower(email)`.
+</Warning>
+
+The system prevents conflicts through:
+- Migration `Migration20260521171000_PreventEmailIntegrationCrossLevelMailboxConflicts`
+- Database trigger `email_integrations_cross_level_mailbox_conflict_trigger`
+- Transaction advisory locks per organization/mailbox
+
+### Token storage
+
+- `encrypted_access_token` - AES-256-GCM encrypted
+- `encrypted_refresh_token` - AES-256-GCM encrypted
+- Uses shared `EncryptionService` with `ENCRYPTION_KEY` (64 hex chars)
+
+### Display and metadata
+
+- `email` - Provider mailbox/profile email (normalized to lowercase)
+- `level` - PERSONAL | ORGANIZATION (Postgres check + application constraint)
+
+<Check>
+The migration `Migration20260508150000_EmailIntegrationOrganizationLevel` introduces the level system with nullable `user_id` and `connected_by_id` fields.
+</Check>
