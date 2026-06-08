@@ -1,0 +1,1357 @@
+---
+title: "Subscription Module Specification v30"
+description: "Complete specification for the subscription and billing module including Stripe integration, plan tiers, feature gating, seat management, and credit system"
+---
+
+## Overview
+
+The Subscription Module implements a **freemium SaaS billing system** for PropWise CRM. Every organization has a subscription tied to one of **three plan tiers** (Free / Pro / Business — Starter was removed). The module handles:
+
+- **Plan-based feature gating** — binary feature flags per tier
+- **Resource limits** — **source-aware** caps on leads, contacts, deals, companies (imports never count), and storage
+- **Unified AI-credit wallet** — one credit balance for Propilot, AI auto-reply, and unit valuation, with a per-action cost map, per-user ceilings, and personal credits
+- **Single per-agent seat model** — one seat SKU per tier; Pro 5–10 seats (11th → upgrade to Business), Business 10+ with volume pricing
+- **Stripe integration** — checkout, subscription management, mid-cycle plan changes, webhooks, billing portal, AED pricing, +25 GB storage packs, credit top-up packs
+- **Evergreen 90-day trial** — Pro & Business signups get a card-upfront trial
+- **Free organization ownership cap** — one user may own at most 2 active Free-plan organizations
+- **Proration** — mid-cycle **tier** changes and seat changes are prorated to the day; **billing cycle** switches (Monthly ↔ Annual) are deferred to period end via Stripe Subscription Schedules
+- **Suspension flow** — 2-day grace period on payment failure, then org goes read-only
+
+<Note>
+**§18 (Subscription Packaging Rollout)** is the authoritative description of the current Free/Pro/Business AED model. Where earlier sections conflict with §18, **§18 wins**.
+</Note>
+
+### Design principles
+
+<AccordionGroup>
+<Accordion title="Freemium model">
+Free plan with limited features; paid tiers unlock progressively
+</Accordion>
+
+<Accordion title="Per-org billing">
+Billing is per organization; developer portal is free
+</Accordion>
+
+<Accordion title="Dual seat types">
+Manager seats (Owner, Admin) and agent seats (Basic, custom roles); every user consumes a seat
+</Accordion>
+
+<Accordion title="Seat type derived from role">
+No explicit seat assignment — seat type is automatically determined by the user's RBAC role
+</Accordion>
+
+<Accordion title="Feature flags over tier checks">
+Gating uses `@RequiresFeature('flag')` on plan JSONB — changing what a tier includes requires only a seeder update, not code changes
+</Accordion>
+
+<Accordion title="Service-layer limit enforcement">
+Resource limits and credit consumption are checked in service methods, not guards, because they need entity counts
+</Accordion>
+
+<Accordion title="Free-org creation protection">
+`POST /v1/organizations` locks the owner row, counts owned Free-plan orgs (missing subscription rows count as Free), and rejects the third active free workspace
+</Accordion>
+
+<Accordion title="Stripe as source of truth for payments">
+Webhook-driven lifecycle: the app reacts to Stripe events rather than polling
+</Accordion>
+
+<Accordion title="Billing cycle vs tier changes">
+**Tier changes** (Free → Pro, Pro → Business) are immediate and prorated. **Billing cycle switches** (Monthly ↔ Annual on same tier) are deferred to period end via Stripe Subscription Schedules with no proration. **Combined changes** (tier + cycle) are immediate and prorated with all line items re-priced atomically
+</Accordion>
+
+<Accordion title="Checkout vs. change-plan separation">
+`POST /checkout` is for first-time subscription (Free → Paid); `POST /change-plan` is for switching between paid tiers
+</Accordion>
+
+<Accordion title="Idempotent webhooks">
+Every Stripe event is logged in `BillingEvent` with a unique `stripeEventId` to prevent duplicate processing
+</Accordion>
+
+<Accordion title="Graceful degradation">
+If `app.stripe.secretKey` (`STRIPE_SECRET_KEY`) is not set, billing features are unavailable but the app still starts
+</Accordion>
+</AccordionGroup>
+
+## Architecture
+
+### High-level diagram
+
+```mermaid
+graph TB
+    A[API Layer Controllers] --> B[Service Layer]
+    A1[SubscriptionController<br/>authenticated /v1/subscriptions] --> B
+    A2[StripeWebhookController<br/>public /webhooks/stripe] --> B
+    
+    B --> C[Data Layer]
+    B1[SubscriptionSvc<br/>lifecycle, plan changes<br/>seat mgmt, resource limits<br/>feature checks] --> C
+    B2[CreditService<br/>consume FIFO<br/>balance query<br/>record packs] --> C
+    B3[StripeService<br/>SDK wrapper<br/>checkout, subscriptions<br/>price swaps, webhooks] --> C
+    
+    C[MikroORM / PostgreSQL<br/>SubscriptionPlan | Subscription | SubscriptionUsage<br/>CreditPurchase | BillingEvent | Organization.stripeCustomerId]
+```
+
+### Data flow
+
+<Steps>
+<Step title="First-time checkout flow (Free → Paid)">
+```
+Frontend "Upgrade" button
+  → POST /v1/subscriptions/checkout
+    → Rejects if org already has a Stripe subscription (use change-plan instead)
+    → SubscriptionService.createCheckoutSession()
+      → StripeService.createCheckoutSession()
+        → Returns Stripe Checkout URL
+          → User pays on Stripe's hosted page
+            → Stripe redirects to success URL with session_id={CHECKOUT_SESSION_ID}
+              → Frontend POST /v1/subscriptions/checkout/confirm { sessionId }
+                → SubscriptionService.fulfillCheckoutSession() (idempotent with webhook)
+                  → Subscription entity updated to ACTIVE (plan tier from session metadata)
+            → (async) Stripe fires checkout.session.completed webhook
+              → StripeWebhookController → activateSubscription() (same activation path)
+```
+</Step>
+
+<Step title="Mid-cycle plan change flow (Paid → different Paid tier)">
+```
+Frontend "Change Plan" button
+  → POST /v1/subscriptions/change-plan
+    → SubscriptionService.changePlan()
+      → Validates seat overflow (blocks if current users exceed new plan capacity)
+      → StripeService.swapSubscriptionPrice() — prorated
+      → Reconciles seat line items (old tier price → new tier price)
+      → Updates local Subscription entity
+      → Returns updated subscription immediately
+```
+</Step>
+
+<Step title="Renewal / payment failure flow">
+```
+Stripe charges renewal invoice
+  ├─ invoice.paid → handleInvoicePaid() → status stays ACTIVE, period updated
+  └─ invoice.payment_failed → handleInvoicePaymentFailed() → status → PAST_DUE
+       └─ Stripe retries for 2 days
+            ├─ Payment succeeds → invoice.paid → back to ACTIVE
+            └─ All retries fail → customer.subscription.updated (status: unpaid)
+                 → handleSubscriptionUpdated() → status → SUSPENDED
+                      → Org is read-only (SubscriptionActiveGuard blocks writes)
+```
+</Step>
+</Steps>
+
+## Plan tiers & pricing
+
+<CardGroup cols={3}>
+<Card title="Free" icon="gift">
+- **Monthly price**: $0
+- **Annual price**: $0
+- **Manager seats**: 1
+- **Agent seats**: 2
+- **Lead cap**: 100
+- **Contact cap**: 500
+- **Deal cap**: 50
+- **Company cap**: 100
+- **Storage**: 1 GB
+- **Monthly AI credits**: 50
+</Card>
+
+<Card title="Professional" icon="rocket">
+- **Monthly price**: $149
+- **Annual price**: $1,430.40 (~20% off)
+- **Manager seats**: 5
+- **Agent seats**: 10
+- **Lead cap**: 10,000
+- **Contact cap**: 50,000
+- **Deal cap**: 5,000
+- **Company cap**: 10,000
+- **Storage**: 50 GB
+- **Monthly AI credits**: 2,000
+</Card>
+
+<Card title="Business" icon="building">
+- **Monthly price**: $399
+- **Annual price**: $3,830.40 (~20% off)
+- **Manager seats**: 10
+- **Agent seats**: Unlimited
+- **Lead cap**: Unlimited
+- **Contact cap**: Unlimited
+- **Deal cap**: Unlimited
+- **Company cap**: Unlimited
+- **Storage**: 200 GB
+- **Monthly AI credits**: 10,000
+</Card>
+</CardGroup>
+
+<Note>
+**Starter tier** was removed in v30. All pricing is in USD cents internally but displayed as AED to customers.
+</Note>
+
+### Resource limits
+
+<Tabs>
+<Tab title="Source-aware caps">
+**Imports never count** toward caps. Only manually created or API-created entities count.
+
+```typescript
+// Example: Lead creation check
+async createLead(data: CreateLeadDto, source: 'manual' | 'import' | 'api') {
+  if (source !== 'import') {
+    await this.subscriptionService.checkResourceLimit('leads');
+  }
+  // ... create lead
+}
+```
+</Tab>
+
+<Tab title="Connection caps">
+- **Free**: 2 external integrations
+- **Pro**: 10 external integrations  
+- **Business**: Unlimited integrations
+
+Connection limits are enforced when adding new integrations via the connections module.
+</Tab>
+</Tabs>
+
+## Feature gating model
+
+Feature access is controlled through plan-specific feature flags stored in the `SubscriptionPlan.features` JSONB column.
+
+### Feature flag structure
+
+```json
+{
+  "advanced_reporting": true,
+  "api_access": true,
+  "bulk_operations": false,
+  "custom_fields": true,
+  "email_sequences": true,
+  "export_data": true,
+  "integrations": true,
+  "pipeline_automation": false,
+  "team_management": true,
+  "webhook_endpoints": false
+}
+```
+
+### Implementation
+
+<CodeGroup>
+```typescript Decorator Usage
+@RequiresFeature('advanced_reporting')
+@Get('/analytics/dashboard')
+async getAdvancedAnalytics() {
+  // Only accessible if plan includes advanced_reporting
+}
+```
+
+```typescript Service Check
+async createWebhook(data: CreateWebhookDto) {
+  await this.subscriptionService.requireFeature('webhook_endpoints');
+  // ... create webhook
+}
+```
+
+```typescript Guard Implementation
+@Injectable()
+export class FeatureGuard implements CanActivate {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const feature = this.reflector.get<string>('feature', context.getHandler());
+    const request = context.switchToHttp().getRequest();
+    const orgId = request.user.organizationId;
+    
+    return this.subscriptionService.hasFeature(orgId, feature);
+  }
+}
+```
+</CodeGroup>
+
+## Seat management
+
+The system uses a **single seat SKU per tier** model with automatic seat type detection based on user roles.
+
+### Seat types
+
+<Tabs>
+<Tab title="Manager seats">
+- **Owner role**: Always consumes a manager seat
+- **Admin role**: Always consumes a manager seat
+- **Higher billing priority**: Manager seats are billed first
+</Tab>
+
+<Tab title="Agent seats">
+- **Basic role**: Consumes an agent seat
+- **Custom roles**: Consume agent seats
+- **Lower cost**: Agent seats typically cost less than manager seats
+</Tab>
+</Tabs>
+
+### Seat enforcement
+
+<Steps>
+<Step title="User invitation">
+When inviting users, the system checks if adding the user would exceed seat limits based on their intended role.
+</Step>
+
+<Step title="Role changes">
+Role promotions (agent → manager) are blocked if manager seat limit would be exceeded.
+</Step>
+
+<Step title="Plan downgrades">
+Plan changes are blocked if the new tier would have insufficient seats for current users.
+</Step>
+</Steps>
+
+<Warning>
+**Pro tier seat overflow**: When a Pro organization reaches 11 users, they must upgrade to Business tier as Pro supports maximum 10 agent seats.
+</Warning>
+
+## Credit system
+
+The unified AI credit wallet powers all AI features with a single balance per organization.
+
+### Credit consumption
+
+<AccordionGroup>
+<Accordion title="Propilot chat">
+- **Cost**: 5 credits per message
+- **Per-user ceiling**: 200 credits/day
+- **Features**: Property recommendations, market insights, lead qualification
+</Accordion>
+
+<Accordion title="AI auto-reply">
+- **Cost**: 10 credits per auto-reply sent
+- **Per-user ceiling**: 100 credits/day  
+- **Features**: Automated email responses, lead nurturing
+</Accordion>
+
+<Accordion title="Unit valuation">
+- **Cost**: 25 credits per valuation
+- **Per-user ceiling**: 50 credits/day
+- **Features**: Property value estimation, market analysis
+</Accordion>
+
+<Accordion title="Personal credits">
+- **Individual balance**: Each user has personal credits
+- **Priority**: Personal credits consumed before org credits
+- **Purchasing**: Users can buy personal credit packs
+</Accordion>
+</AccordionGroup>
+
+### Credit purchasing
+
+<CardGroup cols={2}>
+<Card title="Small pack" icon="coins">
+**500 credits** for $29 AED
+- Best for light usage
+- 1-month expiration
+</Card>
+
+<Card title="Large pack" icon="money-bill">
+**2,000 credits** for $99 AED  
+- Best value for heavy users
+- 3-month expiration
+</Card>
+</CardGroup>
+
+### FIFO consumption
+
+Credits are consumed in First-In-First-Out order:
+
+1. **Personal credits** (oldest first)
+2. **Organization credits** (oldest first)
+3. **Monthly allocation** (current month)
+
+```typescript
+async consumeCredits(orgId: string, userId: string, amount: number, action: string) {
+  // 1. Try personal credits first
+  const personalConsumed = await this.consumePersonalCredits(userId, amount);
+  
+  // 2. Then org purchased credits
+  const remaining = amount - personalConsumed;
+  if (remaining > 0) {
+    const orgConsumed = await this.consumeOrgCredits(orgId, remaining);
+    
+    // 3. Finally monthly allocation
+    const stillRemaining = remaining - orgConsumed;
+    if (stillRemaining > 0) {
+      await this.consumeMonthlyAllocation(orgId, stillRemaining);
+    }
+  }
+}
+```
+
+## Entity specifications
+
+### Subscription entity
+
+```typescript
+@Entity()
+export class Subscription {
+  @PrimaryKey()
+  id!: number;
+
+  @ManyToOne(() => Organization)
+  organization!: Organization;
+
+  @ManyToOne(() => SubscriptionPlan)
+  plan!: SubscriptionPlan;
+
+  @Enum(() => SubscriptionStatus)
+  status!: SubscriptionStatus;
+
+  @Enum(() => BillingCycle) 
+  billingCycle!: BillingCycle;
+
+  @Property({ nullable: true })
+  stripeSubscriptionId?: string;
+
+  @Property({ nullable: true })
+  stripeCustomerId?: string;
+
+  @Property({ nullable: true })
+  currentPeriodStart?: Date;
+
+  @Property({ nullable: true })
+  currentPeriodEnd?: Date;
+
+  @Property({ nullable: true })
+  trialEnd?: Date;
+
+  @Property({ type: 'json', nullable: true })
+  metadata?: Record<string, any>;
+
+  @Property()
+  createdAt!: Date;
+
+  @Property({ onUpdate: () => new Date() })
+  updatedAt!: Date;
+}
+```
+
+### SubscriptionPlan entity
+
+```typescript
+@Entity()
+export class SubscriptionPlan {
+  @PrimaryKey()
+  id!: number;
+
+  @Property({ unique: true })
+  name!: string; // 'free', 'pro', 'business'
+
+  @Property()
+  displayName!: string;
+
+  @Property()
+  monthlyPrice!: number; // USD cents
+
+  @Property()
+  annualPrice!: number; // USD cents
+
+  @Property()
+  managerSeats!: number;
+
+  @Property()
+  agentSeats!: number;
+
+  @Property({ type: 'json' })
+  limits!: {
+    leads: number;
+    contacts: number;
+    deals: number;
+    companies: number;
+    storage: number; // GB
+    connections: number;
+  };
+
+  @Property({ type: 'json' })
+  features!: Record<string, boolean>;
+
+  @Property()
+  monthlyCredits!: number;
+
+  @Property({ nullable: true })
+  stripePriceIdMonthly?: string;
+
+  @Property({ nullable: true })
+  stripePriceIdAnnual?: string;
+}
+```
+
+### CreditPurchase entity
+
+```typescript
+@Entity()
+export class CreditPurchase {
+  @PrimaryKey()
+  id!: number;
+
+  @ManyToOne(() => Organization, { nullable: true })
+  organization?: Organization;
+
+  @ManyToOne(() => User, { nullable: true })
+  user?: User; // For personal credit purchases
+
+  @Property()
+  credits!: number;
+
+  @Property()
+  amountPaid!: number; // USD cents
+
+  @Property()
+  creditsRemaining!: number;
+
+  @Property()
+  expiresAt!: Date;
+
+  @Property({ nullable: true })
+  stripePaymentIntentId?: string;
+
+  @Property()
+  createdAt!: Date;
+}
+```
+
+## Stripe integration
+
+### Checkout session creation
+
+<CodeGroup>
+```typescript Service Method
+async createCheckoutSession(
+  orgId: string,
+  planName: string,
+  billingCycle: BillingCycle,
+  seats?: { managers: number; agents: number }
+): Promise<string> {
+  const org = await this.organizationService.findById(orgId);
+  
+  // Prevent checkout if already has active subscription
+  if (org.subscription?.status === 'ACTIVE') {
+    throw new BadRequestException('Organization already has active subscription');
+  }
+
+  const plan = await this.planRepository.findOne({ name: planName });
+  const priceId = billingCycle === 'MONTHLY' 
+    ? plan.stripePriceIdMonthly 
+    : plan.stripePriceIdAnnual;
+
+  return this.stripeService.createCheckoutSession({
+    customerId: org.stripeCustomerId,
+    priceId,
+    quantity: seats?.managers || 1,
+    metadata: {
+      organizationId: orgId,
+      planName,
+      billingCycle,
+      managerSeats: seats?.managers || 1,
+      agentSeats: seats?.agents || 0
+    },
+    successUrl: `${this.configService.get('app.frontendUrl')}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancelUrl: `${this.configService.get('app.frontendUrl')}/billing`
+  });
+}
+```
+
+```typescript Webhook Handler
+@Post('/webhooks/stripe')
+async handleWebhook(@Body() body: any, @Headers('stripe-signature') signature: string) {
+  const event = this.stripeService.constructEvent(body, signature);
+  
+  // Idempotency check
+  const existingEvent = await this.billingEventRepository.findOne({
+    stripeEventId: event.id
+  });
+  
+  if (existingEvent) {
+    return { received: true };
+  }
+
+  // Log event
+  await this.billingEventRepository.create({
+    stripeEventId: event.id,
+    type: event.type,
+    data: event.data,
+    processedAt: new Date()
+  });
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      await this.handleCheckoutCompleted(event.data.object);
+      break;
+    case 'invoice.paid':
+      await this.handleInvoicePaid(event.data.object);
+      break;
+    case 'invoice.payment_failed':
+      await this.handleInvoicePaymentFailed(event.data.object);
+      break;
+    case 'customer.subscription.updated':
+      await this.handleSubscriptionUpdated(event.data.object);
+      break;
+  }
+
+  return { received: true };
+}
+```
+</CodeGroup>
+
+### Price management
+
+Stripe prices are automatically created during plan seeding:
+
+```typescript
+// Plan seeder creates these price structures
+const prices = {
+  pro_monthly_aed: 'price_1ABC123...', // 546 AED/month (149 USD)
+  pro_annual_aed: 'price_1DEF456...', // 5251.36 AED/year (1430.40 USD)
+  business_monthly_aed: 'price_1GHI789...' // 1464 AED/month (399 USD)
+  business_annual_aed: 'price_1JKL012...' // 14058.07 AED/year (3830.40 USD)
+};
+```
+
+## Subscription lifecycle
+
+<Steps>
+<Step title="Free tier (default)">
+- New organizations start on Free plan
+- No Stripe customer or subscription created
+- Local Subscription entity with status 'ACTIVE'
+</Step>
+
+<Step title="Trial activation">
+- User clicks "Start Trial" → creates Stripe customer
+- 90-day trial begins with full plan access
+- No payment required but card must be on file
+</Step>
+
+<Step title="Trial conversion">
+- At trial end, first invoice is charged
+- If payment succeeds → subscription continues
+- If payment fails → enters grace period
+</Step>
+
+<Step title="Payment failure">
+- Invoice payment fails → status becomes 'PAST_DUE'
+- 2-day grace period with continued access
+- Stripe retries payment automatically
+</Step>
+
+<Step title="Suspension">
+- After failed retries → status becomes 'SUSPENDED'  
+- Organization becomes read-only
+- Users can view but not create/edit data
+</Step>
+
+<Step title="Recovery">
+- User updates payment method in billing portal
+- Stripe retries and succeeds → back to 'ACTIVE'
+- Full access restored immediately
+</Step>
+</Steps>
+
+## Plan changes (upgrade / downgrade)
+
+### Immediate tier changes
+
+Tier changes between Free/Pro/Business are processed immediately with proration:
+
+<CodeGroup>
+```typescript Change Plan Logic
+async changePlan(
+  orgId: string, 
+  newPlanName: string, 
+  newBillingCycle?: BillingCycle
+) {
+  const subscription = await this.getActiveSubscription(orgId);
+  const newPlan = await this.planRepository.findOne({ name: newPlanName });
+  
+  // Validate seat requirements
+  const currentUsers = await this.userService.countActiveUsers(orgId);
+  if (currentUsers.managers > newPlan.managerSeats || 
+      currentUsers.agents > newPlan.agentSeats) {
+    throw new BadRequestException('Current users exceed new plan limits');
+  }
+
+  // Handle tier change vs billing cycle change
+  if (subscription.plan.name !== newPlanName) {
+    // Tier change - immediate with proration
+    await this.processImmediatePlanChange(subscription, newPlan, newBillingCycle);
+  } else if (newBillingCycle && subscription.billingCycle !== newBillingCycle) {
+    // Billing cycle change only - defer to period end
+    await this.scheduleBillingCycleChange(subscription, newBillingCycle);
+  }
+}
+```
+
+```typescript Stripe Price Swap
+private async processImmediatePlanChange(
+  subscription: Subscription,
+  newPlan: SubscriptionPlan,
+  newBillingCycle?: BillingCycle
+) {
+  const cycle = newBillingCycle || subscription.billingCycle;
+  const newPriceId = cycle === 'MONTHLY' 
+    ? newPlan.stripePriceIdMonthly 
+    : newPlan.stripePriceIdAnnual;
+
+  // Update Stripe subscription
+  await this.stripeService.updateSubscriptionPrice(
+    subscription.stripeSubscriptionId,
+    newPriceId,
+    { proration_behavior: 'create_prorations' }
+  );
+
+  // Update local subscription
+  subscription.plan = newPlan;
+  subscription.billingCycle = cycle;
+  await this.subscriptionRepository.persistAndFlush(subscription);
+}
+```
+</CodeGroup>
+
+### Deferred billing cycle changes
+
+When changing only the billing cycle (monthly ↔ annual), the change is scheduled for the end of the current period:
+
+```typescript
+private async scheduleBillingCycleChange(
+  subscription: Subscription,
+  newBillingCycle: BillingCycle
+) {
+  const newPriceId = newBillingCycle === 'MONTHLY'
+    ? subscription.plan.stripePriceIdMonthly
+    : subscription.plan.stripePriceIdAnnual;
+
+  // Create subscription schedule for period end
+  await this.stripeService.createSubscriptionSchedule({
+    customer: subscription.stripeCustomerId,
+    start_date: subscription.currentPeriodEnd,
+    phases: [{
+      items: [{
+        price: newPriceId,
+        quantity: 1
+      }],
+      iterations: null // Ongoing
+    }]
+  });
+
+  // Update local record with pending change
+  subscription.metadata = {
+    ...subscription.metadata,
+    pendingBillingCycle: newBillingCycle,
+    billingCycleChangeAt: subscription.currentPeriodEnd
+  };
+}
+```
+
+## API endpoints
+
+<AccordionGroup>
+<Accordion title="GET /v1/subscriptions/current">
+**Description**: Get current organization subscription details
+
+**Response**:
+```json
+{
+  "subscription": {
+    "id": 123,
+    "status": "ACTIVE",
+    "plan": {
+      "name": "pro",
+      "displayName": "Professional",
+      "features": { "advanced_reporting": true },
+      "limits": { "leads": 10000, "contacts": 50000 }
+    },
+    "billingCycle": "MONTHLY",
+    "currentPeriodEnd": "2024-02-01T00:00:00Z",
+    "trialEnd": null
+  },
+  "usage": {
+    "leads": 1250,
+    "contacts": 5600,
+    "deals": 340,
+    "companies": 890,
+    "storage": 12.5,
+    "credits": 1450
+  },
+  "seats": {
+    "managers": { "used": 2, "included": 5 },
+    "agents": { "used": 7, "included": 10 }
+  }
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/checkout">
+**Description**: Create Stripe checkout session for plan upgrade
+
+**Request**:
+```json
+{
+  "planName": "pro",
+  "billingCycle": "MONTHLY",
+  "seats": {
+    "managers": 5,
+    "agents": 8
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "checkoutUrl": "https://checkout.stripe.com/pay/cs_live_..."
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/checkout/confirm">
+**Description**: Confirm successful checkout completion
+
+**Request**:
+```json
+{
+  "sessionId": "cs_live_1234567890"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "subscription": {
+    "id": 123,
+    "status": "ACTIVE",
+    "plan": { "name": "pro" }
+  }
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/change-plan">
+**Description**: Change between paid plan tiers
+
+**Request**:
+```json
+{
+  "planName": "business",
+  "billingCycle": "ANNUAL"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "subscription": {
+    "plan": { "name": "business" },
+    "billingCycle": "ANNUAL",
+    "prorationAmount": -15420
+  }
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/portal">
+**Description**: Create Stripe billing portal session
+
+**Response**:
+```json
+{
+  "portalUrl": "https://billing.stripe.com/session/..."
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/cancel">
+**Description**: Cancel subscription at period end
+
+**Response**:
+```json
+{
+  "success": true,
+  "cancelAt": "2024-02-01T00:00:00Z"
+}
+```
+</Accordion>
+
+<Accordion title="GET /v1/subscriptions/credits/balance">
+**Description**: Get credit balance breakdown
+
+**Response**:
+```json
+{
+  "total": 2450,
+  "breakdown": {
+    "monthly": 2000,
+    "purchased": 450,
+    "personal": 0
+  },
+  "usage": {
+    "thisMonth": 550,
+    "byAction": {
+      "propilot": 300,
+      "autoReply": 150,
+      "valuation": 100
+    }
+  }
+}
+```
+</Accordion>
+
+<Accordion title="POST /v1/subscriptions/credits/purchase">
+**Description**: Purchase additional credit pack
+
+**Request**:
+```json
+{
+  "packSize": "large",
+  "personal": false
+}
+```
+
+**Response**:
+```json
+{
+  "checkoutUrl": "https://checkout.stripe.com/pay/cs_credits_..."
+}
+```
+</Accordion>
+</AccordionGroup>
+
+## Guards & decorators
+
+### Feature requirement decorator
+
+```typescript
+export const RequiresFeature = (feature: string) => SetMetadata('feature', feature);
+
+@Injectable()
+export class FeatureGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly subscriptionService: SubscriptionService
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const feature = this.reflector.get<string>('feature', context.getHandler());
+    if (!feature) return true;
+
+    const request = context.switchToHttp().getRequest();
+    const orgId = request.user?.organizationId;
+    
+    if (!orgId) return false;
+    
+    return this.subscriptionService.hasFeature(orgId, feature);
+  }
+}
+```
+
+### Subscription active guard
+
+```typescript
+@Injectable()
+export class SubscriptionActiveGuard implements CanActivate {
+  constructor(private readonly subscriptionService: SubscriptionService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const orgId = request.user?.organizationId;
+    
+    if (!orgId) return false;
+    
+    const subscription = await this.subscriptionService.getSubscription(orgId);
+    
+    // Allow read operations for suspended subscriptions
+    const method = request.method;
+    if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return true;
+    
+    // Block write operations if suspended
+    return subscription.status !== 'SUSPENDED';
+  }
+}
+```
+
+## Enforcement points
+
+Resource limits and feature access are enforced at multiple layers:
+
+### Service layer enforcement
+
+<CodeGroup>
+```typescript Lead Creation
+async createLead(data: CreateLeadDto, source: 'manual' | 'import' | 'api') {
+  // Skip limit check for imports
+  if (source !== 'import') {
+    await this.subscriptionService.checkResourceLimit('leads');
+  }
+  
+  // Create the lead
+  const lead = this.leadRepository.create(data);
+  await this.leadRepository.persistAndFlush(lead);
+  
+  // Update usage counter (for all sources)
+  await this.subscriptionService.incrementUsage('leads');
+  
+  return lead;
+}
+```
+
+```typescript Credit Consumption
+async sendAutoReply(leadId: string, message: string) {
+  const orgId = this.contextService.getOrganizationId();
+  const userId = this.contextService.getUserId();
+  
+  // Check and consume credits before action
+  await this.creditService.consumeCredits({
+    organizationId: orgId,
+    userId,
+    amount: 10, // Auto-reply cost
+    action: 'auto_reply',
+    entityId: leadId,
+    entityType: 'lead'
+  });
+  
+  // Send the auto-reply
+  return this.emailService.sendAutoReply(leadId, message);
+}
+```
+
+```typescript Feature Access
+@RequiresFeature('advanced_reporting')
+async generateAdvancedReport(filters: ReportFilters) {
+  // Feature guard already verified access
+  return this.reportingService.generate(filters);
+}
+```
+</CodeGroup>
+
+### Frontend enforcement
+
+<Tip>
+Feature flags and usage limits should also be enforced in the frontend for better UX, but backend enforcement is the authoritative source.
+</Tip>
+
+```typescript
+// Frontend feature check
+const canUseAdvancedReporting = subscription.plan.features.advanced_reporting;
+
+// Usage limit display
+const leadsUsed = usage.leads;
+const leadsLimit = subscription.plan.limits.leads;
+const usagePercentage = (leadsUsed / leadsLimit) * 100;
+
+if (usagePercentage > 80) {
+  showUpgradePrompt('You are approaching your leads limit');
+}
+```
+
+## Plan seeder
+
+The plan seeder creates the three tiers with current pricing and features:
+
+<CodeGroup>
+```typescript Seeder Implementation
+export class SubscriptionPlanSeeder implements Seeder {
+  async run(em: EntityManager): Promise<void> {
+    const plans = [
+      {
+        name: 'free',
+        displayName: 'Free',
+        monthlyPrice: 0,
+        annualPrice: 0,
+        managerSeats: 1,
+        agentSeats: 2,
+        limits: {
+          leads: 100,
+          contacts: 500,
+          deals: 50,
+          companies: 100,
+          storage: 1,
+          connections: 2
+        },
+        features: {
+          basic_crm: true,
+          email_integration: true,
+          mobile_app: true,
+          basic_reporting: true,
+          api_access: false,
+          advanced_reporting: false,
+          bulk_operations: false,
+          custom_fields: false,
+          pipeline_automation: false,
+          team_management: false,
+          webhook_endpoints: false
+        },
+        monthlyCredits: 50
+      },
+      {
+        name: 'pro', 
+        displayName: 'Professional',
+        monthlyPrice: 14900, // $149 in cents
+        annualPrice: 143040, // $1430.40 in cents  
+        managerSeats: 5,
+        agentSeats: 10,
+        limits: {
+          leads: 10000,
+          contacts: 50000,
+          deals: 5000,
+          companies: 10000,
+          storage: 50,
+          connections: 10
+        },
+        features: {
+          basic_crm: true,
+          email_integration: true,
+          mobile_app: true,
+          basic_reporting: true,
+          api_access: true,
+          advanced_reporting: true,
+          bulk_operations: true,
+          custom_fields: true,
+          pipeline_automation: true,
+          team_management: true,
+          webhook_endpoints: false
+        },
+        monthlyCredits: 2000,
+        stripePriceIdMonthly: await this.createStripePrice(14900, 'month'),
+        stripePriceIdAnnual: await this.createStripePrice(143040, 'year')
+      },
+      {
+        name: 'business',
+        displayName: 'Business', 
+        monthlyPrice: 39900, // $399 in cents
+        annualPrice: 383040, // $3830.40 in cents
+        managerSeats: 10,
+        agentSeats: -1, // Unlimited
+        limits: {
+          leads: -1,
+          contacts: -1,
+          deals: -1,
+          companies: -1,
+          storage: 200,
+          connections: -1
+        },
+        features: {
+          basic_crm: true,
+          email_integration: true,
+          mobile_app: true,
+          basic_reporting: true,
+          api_access: true,
+          advanced_reporting: true,
+          bulk_operations: true,
+          custom_fields: true,
+          pipeline_automation: true,
+          team_management: true,
+          webhook_endpoints: true
+        },
+        monthlyCredits: 10000,
+        stripePriceIdMonthly: await this.createStripePrice(39900, 'month'),
+        stripePriceIdAnnual: await this.createStripePrice(383040, 'year')
+      }
+    ];
+
+    for (const planData of plans) {
+      const existingPlan = await em.findOne(SubscriptionPlan, { name: planData.name });
+      if (!existingPlan) {
+        const plan = em.create(SubscriptionPlan, planData);
+        em.persist(plan);
+      }
+    }
+
+    await em.flush();
+  }
+
+  private async createStripePrice(amount: number, interval: 'month' | 'year'): Promise<string> {
+    const price = await stripe.prices.create({
+      currency: 'aed',
+      unit_amount: Math.round(amount * 3.67), // Convert USD to AED
+      recurring: { interval },
+      product_data: {
+        name: 'PropWise CRM Subscription'
+      }
+    });
+    return price.id;
+  }
+}
+```
+</CodeGroup>
+
+## Module structure
+
+```
+src/modules/subscription/
+├── controllers/
+│   ├── subscription.controller.ts      # Main subscription endpoints
+│   └── stripe-webhook.controller.ts    # Webhook handling
+├── services/
+│   ├── subscription.service.ts         # Core subscription logic
+│   ├── credit.service.ts               # Credit management
+│   └── stripe.service.ts               # Stripe SDK wrapper
+├── entities/
+│   ├── subscription.entity.ts          # Main subscription entity
+│   ├── subscription-plan.entity.ts     # Plan definitions
+│   ├── subscription-usage.entity.ts    # Usage tracking
+│   ├── credit-purchase.entity.ts       # Credit transactions
+│   └── billing-event.entity.ts         # Webhook event log
+├── guards/
+│   ├── feature.guard.ts                # Feature access control
+│   └── subscription-active.guard.ts    # Suspension enforcement
+├── decorators/
+│   └── requires-feature.decorator.ts   # Feature requirement annotation
+├── dto/
+│   ├── checkout.dto.ts
+│   ├── change-plan.dto.ts
+│   └── purchase-credits.dto.ts
+├── enums/
+│   ├── subscription-status.enum.ts
+│   ├── billing-cycle.enum.ts
+│   └── credit-action.enum.ts
+├── seeders/
+│   └── subscription-plan.seeder.ts
+└── subscription.module.ts
+```
+
+## Environment configuration
+
+<CodeGroup>
+```typescript Config Schema
+export const subscriptionConfig = {
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY,
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+    publicKey: process.env.STRIPE_PUBLIC_KEY,
+  },
+  billing: {
+    currency: 'AED',
+    trialDays: 90,
+    gracePeriodDays: 2,
+    maxFreeOrgsPerUser: 2
+  },
+  credits: {
+    actions: {
+      propilot: 5,
+      autoReply: 10,
+      valuation: 25
+    },
+    dailyLimits: {
+      propilot: 200,
+      autoReply: 100,
+      valuation: 50
+    }
+  }
+};
+```
+
+```bash Environment Variables
+# Stripe Configuration
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_PUBLIC_KEY=pk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+# Frontend URLs (for checkout redirects)
+FRONTEND_URL=https://app.propwise.ai
+
+# Feature Flags
+BILLING_ENABLED=true
+CREDITS_ENABLED=true
+TRIALS_ENABLED=true
+```
+</CodeGroup>
+
+## Integration with other modules
+
+### Organization module
+
+<Info>
+Organizations have a one-to-one relationship with subscriptions. The subscription determines resource limits and feature access for the entire organization.
+</Info>
+
+```typescript
+// Organization entity includes subscription reference
+@Entity()
+export class Organization {
+  @OneToOne(() => Subscription, { nullable: true })
+  subscription?: Subscription;
+
+  @Property({ nullable: true })
+  stripeCustomerId?: string;
+
+  // Subscription status affects org operations
+  get isReadOnly(): boolean {
+    return this.subscription?.status === 'SUSPENDED';
+  }
+}
+```
+
+### User module
+
+```typescript
+// Seat management integration
+export class UserService {
+  async inviteUser(orgId: string, email: string, role: string) {
+    // Check seat availability before sending invite
+    await this.subscriptionService.validateSeatAvailability(orgId, role);
+    
+    // Send invitation...
+  }
+
+  async changeUserRole(userId: string, newRole: string) {
+    const user = await this.findById(userId);
+    
+    // Check if role change would exceed seat limits
+    await this.subscriptionService.validateRoleChange(
+      user.organizationId, 
+      user.role, 
+      newRole
+    );
+    
+    // Update role...
+  }
+}
+```
+
+### AI modules (Propilot, auto-reply, valuation)
+
+```typescript
+// Credit consumption integration
+export class PropilotService {
+  async sendMessage(userId: string, message: string) {
+    const orgId = this.contextService.getOrganizationId();
+    
+    // Consume credits before processing
+    await this.creditService.consumeCredits({
+      organizationId: orgId,
+      userId,
+      amount: 5,
+      action: 'propilot',
+      dailyLimit: 200
+    });
+    
+    // Process AI request...
+  }
+}
+```
+
+### CRM modules (leads, contacts, deals, companies)
+
+```typescript
+// Resource limit integration
+export class LeadService {
+  async createLead(data: CreateLeadDto, source = 'manual') {
+    // Check resource limits for non-import sources
+    if (source !== 'import') {
+      await this.subscriptionService.checkResourceLimit('leads');
+    }
+    
+    // Create lead...
+    
+    // Update usage tracking
+    await this.subscriptionService.incrementUsage('leads');
+  }
+}
+```
+
+<Check>
+The subscription module serves as the central authority for billing, feature access, and resource consumption across the entire PropWise CRM platform.
+</Check>

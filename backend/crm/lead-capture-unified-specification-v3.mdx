@@ -1,0 +1,465 @@
+---
+title: "Lead Capture Specification (Unified)"
+description: "Complete specification for the unified inbound lead ingestion system with source-agnostic pipeline, person reuse, deduplication, and assignment orchestration"
+---
+
+<Info>
+**Module:** `src/modules/crm/lead-capture/` - A universal, source-agnostic pipeline that turns any **captured** lead into a CRM `Lead` with consistent source fields, person reuse, deduplication, and assignment.
+</Info>
+
+## Overview
+
+The Lead Capture system provides one universal pipeline for all inbound lead sources - Property Finder, Bayut/dubizzle, and future Meta Ads, website forms, etc. Every source funnels through `LeadCaptureService.capture()`.
+
+<Note>
+**Core principle - reuse, don't rebuild.** This layer sits **above** existing CRM primitives and orchestrates them. It does NOT reimplement lead creation, person matching, dedup, stakeholders, or distribution.
+</Note>
+
+### Implementation Status
+
+<Check>
+**BUILT** - Module `src/modules/crm/lead-capture/` ships complete implementation including:
+- `LeadCaptureService` with `capture()` pipeline
+- `CapturedLeadInput`/`CaptureResult` contracts  
+- `LeadCaptureSource` interface + registry pattern
+- Async transport via pg-boss queue + worker
+- Idempotency ledger with RLS
+</Check>
+
+## Scope & Architecture
+
+### In Scope
+- Canonical captured-lead contract
+- Source-adapter pattern for extensibility
+- Orchestration of source-field mapping + identity resolution + dedup/attach + assignment
+- Async transport (queue + worker)
+
+### Out of Scope
+<Warning>
+Meta Ads and website-form ingestion are **not** designed here. The contract reserves fields they will need (`externalLeadId`, `assignmentHint`) for future implementation.
+</Warning>
+
+## Reused Components
+
+The system leverages existing CRM primitives rather than rebuilding functionality:
+
+<AccordionGroup>
+<Accordion title="Lead Management">
+- **Lead creation**: `LeadService.createLeadInTransaction()`
+- **Dedup matching**: `LeadService.findDuplicateLeadMatchInTransaction`
+- **Source vocabulary**: `LeadSource` enum
+</Accordion>
+
+<Accordion title="Person Management">
+- **Person reuse**: `PersonService.findOrCreatePersonFullInTransaction`
+- **Identity lookup**: `findByEmailInTransaction`, `findByPhoneInTransaction`
+- **Channel identity**: `PersonChannel` + messaging matchers
+</Accordion>
+
+<Accordion title="Assignment & Distribution">
+- **Direct assignment**: `EntityStakeholderService`
+- **Rule-based assignment**: `DistributionEngineService` via `LeadCreatedEvent`
+- **System actor**: `resolveSystemActorId` for audit trails
+</Accordion>
+</AccordionGroup>
+
+## Module Structure
+
+```
+crm/lead-capture/
+├── lead-capture.service.ts              # Core orchestrator
+├── lead-capture-source.interface.ts     # Adapter contract
+├── captured-lead-input.ts               # Type definitions
+├── lead-capture-settings.entity.ts      # Org-level defaults
+├── captured-lead.entity.ts              # Idempotency ledger
+├── queue/lead-ingestion.worker.ts       # Async processing
+└── enums/capture-assignment-strategy.enum.ts
+```
+
+<Info>
+**Dependency Rule**: `crm/lead-capture` depends only on intra-CRM services. Source modules depend on lead-capture, never the reverse.
+</Info>
+
+## Canonical Contract
+
+### CapturedLeadInput
+
+<CodeGroup>
+```typescript CapturedLeadInput
+interface CapturedLeadInput {
+  orgId: string;
+  source: LeadSource;                  // Bayut | PropertyFinder | Dubizzle | Website | Instagram
+  sourceDetail?: string;               // campaign / form / "WhatsApp message"
+  inboundChannel?: InboundChannel;     // call | whatsapp | email | sms
+  referenceId?: string;                // listing / campaign / form id
+  externalLeadId?: string;             // source's own lead id (idempotency key)
+
+  identity: {                          // Person reuse, in match-priority order
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    phone?: string;
+    channel?: { type: ChannelType; identifier: string };
+  };
+
+  intent?: LeadIntent;
+  propertyRef?: { listingId?: string; refUnitId?: number };
+  assignmentHint?: CaptureAssignmentConfig;
+  capturedAt?: Date;
+  rawPayload: unknown;                 // stored for audit / replay
+}
+```
+
+```typescript CaptureResult
+interface CaptureResult {
+  leadId: string;
+  personId: string;
+  outcome: 'created' | 'attached' | 'skipped';
+  assignment: 'agent' | 'team_pool' | 'org_pool' | 'queued' | 'none';
+}
+```
+
+```typescript LeadCaptureSource
+interface LeadCaptureSource {
+  readonly source: LeadSource;
+  toCapturedInput(raw: unknown, ctx: { orgId: string }): CapturedLeadInput | CapturedLeadInput[];
+}
+```
+</CodeGroup>
+
+## Processing Pipeline
+
+The `LeadCaptureService.capture(input)` pipeline runs with system actor privileges:
+
+<Steps>
+<Step title="Idempotency Guard">
+Check `captured_lead` ledger by `(orgId, source, externalLeadId)`. If exists, return prior result (no-op for webhook retries).
+</Step>
+
+<Step title="Source Field Normalization">
+Derive `leadSource`, `sourceDetail`, `referenceId`, and any `sourceChannel`/`sourceConversation` mappings.
+</Step>
+
+<Step title="Identity Resolution">
+Resolve or create the `Person` using the identity hierarchy (email → phone → channel → create new).
+</Step>
+
+<Step title="Deduplication">
+Decide whether to create new lead or attach to existing open lead based on person + property context.
+</Step>
+
+<Step title="Assignment">
+Execute assignment strategy (direct agent, team pool, org pool, or queue for manual assignment).
+</Step>
+
+<Step title="Persistence">
+Create lead via `createLeadInTransaction()` or attach re-inquiry, write ledger entry, return `CaptureResult`.
+</Step>
+</Steps>
+
+<Note>
+**System Actor**: Uses dedicated per-org System service user (`isSystemServiceUser = true`), ensuring memberless orgs can still capture leads rather than dropping them.
+</Note>
+
+### Read Queries
+
+#### Listing Lead History
+
+```typescript
+findCapturedLeadsForListing(listingId: string, orgId: string): Promise<ListingCapturedLead[]>
+```
+
+Powers the portal-syndication listing detail "Leads" tab. Filters by `referenceId = listingId` for portal sources, returning newest-first with person details.
+
+## Source Field Mapping Policy
+
+<Tabs>
+<Tab title="Lead Fields">
+| Field | Source | Description |
+|-------|--------|-------------|
+| `leadSource` | `input.source` | Portal/origin of THIS inquiry |
+| `sourceDetail` | `input.sourceDetail` | Human-readable context (campaign, "WhatsApp message") |
+| `inboundChannel` | `input.inboundChannel` | Structured delivery channel (call/whatsapp/email/sms) |
+| `referenceId` | `input.referenceId` | Attribution key (listing/campaign/form id) |
+| `sourceChannel` | Resolved `PersonChannel` | Persistent messaging identity |
+| `sourceConversation` | Context-dependent | When captured from messaging |
+</Tab>
+
+<Tab title="Person Fields">
+| Field | Source | Description |
+|-------|--------|-------------|
+| `originalSource` | `input.source` | **First-touch only** - never overwritten |
+</Tab>
+</Tabs>
+
+### InboundChannel Vocabulary
+
+<CodeGroup>
+```typescript InboundChannel
+enum InboundChannel {
+  EMAIL = 'email',
+  WHATSAPP = 'whatsapp', 
+  CALL = 'call',
+  SMS = 'sms'
+}
+```
+</CodeGroup>
+
+**Portal Mapping:**
+- **Property Finder**: `payload.channel` maps 1:1 (`email | whatsapp | call`)
+- **Bayut/dubizzle**: Inferred from inquiry context and contact method
+
+## Assignment Strategies
+
+<Tabs>
+<Tab title="Strategy Types">
+```typescript
+enum CaptureAssignmentStrategy {
+  LISTING_AGENT = 'listing_agent',     // Resolve from property attribution
+  AGENT_HINT = 'agent_hint',           // Direct assignment from source
+  ORG_DEFAULT = 'org_default',         // Fallback to org settings
+  MANUAL = 'manual'                    // Queue for manual assignment
+}
+```
+</Tab>
+
+<Tab title="Resolution Priority">
+<Steps>
+<Step title="Property Attribution">
+If `propertyRef.listingId` provided, resolve listing agent via `LISTING_AGENT_RESOLVER` seam.
+</Step>
+
+<Step title="Agent Hint">
+If `assignmentHint.agentEmailHint` provided, resolve to in-org user via `UserOrgRole`.
+</Step>
+
+<Step title="Organization Default">
+Fall back to `LeadCaptureSettings` for org-wide assignment strategy.
+</Step>
+
+<Step title="Manual Queue">
+If no automatic assignment possible, queue for manual assignment.
+</Step>
+</Steps>
+</Tab>
+</Tabs>
+
+## Source Adapters
+
+### Adapter Implementation
+
+Source modules implement `LeadCaptureSource` and self-register:
+
+<CodeGroup>
+```typescript Bayut Adapter
+@Injectable()
+export class BayutLeadCaptureAdapter implements LeadCaptureSource {
+  readonly source = LeadSource.Bayut;
+  
+  toCapturedInput(raw: BayutWebhookPayload, ctx: { orgId: string }): CapturedLeadInput {
+    return {
+      orgId: ctx.orgId,
+      source: raw.source === 'dubizzle' ? LeadSource.Dubizzle : LeadSource.Bayut,
+      inboundChannel: this.mapInboundChannel(raw.inquiryType),
+      identity: this.extractIdentity(raw.lead),
+      propertyRef: { listingId: raw.listingReference },
+      rawPayload: raw
+    };
+  }
+}
+```
+
+```typescript Property Finder Adapter  
+@Injectable()
+export class PfLeadCaptureAdapter implements LeadCaptureSource {
+  readonly source = LeadSource.PropertyFinder;
+  
+  toCapturedInput(raw: WHPayloadLead, ctx: { orgId: string }): CapturedLeadInput {
+    return {
+      orgId: ctx.orgId,
+      source: LeadSource.PropertyFinder,
+      inboundChannel: raw.payload.channel as InboundChannel,
+      identity: this.extractFromSender(raw.payload.sender),
+      propertyRef: { refUnitId: raw.payload.entityId },
+      rawPayload: raw
+    };
+  }
+}
+```
+</CodeGroup>
+
+### Registration
+
+Adapters auto-register during module initialization:
+
+```typescript
+@Injectable()
+export class LeadCaptureSourceRegistry {
+  async onModuleInit() {
+    // Auto-discover and register all LeadCaptureSource implementations
+    this.registerSource(this.bayutAdapter);
+    this.registerSource(this.pfAdapter);
+  }
+}
+```
+
+## Async Transport
+
+### Queue Processing
+
+<CodeGroup>
+```typescript Worker
+@Processor('lead-ingestion')
+export class LeadIngestionWorker {
+  @Process()
+  async processLeadIngestion(job: Job<LeadIngestionPayload>) {
+    const { source, rawPayload, orgId } = job.data;
+    
+    const adapter = this.registry.getSource(source);
+    const input = adapter.toCapturedInput(rawPayload, { orgId });
+    
+    return this.leadCaptureService.capture(input);
+  }
+}
+```
+
+```typescript Enqueue
+// From webhook handlers
+await this.leadIngestionQueue.add('process-lead', {
+  source: LeadSource.PropertyFinder,
+  rawPayload: webhookData,
+  orgId: tenantId
+}, {
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 2000 }
+});
+```
+</CodeGroup>
+
+<Warning>
+Queue failures bubble to pg-boss for automatic retry. The idempotency ledger makes retries safe.
+</Warning>
+
+## Data Models
+
+### Captured Lead Ledger
+
+```typescript
+@Entity()
+export class CapturedLead {
+  @PrimaryColumn('uuid')
+  id: string;
+
+  @Column()
+  orgId: string;
+
+  @Column('text')
+  source: LeadSource;
+
+  @Column({ nullable: true })
+  externalLeadId?: string;
+
+  @Column({ nullable: true })
+  leadId?: string;
+
+  @Column()
+  personId: string;
+
+  @Column('text')
+  outcome: 'created' | 'attached' | 'skipped';
+
+  @Column({ type: 'text', nullable: true })
+  inboundChannel?: InboundChannel;
+
+  @Column('jsonb')
+  rawPayload: unknown;
+
+  @CreateDateColumn()
+  capturedAt: Date;
+}
+```
+
+### Settings Entity
+
+```typescript
+@Entity()
+export class LeadCaptureSettings {
+  @PrimaryColumn('uuid')
+  orgId: string;
+
+  @Column('text')
+  defaultAssignmentStrategy: CaptureAssignmentStrategy;
+
+  @Column('text', { nullable: true })
+  defaultAssignmentPoolId?: string;
+
+  @Column('boolean', { default: true })
+  enableAutoAssignment: boolean;
+}
+```
+
+## Integration Points
+
+### Portal Syndication Integration
+
+<CardGroup cols={2}>
+<Card title="Webhook Processing" icon="webhook">
+Portal webhooks enqueue via `lead-ingestion` queue for async processing
+</Card>
+
+<Card title="Listing Attribution" icon="link">
+`LISTING_AGENT_RESOLVER` seam connects property references to agent assignment
+</Card>
+</CardGroup>
+
+### Messaging Integration
+
+Direct inline processing for messaging-originated leads:
+
+```typescript
+// From messaging conversation handler
+const result = await this.leadCaptureService.capture({
+  orgId,
+  source: LeadSource.WhatsApp,
+  inboundChannel: InboundChannel.WHATSAPP,
+  identity: { channel: { type: 'whatsapp', identifier: phoneNumber } },
+  sourceConversation: conversationId,
+  rawPayload: messageData
+});
+```
+
+## Migration Strategy
+
+<Steps>
+<Step title="Foundation Migration">
+`Migration20260531130000_LeadCaptureFoundation` - Core tables and indexes
+</Step>
+
+<Step title="Channel Enhancement">
+`Migration20260605200000_AddInboundChannel` - Add structured channel tracking
+</Step>
+
+<Step title="System User Backfill">
+Automatic seeding of System service users for existing orgs at startup
+</Step>
+</Steps>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+<Card title="CRM Module" href="/backend/crm/crm-module-specification">
+Core CRM primitives and services
+</Card>
+
+<Card title="Distribution System" href="/backend/crm/distribution-specification">
+Lead assignment and routing rules
+</Card>
+
+<Card title="Portal Syndication" href="/backend/real-estate/portal-syndication-specification">
+Property portal integrations
+</Card>
+
+<Card title="Stakeholder System" href="/backend/crm/stakeholder-system">
+Entity relationship management
+</Card>
+</CardGroup>

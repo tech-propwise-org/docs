@@ -1,0 +1,302 @@
+---
+title: "Portal Syndication Specification v5"
+description: "Comprehensive portal syndication module specification with three-tier architecture (InventoryUnit → Listing → ListingPortalSync) and implementation status for Property Finder, Bayut, and dubizzle integrations"
+---
+
+# Portal Syndication Specification v5
+
+<Note>
+**Version:** 3.0 — Architectural revision: introduced `Listing` entity as the marketing layer between `InventoryUnit` (inventory) and `ListingPortalSync` (per-portal state). Consolidated from system design plan, PF API guide, Bayut/dubizzle XML guide, and gap analysis.
+</Note>
+
+<Info>
+**Source files:** `PORTAL_SYNDICATION_RESOURCE.md`, `PROPERTY_FINDER_API_GUIDE.md`, `BAYUT_DUBIZZLE_XML_GUIDE.md`, `PORTAL_SYNDICATION_GAP_ANALYSIS.md`
+
+**Status:** Authoritative design document. The `.cursor/plans/portal_syndication_system_design` plan tracks implementation progress against this spec.
+</Info>
+
+## Module Overview
+
+The Portal Syndication Module allows real estate agents to publish property listings to three UAE property portals directly from PropWise CRM, and automatically receive leads back into the CRM pipeline.
+
+### Three-Tier Architecture
+
+```
+InventoryUnit  →  Listing  →  ListingPortalSync
+  (inventory)     (marketing)   (per-portal state)
+```
+
+<CardGroup cols={3}>
+  <Card title="InventoryUnit" icon="building">
+    What the unit *is* - rooms, area, price, physical attributes. Unchanged by portal syndication logic.
+  </Card>
+  <Card title="Listing" icon="megaphone">
+    How the unit is *marketed* - title, descriptions, permit number, portal classifications, marketing media. Created by an agent from an InventoryUnit.
+  </Card>
+  <Card title="ListingPortalSync" icon="sync">
+    Where the listing is *published* and its current state on each portal.
+  </Card>
+</CardGroup>
+
+<Tip>
+This separation ensures `InventoryUnit` stays a clean inventory record and the `Listing` layer can eventually support off-plan units (`refUnitId`) without any structural change to the sync system.
+</Tip>
+
+### Integration Model Per Portal
+
+| Portal | Listing Syndication | Lead Ingestion | Listing Timing |
+|---|---|---|---|
+| Property Finder | REST API Push (JSON) | Webhook push (primary) + REST poll fallback (15 min) | Real-time (seconds) |
+| Bayut | XML Feed Pull (unified) | Pull API polling — scheduled every 15 min | 30 min – 2 hr delay |
+| dubizzle | XML Feed Pull (same as Bayut) | Pull API polling — same API + endpoint as Bayut | 30 min – 2 hr delay |
+
+<Warning>
+**Bayut / dubizzle lead ingestion note:** Bayut and dubizzle share one API endpoint and one Bearer token (per agency). The `source` field in each lead response (`"bayut"` or `"dubizzle"`) determines which `LeadSource` enum value is used when the CRM lead is created. The Bearer token is stored encrypted in the existing `apiKey` field of the Bayut `PortalConfiguration` row — no new credential columns are needed.
+</Warning>
+
+### Data Flow Rules
+
+- Listings flow **one direction only**: CRM → portals (CRM always wins)
+- Leads flow **one direction only**: portals → CRM  
+- Portal data **never** overwrites CRM data
+- `Listing` is the **single source of truth** for listing (marketing) content
+- `InventoryUnit` is the **single source of truth** for unit inventory data
+
+### Module Location
+
+```typescript
+src/modules/real-estate/portal-syndication/
+```
+
+Imported in `src/modules/real-estate/real-estate.module.ts`.
+
+## As-Built Implementation Status
+
+This section reconciles the spec with the shipped implementation. Where the spec and the build diverge, **the build below is authoritative**.
+
+### Phase A — Bayut/dubizzle outbound (XML feed) — BUILT
+
+<AccordionGroup>
+  <Accordion title="Self-contained Listing">
+    Every field any portal needs now lives on `Listing` (snapshotted from the unit in linked mode via `ListingService.copyUnitToListing`, or entered directly in manual mode). Adapters + `PortalValidationService` read ONLY `listing.X` — never `listing.inventoryUnit.X`. `inventoryUnit` FK is **nullable** (manual listings have none).
+    
+    - New `ListingPurpose` enum (`Sale`/`Rent`)
+    - New columns added by `Migration20260531120000_SelfContainedListingFields`
+  </Accordion>
+
+  <Accordion title="Two Creation Modes">
+    Both converge on `ListingService.create(dto, userId, orgId)`. Linked mode snapshots then applies DTO overrides; `refreshFromUnit` re-pulls snapshot fields while preserving marketing content + agent overrides.
+  </Accordion>
+
+  <Accordion title="Centralized Value Transforms">
+    Located in `src/modules/shared/portal-value-map.ts` (sibling to `property-type-portal-map.ts`):
+    - `purposeToBayut/purposeToPfPriceType`
+    - `furnishedToBayut/Pf`
+    - `bedroomsToBayut/Pf`
+    - `bathroomsToBayut/Pf`
+    - `rentalPeriodToBayut`
+    - `finishingToPf`
+    - `emirateToPfCompliance/UaeEmirate`
+    
+    Both adapters AND the validator consume these.
+  </Accordion>
+
+  <Accordion title="Bayut/dubizzle Feed Adapter">
+    `BayutDubizzleFeedAdapter` + a CDATA XML serializer (`utils/bayut-xml.serializer.ts`).
+    
+    `Property_Ref_No = UNIT-{orgShortCode}-{listing.id}` with a null-`orgShortCode` fallback.
+  </Accordion>
+</AccordionGroup>
+
+### Public Feed Implementation
+
+<CodeGroup>
+```typescript Endpoint
+GET /portal-syndication/feeds/:orgId?token=
+```
+
+```typescript Implementation
+@PublicEndpoint
+PortalFeedController + PortalFeedService
+// Built live via executeWithBypass
+```
+</CodeGroup>
+
+The feed includes:
+- Published rows as `Property_Status=live`
+- Recently-removed rows as `deleted` for ≥48h (F2) so portals delist promptly
+
+### Sync State Machine
+
+<Steps>
+  <Step title="Draft to Published">
+    `DRAFT → PUBLISHED` ADDED to `VALID_TRANSITIONS` for feed portals (mirrors the existing `REMOVED → PUBLISHED`)
+  </Step>
+  
+  <Step title="Pending Remains Invalid">
+    `PENDING → PUBLISHED` remains invalid
+  </Step>
+</Steps>
+
+### Publish Authorization
+
+<Tabs>
+  <Tab title="Gate A Check">
+    `SyndicationService.publish` checks `real_estate.listing.publish` (managers hold it via implication). Without it, the listing goes to `ListingStatus.PENDING_APPROVAL`.
+  </Tab>
+  
+  <Tab title="Approval Process">
+    A `real_estate.manage` user uses `POST /:listingId/approve|reject`:
+    
+    - **Reject** moves the listing to `ListingStatus.REJECTED` and persists the approver's note
+    - **Approve** honors the submitter's publish intent (`publishOnApproval`)
+    - **Approve** stamps `Listing.approvedAt` / `approvedBy` (set-once, never cleared)
+  </Tab>
+</Tabs>
+
+### Owner Self-Manage Bypass
+
+<Warning>
+The approval gate only blocks a non-publisher's **first** publish. Once `Listing.approvedAt` is set, the listing's **owner** can publish/unpublish/toggle portals **directly**.
+</Warning>
+
+<Check>
+New endpoints: `publish`, `approve`, `reject`, `unpublish`, `refresh-from-unit`
+
+**Delete** (`DELETE /:listingId`) soft-deletes (`isDeleted=true`) after removing from portals.
+</Check>
+
+### Listing Approval Notifications
+
+<AccordionGroup>
+  <Accordion title="Submit for Approval">
+    `LISTING_APPROVAL_REQUESTED` to every `real_estate.manage` approver (bulk; resolved via `PermissionService.getUserIdsWithOrgPermission`)
+  </Accordion>
+
+  <Accordion title="Approve">
+    `LISTING_APPROVED` to the publisher (`createdBy`); payload `published` indicates auto-publish vs approval-only
+  </Accordion>
+
+  <Accordion title="Reject">
+    `LISTING_REJECTED` to the publisher (with the rejection reason)
+  </Accordion>
+
+  <Accordion title="Delete">
+    `LISTING_DELETED` to the publisher, ONLY when the deleter is not the publisher
+  </Accordion>
+</AccordionGroup>
+
+See `NOTIFICATION_IMPLEMENTATION_GUIDE.md` → "Implemented Real Estate Listing Approval Notification Types".
+
+### Inventory Cascade (User Choice on Delete)
+
+`inventory-unit.deleted` is emitted from `InventoryUnitService.softDelete` and carries `removeLinkedListings`:
+
+<Tabs>
+  <Tab title="Remove Listings (Default)">
+    `removeLinkedListings = true`
+    
+    - Remove the unit's listings from all portals (`SyndicationService.removeFromAllPortals`)
+    - Archive them (`ListingService.archiveByUnit`, passing the deleting actor for audit attribution)
+  </Tab>
+  
+  <Tab title="Keep Listings">
+    `removeLinkedListings = false`
+    
+    - Keep the listings live but sever the unit link (`ListingService.unlinkFromUnit` sets `inventoryUnit = null`)
+    - Turns each into a self-contained manual listing the user can keep editing/publishing
+  </Tab>
+</Tabs>
+
+<CodeGroup>
+```http Delete Endpoint
+DELETE /inventory/units/:id?removeLinkedListings=true|false
+```
+
+```typescript Event Logic
+// String "false" is the only opt-out; anything else defaults to remove
+// Event-driven to avoid a two-way forwardRef
+```
+</CodeGroup>
+
+### Phase A.5 — Unified Inbound Lead Capture — BUILT
+
+<Info>
+New module **`src/modules/crm/lead-capture/`** owns the unified lead capture system, generalizing the spec's portal-only implementation.
+</Info>
+
+**Key Components:**
+- `LeadCaptureService.capture()`
+- `CapturedLeadInput` contract
+- `LeadCaptureSource` interface
+- `LeadCaptureSourceRegistry`
+- Org-default `LeadCaptureSettings`
+- `CapturedLead` idempotency ledger
+- Source-agnostic **`lead-ingestion`** pg-boss queue + `LeadIngestionWorker`
+
+**Migration:** `Migration20260531130000_LeadCaptureFoundation` (+ RLS)
+
+### Bayut Lead Integration
+
+<CardGroup cols={3}>
+  <Card title="Parser" icon="code">
+    **`BayutLeadParserService`** (pure, 7 shapes → `NormalizedBayutLead`)
+  </Card>
+  <Card title="Adapter" icon="plug">
+    **`BayutLeadCaptureAdapter`** handles lead transformation
+  </Card>
+  <Card title="Poller" icon="clock">
+    **`BayutLeadPollerService`** (`@Cron('*/15 …')`, cross-org)
+  </Card>
+</CardGroup>
+
+**Poller Logic:**
+- Selects Bayut rows with `leadIngestionEnabled = true` + a token
+- Decrypts the Bayut Pull API Bearer token from `PortalConfiguration.apiKey`
+- Polls the 7 combos, drops dubizzle-source leads unless the org's dubizzle row has `leadIngestionEnabled = true`
+- Enqueues `lead-ingestion`
+- On 401 it does NOT advance `lastLeadPollAt`
+
+**Config:** `app.bayut.leadApiBaseUrl`
+
+### Phase B — Property Finder (REST push) — BUILT
+
+<AccordionGroup>
+  <Accordion title="Core Services">
+    - `PfTokenService` (30-min token cache, invalidate-on-401)
+    - `PfLocationMappingService` (24h cache)
+    - `PfAgentMappingService` (24h cache + `refreshOrgAgentMappings`)
+    - `PfComplianceService`
+    - `PfCreditService`
+    - `ListingImageService` (sharp validate/auto-fix + `processedMedia` cache)
+  </Accordion>
+
+  <Accordion title="Adapters & Workers">
+    - `PropertyFinderAdapter` (6-step publish)
+    - `PfWebhookSubscriptionService`
+    - Public `PortalWebhookController` (HMAC over raw body)
+    - `PfLeadCaptureAdapter`
+    - `PfSyndicationWorker` (`pf-syndication` queue)
+  </Accordion>
+
+  <Accordion title="Reconciliation & Monitoring">
+    - `SyncReconciliationService` (cron)
+    - `ApiKeyExpirationCheckService` (cron)
+  </Accordion>
+</AccordionGroup>
+
+**Config:** `app.propertyFinder.apiBaseUrl`
+
+<Note>
+All PF/Bayut HTTP uses plain `axios` (the codebase convention).
+</Note>
+
+## Architecture Implementation Notes
+
+<Warning>
+Lead ingestion is gated by `PortalConfiguration.leadIngestionEnabled` (per portal): the poller runs only for Bayut rows with `leadIngestionEnabled = true` + a token, and keeps dubizzle-source leads only when the dubizzle row also has `leadIngestionEnabled = true`.
+</Warning>
+
+<Tip>
+The three-tier architecture provides clear separation of concerns and ensures that inventory data remains clean while marketing content can be optimized per portal without affecting the core unit data.
+</Tip>
