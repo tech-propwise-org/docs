@@ -1,0 +1,286 @@
+---
+title: "Queue Module Specification v29"
+description: "Latest comprehensive specification for the Queue module with PostgreSQL-based job processing, worker management, and health monitoring capabilities"
+---
+
+<Note>
+**Last Updated:** 2026-06-02  
+**Status:** Active
+</Note>
+
+## Overview
+
+The Queue module provides a centralized job queue system for PropWise CRM using PostgreSQL-based job processing via the pg-boss library. This module enables asynchronous processing of background tasks such as notifications, data processing, and other long-running operations that should be decoupled from HTTP request/response cycles.
+
+The module implements a queue service abstraction that allows other modules to enqueue jobs for background processing while providing features like job retries, priorities, batching, and worker management.
+
+## Architecture
+
+### Design Decisions
+
+The Queue module is built on several key architectural decisions:
+
+- **PostgreSQL-based queuing**: Uses pg-boss library for reliability and ACID compliance
+- **Interface-driven design**: Implements `IQueueService` interface for potential future queue provider swapping
+- **Global module**: Available throughout the application without explicit imports
+- **Worker abstraction**: Provides flexible worker registration with configurable options
+- **Lifecycle management**: Properly handles startup and shutdown of queue connections
+
+### Queue Provider Selection
+
+<Info>
+The module uses pg-boss as the underlying queue implementation because:
+
+- Leverages existing PostgreSQL infrastructure
+- Provides ACID guarantees for job persistence
+- Supports advanced features like job scheduling, retries, and priorities
+- No additional infrastructure dependencies
+</Info>
+
+## Interfaces
+
+### QueueJob
+
+Represents a job in the queue system:
+
+```typescript
+interface QueueJob<T> {
+  id: string; // Unique job identifier
+  data: T; // Job payload data
+  retryCount: number; // Current retry attempt count
+  retryLimit: number; // Maximum retry attempts allowed
+}
+```
+
+### QueueJobOptions
+
+Configuration options for job enqueueing:
+
+```typescript
+interface QueueJobOptions {
+  retryLimit?: number; // Max retry attempts (default: 3)
+  retryDelay?: number; // Delay between retries in seconds
+  retryBackoff?: boolean; // Use exponential backoff for retries
+  expireInSeconds?: number; // Job expiration time
+  singletonKey?: string; // Ensure only one job with this key exists
+  priority?: number; // Job priority (higher = more priority)
+}
+```
+
+### QueuePolicy
+
+Controls how `singletonKey` deduplication is enforced at the database level via pg-boss policy-specific unique indexes:
+
+```typescript
+type QueuePolicy =
+  | 'standard' // No dedup — singletonKey stored but no unique constraint
+  | 'short' // ≤ 1 job per singletonKey in `created` state
+  | 'singleton' // ≤ 1 job per singletonKey in `active` state
+  | 'stately' // ≤ 1 job per singletonKey in created | retry | active
+  | 'exclusive' // Same uniqueness as stately, different fetch semantics
+  | 'key_strict_fifo';
+```
+
+<Warning>
+**Critical:** The default `'standard'` policy applies **no unique index** on `singleton_key`. Any queue that uses `singletonKey` for deduplication **must** be created with `policy: 'stately'` (or `'exclusive'`), otherwise `ON CONFLICT DO NOTHING` never fires and every insert creates a new row regardless of how many pending jobs already exist for the same key.
+</Warning>
+
+### WorkerOptions
+
+Configuration for single-job workers:
+
+```typescript
+interface WorkerOptions {
+  concurrency?: number; // Independent worker invocations (default: 1)
+  pollingIntervalSeconds?: number; // How often to poll for new jobs
+  policy?: QueuePolicy; // Queue policy — REQUIRED for singletonKey dedup on the worker's queue
+}
+```
+
+### BatchWorkerOptions
+
+Configuration for batch workers:
+
+```typescript
+interface BatchWorkerOptions {
+  batchSize?: number; // Jobs per handler invocation (default: 1)
+  pollingIntervalSeconds?: number; // How often to poll for new jobs
+  policy?: QueuePolicy; // Queue policy — REQUIRED for singletonKey dedup
+}
+```
+
+<Tip>
+`policy` is enforced by `ensureQueue` inside **both** `registerWorker` and `registerBatchWorker`. Use `'stately'` whenever jobs are submitted with `singletonKey` and you need "at most one pending/active job per key".
+</Tip>
+
+### IQueueService Interface
+
+Core queue service contract with the following methods:
+
+| Method | Description |
+|--------|-------------|
+| `enqueue<T>(queueName, data, options?)` | Add single job to queue |
+| `enqueueBatch<T>(queueName, data[], options?)` | Add multiple jobs to queue |
+| `registerWorker<T>(queueName, handler, options?)` | Register job processor (accepts `policy`) |
+| `schedule(queueName, cron, data?)` | Register recurring cron (pg-boss `schedule`) |
+| `unschedule(queueName, key?)` | Remove recurring schedule (pg-boss `unschedule`) |
+| `purgeQueuedJobs(queueName)` | Delete pending jobs (`created` + `retry`); leaves `active` |
+| `checkHealth(timeoutMs?)` | Active liveness probe |
+| `start()` | Start queue processing |
+| `stop()` | Stop queue processing |
+
+#### checkHealth(timeoutMs?) — Active Liveness Probe
+
+Returns `Promise<QueueHealthResult>` (`{ healthy, reason?, latencyMs? }`) and never throws. Consumed by `PgBossHealthIndicator` for the `/health/ready` probe.
+
+<Note>
+The `isStarted` boolean is **not** a sufficient health signal: it is set once after `boss.start()` resolves and only flips back on `stop()`. `checkHealth()` instead round-trips `SELECT 1` through pg-boss's **own** connection, bounded by `QUEUE_HEALTH_PROBE_TIMEOUT_MS`.
+</Note>
+
+**Health Check Responses:**
+
+- Not started → `{ healthy: false, reason: 'boss.start() has not completed' }`
+- Query rejects → `{ healthy: false, reason: <driver error> }`
+- Query exceeds timeout → `{ healthy: false, reason: 'queue health probe timed out after <n>ms' }`
+- Otherwise → `{ healthy: true, latencyMs }`
+
+## Service Implementation
+
+### PgBossQueueService
+
+The main service implementation using pg-boss:
+
+```typescript
+@Injectable()
+export class PgBossQueueService implements IQueueService, OnModuleInit, OnModuleDestroy
+```
+
+<AccordionGroup>
+<Accordion title="Key Features">
+
+- **Automatic queue creation tracking** via `createdQueues` Set
+- **Database connection configured** via `ConfigService` from centralized `app.database.*` config
+- **Lifecycle hooks** for proper startup/shutdown
+- **Worker registration** with type-safe job handlers
+- **Parallel per-job processing** via `localConcurrency`
+- **Test-only utilities** for E2E testing scenarios
+
+</Accordion>
+
+<Accordion title="Database Configuration">
+
+Database connection is configured via `ConfigService` from centralized `app.database.*` config (`app.database.url`, `app.database.ssl`). TLS options are resolved by the shared `resolveDatabaseSsl()` helper, which validates the server certificate against Node's trust store for managed/Neon databases.
+
+</Accordion>
+
+<Accordion title="Parallel Processing">
+
+When `batchSize` is specified in `WorkerOptions`, it is mapped to pg-boss's `localConcurrency` option (with `batchSize: 1` at the pg-boss level). This spawns N independent workers that each process one job at a time, avoiding the batch auto-completion pitfall.
+
+</Accordion>
+</AccordionGroup>
+
+## Business Rules
+
+### Job Processing Rules
+
+<Steps>
+<Step title="Retry Logic">
+Jobs can be configured with retry limits and backoff strategies
+</Step>
+
+<Step title="Job Uniqueness">
+`singletonKey` deduplication is only enforced when the queue is created with `policy: 'stately'` (or `'exclusive'`)
+</Step>
+
+<Step title="Priority Processing">
+Higher priority jobs are processed first
+</Step>
+
+<Step title="Job Expiration">
+Jobs can expire if not processed within specified time
+</Step>
+
+<Step title="Batch Processing">
+Workers can process multiple jobs simultaneously
+</Step>
+
+<Step title="Current Authorization">
+Queue payloads should carry stable identifiers, not trusted authorization snapshots. Workers must reload current permissions before execution.
+</Step>
+</Steps>
+
+### Queue Management
+
+<CardGroup cols={2}>
+<Card title="Queue Creation" icon="plus">
+Queues are created automatically when first used
+</Card>
+
+<Card title="Worker Registration" icon="users">
+Each queue can have multiple workers with different configurations
+</Card>
+
+<Card title="Connection Management" icon="link">
+Single pg-boss instance per service lifetime
+</Card>
+
+<Card title="Signal Handling" icon="signal">
+Proper shutdown hooks for graceful termination
+</Card>
+</CardGroup>
+
+## Integration Points
+
+### Module Dependencies
+
+<Tabs>
+<Tab title="Database">
+Requires PostgreSQL connection via `app.database.url`; pg-boss uses the owner/superuser URL because it creates and manages queue tables
+</Tab>
+
+<Tab title="Configuration">
+Uses NestJS `ConfigService` for connection setup from `src/config/app.config.ts`
+</Tab>
+
+<Tab title="Logging">
+Integrates with NestJS Logger for operational monitoring
+</Tab>
+</Tabs>
+
+### Consumer Modules
+
+The queue module is designed to be consumed by:
+
+<AccordionGroup>
+<Accordion title="Core Modules">
+
+- **NotificationModule**: For sending notifications asynchronously
+- **MessagingModule**: For processing messaging workflows  
+- **AiModule**: For AI agent execution via AiAgentExecuteWorker
+- **WorkflowModule**: For workflow step execution and automation
+- **AuditModule**: For background audit log processing
+
+</Accordion>
+
+<Accordion title="Business Modules">
+
+- **Real Estate Module**: For data processing tasks, including the `PropertyMatchJobHandler` (`propertymatch` queue) that runs the multi-source lead matching engine
+- **SearchModule**: Async `search.reindex` indexer jobs plus recurring maintenance
+
+</Accordion>
+
+<Accordion title="Testing">
+
+`jest-e2e-queue.json` runs distribution, escalation, and misc queue E2E tests
+
+</Accordion>
+</AccordionGroup>
+
+## Health Monitoring
+
+The Queue module provides comprehensive health monitoring through the `checkHealth()` method, which is integrated with the application's health check system. This ensures that queue processing issues are detected and reported through standard health endpoints.
+
+<Check>
+The health probe uses pg-boss's own connection pool, providing coverage for queue-specific database connectivity issues that may not be caught by standard ORM health checks.
+</Check>

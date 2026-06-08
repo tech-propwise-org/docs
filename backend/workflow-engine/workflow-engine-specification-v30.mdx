@@ -1,0 +1,367 @@
+---
+title: "Workflow Engine Specification v30"
+description: "Comprehensive workflow engine specification covering rule-based automation for the messaging module, visual workflow builder, and workflow execution pipeline"
+---
+
+## Overview
+
+The Workflow Engine provides rule-based automation for the messaging module. It evaluates configurable automation rules against messaging events (new messages, new conversations, AI escalations) and executes actions such as assigning agents, sending templates, creating tasks, and updating lead stages.
+
+<Note>
+Rules are evaluated in **Phase B** of the webhook processor pipeline, isolated in a try-catch block so failures never affect message persistence or delivery.
+</Note>
+
+## Core Concepts
+
+### Visual Workflow Architecture
+
+The current workflow builder persists visual automations in the `workflow` table. Each workflow has a `triggerType`, optional `triggerConfig`, and a JSONB `graph` containing ordered step definitions and their connections.
+
+#### Save and Publish Model
+
+The frontend builder uses an explicit-save model with distinct operations:
+
+<Tabs>
+  <Tab title="Save Operation">
+    **`PATCH /v1/workflows/:id`** without lifecycle - saves draft changes
+  </Tab>
+  <Tab title="Publish Operation">
+    - **New workflow**: `POST /v1/workflows` with `status: PUBLISHED` (atomic create + publish)
+    - **Existing workflow**: `PATCH /v1/workflows/:id` with editor payload plus `status: PUBLISHED`
+  </Tab>
+  <Tab title="Lifecycle Operations">
+    - **Unpublish**: `PATCH` with `status: DRAFT`
+    - **Archive**: `PATCH` with `status: ARCHIVED`
+  </Tab>
+</Tabs>
+
+#### Workflow Creation Modes
+
+<CardGroup cols={2}>
+  <Card title="Start from Scratch" icon="plus">
+    Opens a local draft with an empty graph and no trigger selected. User must choose a trigger before saving.
+  </Card>
+  <Card title="Template" icon="template">
+    Opens a local draft from a system-level `WorkflowTemplate` record, copying its trigger type and graph into an editable local workflow.
+  </Card>
+</CardGroup>
+
+### Builder Action Gating
+
+<Warning>
+A non-empty **name is required** before any action. **Save**, **Test**, and **Publish** are all disabled while `name` is empty/whitespace-only.
+</Warning>
+
+Action requirements:
+- **Test**: Always requires a selected trigger
+- **Save**: Requires a trigger except for metadata-only edits on published workflows
+- **Publish**: Requires zero `getWorkflowValidationIssues` (name, trigger, at least one step, and valid per-step config)
+
+### Workflow Templates
+
+Workflow templates are stored in the database and managed through `WorkflowTemplateSeederService`. The service runs on **every server boot** to ensure the global `workflow_template` catalog is always present.
+
+<Info>
+Templates are exposed through `GET /v1/workflows/templates` and are global system catalog records with no organization ownership.
+</Info>
+
+#### Template Requirements
+
+Seeded templates must be ready-to-publish in any organization:
+- ✅ Generic message, question, branch, date/time, task, contact-update, and unassign steps
+- ❌ Organization-specific AI agents, users, teams, lead stages, or notification recipients
+
+### Workflow Actor Resolution
+
+The engine resolves the workflow actor once per execution and threads it onto every step's `StepContext.actorUserId`:
+
+<Steps>
+  <Step title="Scope Resolution">
+    - **ORGANIZATION scope**: Per-org AI service user via shared `resolveAiServiceUserId` utility
+    - **PERSONAL scope**: The workflow owner
+  </Step>
+  <Step title="Attribution">
+    Actor is used for domain attribution (task creation, lead updates, conversation assignments) and audit row attribution
+  </Step>
+  <Step title="Error Handling">
+    When actor cannot be resolved, handlers fail with appropriate error codes rather than writing unattributed records
+  </Step>
+</Steps>
+
+## Workflow Scopes and Permissions
+
+### Organization vs Personal Workflows
+
+<Tabs>
+  <Tab title="Organization Workflows">
+    - Users with `MESSAGING_MANAGE` can create by default
+    - Require `MESSAGING_MANAGE` for MODIFY/DELETE operations
+    - Can be triggered by organization AI agents
+  </Tab>
+  <Tab title="Personal Workflows">
+    - Users without `MESSAGING_MANAGE` always create personal workflows
+    - Fully accessible to the owner
+    - Can only be triggered by personal AI agents owned by the same user
+  </Tab>
+</Tabs>
+
+### Publishing Constraints
+
+<Note>
+Publishing is unique by scope with database-enforced partial unique indexes:
+- `workflow_org_published_trigger_unique`: One published organization workflow per `(organization_id, trigger_type)`
+- `workflow_personal_published_trigger_unique`: One published personal workflow per `(organization_id, owner_user_id, trigger_type)`
+</Note>
+
+### Access Control
+
+Access enforcement uses `AccessService.assertWorkflowAccessInTransaction`:
+
+<AccordionGroup>
+  <Accordion title="Users with MESSAGING_VIEW or MESSAGING_MANAGE">
+    - Can list both organization and personal workflows
+    - Organization workflows require messaging permissions for read/modify
+  </Accordion>
+  <Accordion title="Users without messaging permissions">
+    - Receive **only their own personal workflows**
+    - `scope=ORGANIZATION` returns **no rows**
+  </Accordion>
+</AccordionGroup>
+
+## Supported Trigger Types
+
+The visual builder trigger picker exposes this reduced set:
+
+<CardGroup cols={2}>
+  <Card title="FIRST_MESSAGE_RECEIVED" icon="message">
+    First Message Received
+  </Card>
+  <Card title="MESSAGING_WINDOW_REOPENED" icon="window-restore">
+    Messaging Window Reopened
+  </Card>
+  <Card title="CONTACT_FIELD_UPDATED" icon="user-edit">
+    Contact Field Updated
+  </Card>
+  <Card title="ASSIGNMENT_CHANGED" icon="user-arrows">
+    Assignment Changed
+  </Card>
+  <Card title="LEAD_CREATED_FROM_CAMPAIGN" icon="bullhorn">
+    Lead Created from Campaign
+  </Card>
+  <Card title="LIFECYCLE_UPDATED" icon="arrows-spin">
+    Lead Moved to Stage
+  </Card>
+  <Card title="INCOMING_WEBHOOK" icon="webhook">
+    Webhook / Integration Event
+  </Card>
+</CardGroup>
+
+<Check>
+The backend `WorkflowTriggerType` enum, frontend API enum, and database CHECK constraints are aligned to this same seven-trigger set.
+</Check>
+
+## Branch Conditions and Logic
+
+### Structured Branch Conditions
+
+Visual workflow branches use the structured backend `BranchCondition` schema:
+
+```json
+{
+  "category": "contact_field",
+  "field": "email",
+  "operator": "exists",
+  "value": null,
+  "stepId": "optional-when-category-is-previous_step_output"
+}
+```
+
+<Warning>
+Legacy raw field paths, wrapped variables, and deprecated categories (`trigger`, `contact`, `lead`, `conversation`, `previous_step`, `webhook_payload`) are rejected at publish time.
+</Warning>
+
+### Supported Categories
+
+<Tabs>
+  <Tab title="Contact & Lead">
+    - `contact_field`: Values resolve through `PersonService` workflow branch helpers
+    - `lead_stage`: Compares against organization's effective lead stages
+  </Tab>
+  <Tab title="Assignment & Messages">
+    - `assignee_status`: Current assignment status
+    - `last_incoming_message`: Latest inbound message fields
+    - `last_outgoing_message`: Latest outbound message fields
+    - `time_since_last_incoming_message`: Time elapsed since last inbound
+    - `time_since_last_outgoing_message`: Time elapsed since last outbound
+  </Tab>
+  <Tab title="Step Output">
+    - `previous_step_output`: Reads from `execution.variables.steps[stepId]`
+  </Tab>
+</Tabs>
+
+### Branch Operators
+
+<CodeGroup>
+```json Comparison Operators
+{
+  "eq": "equals",
+  "neq": "not equals", 
+  "gt": "greater than",
+  "gte": "greater than or equal",
+  "lt": "less than",
+  "lte": "less than or equal"
+}
+```
+
+```json String Operators
+{
+  "contains": "contains substring",
+  "not_contains": "does not contain",
+  "in": "in array (non-empty required)",
+  "between": "between two values"
+}
+```
+
+```json Existence Operators
+{
+  "exists": "field exists (no value required)",
+  "not_exists": "field does not exist",
+  "has_any_of": "has any of values",
+  "has_all_of": "has all of values", 
+  "has_none_of": "has none of values"
+}
+```
+</CodeGroup>
+
+### Branch Validation Rules
+
+<Steps>
+  <Step title="Value Requirements">
+    - `exists` and `not_exists` require no value
+    - `in` requires a non-empty array
+    - `between` requires a two-element bound
+  </Step>
+  <Step title="Type Validation">
+    Numeric/date/boolean/array fields reject incompatible values before publish
+  </Step>
+  <Step title="Branch Structure">
+    - Exactly one else branch (empty `conditions`) is required per Branch step
+    - Branch evaluation preserves branch order with `AND` / `OR` semantics
+  </Step>
+</Steps>
+
+## Graph Structure and Validation
+
+### Connection Types
+
+Branching steps must persist explicit output targets:
+
+<AccordionGroup>
+  <Accordion title="BRANCH Step Connections">
+    ```json
+    {
+      "connections": {
+        "branches": [
+          {"nextStepId": "step-id-1"},
+          {"nextStepId": "step-id-2"}
+        ]
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="DATE_TIME Step Connections">
+    ```json
+    {
+      "connections": {
+        "inWindowBranch": "step-id-1",
+        "outOfWindowBranch": "step-id-2"
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="CHECK_TEAM_AVAILABILITY Connections">
+    ```json
+    {
+      "connections": {
+        "availableBranch": "step-id-1", 
+        "unavailableBranch": "step-id-2"
+      }
+    }
+    ```
+  </Accordion>
+  <Accordion title="Advanced Failure Branches">
+    ```json
+    {
+      "connections": {
+        "onFailure": "step-id",
+        "onMessageFailure": "step-id",
+        "onTimeout": "step-id"
+      }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Publish-Grade Validation
+
+<Warning>
+Server-side validation uses `node.connections` as the executable source of truth, not the `edges` array.
+</Warning>
+
+The backend validation enforces:
+
+<Steps>
+  <Step title="Graph Structure">
+    - Exactly one entry node required
+    - Every connection target must reference an existing node
+    - No unreachable nodes allowed
+  </Step>
+  <Step title="Cycle Detection">
+    - Regular graph cycles are rejected
+    - Intentional loops only permitted through `JUMP_TO` with bounded `maxJumps`
+  </Step>
+  <Step title="End Node Rules">
+    - `END` nodes cannot have any outgoing connections
+  </Step>
+</Steps>
+
+### Step Management
+
+In the vertical builder:
+- **Adding steps**: Wires the selected output connection to the new node
+- **Deleting steps**: Graph-aware deletion with confirmation prompt for steps with downstream targets
+
+<Tip>
+The builder removes references to deleted nodes from named output connections and branch targets to prevent broken references in the saved graph.
+</Tip>
+
+## Wait Step Configuration
+
+The Wait step stores duration as `durationMs` for precise queue worker scheduling.
+
+<CodeGroup>
+```json Wait Step Configuration
+{
+  "type": "WAIT",
+  "config": {
+    "durationMs": 300000
+  }
+}
+```
+
+```javascript Duration Constraints
+// Wait durations must be between 1 second and 7 days
+const MIN_DURATION = 1000;        // 1 second
+const MAX_DURATION = 604800000;   // 7 days
+```
+</CodeGroup>
+
+<Note>
+Frontend controls may display seconds, minutes, hours, or days, but saved workflow JSON must use milliseconds for queue worker compatibility.
+</Note>
+
+The Wait handler:
+1. Schedules a delayed resume job for the same wait node
+2. Engine continues execution after the specified duration
+
+This specification covers the core workflow engine architecture, visual builder functionality, and execution pipeline for rule-based messaging automation.
