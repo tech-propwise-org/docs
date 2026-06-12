@@ -1,0 +1,228 @@
+---
+title: "Team Deletion Specification v5"
+description: "Authoritative specification for team deletion with safety layers, pre-delete hints, and data integrity safeguards"
+---
+
+Authoritative specification for **team deletion** (`DELETE /teams/:id`) and the safety + visibility layers that bring it to parity with organization user removal.
+
+<Note>
+**Core model (unchanged):** team deletion **soft-deletes the RBAC/access layer** (team, memberships, membership-roles, custom team roles) and **retains all CRM data** (`entity_stakeholder`, `commission_payment`, distribution/escalation settings). There is **no auto-cleanup or auto-reassignment** — reassignment is manual. This spec adds a pre-delete hint, a delete-dialog warning, a deleted-team badge, and a data-integrity audit counter on top of that model.
+</Note>
+
+## What `TeamService.remove()` does
+
+`TeamService.remove(teamId, organizationId, currentUserId)` runs inside `executeInOrg` and:
+
+<Steps>
+<Step title="Load team data">
+Loads the team with `memberships`, `memberships.user`, `memberships.teamRoles`, `roles`
+</Step>
+
+<Step title="Collect member information">
+Collects active member IDs for the notification
+</Step>
+
+<Step title="Soft-delete memberships and roles">
+Soft-deletes all team memberships + their roles (`TeamMembershipService.softDeleteAllMembershipsInTransaction`)
+</Step>
+
+<Step title="Soft-delete custom team roles">
+Soft-deletes all custom team roles (`role.isDeleted = true`)
+</Step>
+
+<Step title="Soft-delete the team">
+Soft-deletes the team (`team.isDeleted = true`)
+</Step>
+
+<Step title="Invalidate cache">
+Invalidates the permission cache for the team
+</Step>
+
+<Step title="Emit events">
+Emits `TEAM_DELETED` (notifications to former members + `messaging-cleanup.listener` conversation cleanup)
+</Step>
+</Steps>
+
+<Warning>
+It does **NOT** touch `entity_stakeholder`, `commission_payment`, or distribution/escalation rows.
+</Warning>
+
+```mermaid
+flowchart TD
+  Admin["DELETE /teams/:id (system.admin)"] --> Remove["TeamService.remove"]
+  Remove --> RBAC["Team + memberships + roles isDeleted=true"]
+  Remove --> Evt["TEAM_DELETED event"]
+  Remove -. "no auto-clear" .-> CRM["stakeholders + commission + distribution UNCHANGED"]
+  PreDelete["GET /teams/:id/stale-assignments"] --> Dialog["delete dialog warning (team-pool aware)"]
+  CRM --> Badge["deleted-team badge (EntityStakeholder.team override → isActiveTeam=false)"]
+  CRM --> Audit["data-integrity informational counts"]
+```
+
+## Data retention matrix
+
+| Data | On team deletion | Reachability after deletion |
+| --- | --- | --- |
+| Team (RBAC) | Soft-deleted | — |
+| Team memberships + membership roles | Soft-deleted | — |
+| Custom team roles | Soft-deleted | — |
+| `entity_stakeholder` **user + team** rows | **Retained** | Reachable via the named **user** stakeholder (badged "deleted team") |
+| `entity_stakeholder` **team-pool** rows (`user = NULL`) | **Retained** | **Admin-only** — no active membership remains to grant access |
+| `commission_payment` (`team_id` set) | **Retained** | Visible to finance/admin; reassign manually |
+| Distribution / escalation settings referencing the team | **Retained** (orphan audit already covers `team_membership` / `team_distribution_settings`) | — |
+
+## Pre-delete hint — `GET /teams/:id/stale-assignments`
+
+Mirrors `GET /users/:id/stale-assignments` with **`@CheckAccess({ permissions: [SYSTEM_ADMIN] })`** access control, the same gate as delete.
+
+<Info>
+**Informational only** — never blocks deletion.
+</Info>
+
+### Implementation details
+
+**Orchestration:** the handler lives in `TeamController` (NOT `TeamService`, which stays free of CRM dependencies). It fans out to two own-module read methods in parallel and assembles `TeamStaleAssignmentsDto`:
+
+<Tabs>
+<Tab title="EntityStakeholderService">
+`EntityStakeholderService.getTeamStaleAssignments(teamId, orgId)` — own `executeReadOnly`; counts active (non-deleted) leads/deals where the team is a stakeholder, and breaks out the **team-pool** subset (`user_id IS NULL`). Own-module raw SQL (`entity_stakeholder` + `lead`/`deal` liveness JOIN — the accepted CRM-internal exception).
+</Tab>
+
+<Tab title="CommissionPaymentService">
+`CommissionPaymentService.countActiveTeamCommissionPayments(teamId, orgId)` — own `executeReadOnly`; `commission_payment` is owned by the commission-payment module, so this raw count **must** live there (module-boundary rule), not in `EntityStakeholderService`.
+</Tab>
+</Tabs>
+
+### TeamStaleAssignmentsDto
+
+| Field | Meaning |
+| --- | --- |
+| `leadCount` / `dealCount` | Active leads/deals where the team is a stakeholder |
+| `teamPoolLeadCount` / `teamPoolDealCount` | Subset owned by no named agent (`user_id IS NULL`) |
+| `commissionPaymentCount` | Active commission payments attributed to the team |
+| `total` | `leadCount + dealCount + commissionPaymentCount` |
+| `teamPoolTotal` | `teamPoolLeadCount + teamPoolDealCount` |
+
+## Surfacing the deleted team — `isActiveTeam`
+
+The deleted team is surfaced via the **project-standard per-relation `{ filters: { isDeleted: false } }` override** on `EntityStakeholder.team` — NOT a side-query.
+
+<Steps>
+<Step title="Relation override">
+`EntityStakeholder.team` declares `@ManyToOne(() => Team, { nullable: true, filters: { isDeleted: false } })`. The relation is nullable → **LEFT JOIN**, so there is **zero row-drop risk**; the only behavioral change is that a soft-deleted populated team now hydrates (exposing `isActiveTeam: false`) instead of nulling.
+</Step>
+
+<Step title="isActiveTeam flag">
+`TeamDto` and `TeamBasicDto` expose `isActiveTeam = !team.isDeleted`. It flows automatically to lead/deal DTOs via the embedded stakeholder `TeamDto` and the denormalized `assignedTeam` (`TeamBasicDto`).
+</Step>
+
+<Step title="No orphan warn">
+`EntityStakeholderDto` does **not** call `warnIfStaleRelation` for `team`. A deleted team on a stakeholder is an **expected, supported, informational** state, not corruption.
+</Step>
+
+<Step title="Tier-2 pass-through">
+`EntityStakeholder.team` is Tier-2. Per soft delete filter standards, Tier-2 relations pass the name through; exposing the name + `isActiveTeam: false` is standard-compliant.
+</Step>
+
+<Step title="Populate-site safety">
+Team-pool / team-row detection uses `s.team && !s.user` (and id-keying), never `!s.team` as "team was deleted". After the override these paths are unchanged or **improved**.
+</Step>
+</Steps>
+
+## Side effect — team-pool records become admin-only
+
+<Warning>
+Deleting a team soft-deletes its memberships, so **pure team-pool stakeholders (`user = NULL, team = set`)** are reachable only by org admins / direct user stakeholders afterwards — strictly worse than user removal, where the lead keeps a named (badged) owner.
+</Warning>
+
+This is surfaced end-to-end:
+
+- The hint breaks out `teamPoolLeadCount` / `teamPoolDealCount`
+- The delete dialog raises a **stronger `danger` Alert** for team-pool records and a **softer `attention` Alert** for the user+team remainder
+
+**Manual reassignment** is the expected recovery. A v2 reassignment worklist / soft-block is out of scope.
+
+## Frontend implementation
+
+### Delete dialog (`delete-team-confirmation-dialog.tsx`)
+
+Fetches `TeamApi.getStaleAssignments(team.id)` (`queryKeys.teams.staleAssignments(id)`, enabled on `open`) and renders, via `EntityConfirmDialog` `extraContent`:
+
+<CardGroup cols={2}>
+<Card title="Danger Alert" icon="triangle-exclamation">
+When `teamPoolTotal > 0` — team-pool records become admin-only until reassigned
+</Card>
+
+<Card title="Attention Alert" icon="info-circle">
+When the non-pool remainder `> 0` — user+team stakeholder rows + commission payments that keep a named owner but should be reassigned
+</Card>
+</CardGroup>
+
+<Note>
+The dialog never blocks deletion (informational, matching user removal).
+</Note>
+
+### Deleted-team badge (`RemovedTeamName`)
+
+`removed-from-org-badge.tsx` exports `RemovedTeamName` + `isRemovedTeam(team)` using the **team-shaped** `team.isActiveTeam === false` guard.
+
+**Features:**
+- Strikethrough + muted styling + tooltip "This team was deleted"
+- Used wherever stakeholder/CRM team names render:
+  - Stakeholders tab team-group header
+  - Lead panel + deal panel Team field
+  - Lead + deal kanban card assignee (team-pool rows)
+  - Lead + deal list-table "Assigned to" column
+
+<Tip>
+The frontend `TeamDto` / `TeamBasicDto` carry optional `isActiveTeam` (default `true` when omitted).
+</Tip>
+
+## Data integrity audit
+
+`DataIntegrityAuditService` adds two **informational** counts:
+
+<AccordionGroup>
+<Accordion title="stakeholdersWithDeletedTeamsCount">
+`entity_stakeholder es JOIN team t ON t.id = es.team_id WHERE t.is_deleted = true AND es.is_deleted = false`
+
+Lives in `auditStakeholderTransferStageHistory`
+</Accordion>
+
+<Accordion title="commissionPaymentsWithDeletedTeamsCount">
+`commission_payment cp JOIN team t ON t.id = cp.team_id WHERE t.is_deleted = true AND cp.is_deleted = false`
+
+Lives in `auditJunctionsCommissionDealDoc`
+</Accordion>
+</AccordionGroup>
+
+<Note>
+**NOT orphans** — they do not flip `totalOrphans > 0`, otherwise any team deletion would mark the audit unhealthy forever. Both live in `INFORMATIONAL_COUNT_FIELDS` (precedent: `stakeholdersWithoutActiveUserOrgRoleCount` after org user removal).
+</Note>
+
+## Module wiring (bidirectional forwardRef cycle)
+
+The stakeholder count reads CRM-owned data, so `RbacModule` must reach `EntityStakeholderService`.
+
+<Steps>
+<Step title="Existing imports">
+`EntityStakeholderModule` already imports `forwardRef(() => RbacModule)` and already exports `EntityStakeholderService`
+</Step>
+
+<Step title="Add reverse import">
+Adding `forwardRef(() => EntityStakeholderModule)` to `RbacModule` closes a **bidirectional** cycle (same shape as `UserModule`)
+</Step>
+
+<Step title="Inject into controller">
+`EntityStakeholderService` is injected into **`TeamController`** (not `TeamService`) so `TeamService` stays free of CRM dependencies
+</Step>
+</Steps>
+
+<Warning>
+Verify with an app **boot** (not just `pnpm build`): a broken DI cycle throws only at Nest bootstrap.
+</Warning>
+
+## Out of scope
+
+<Check>
+**Per decisions:** No auto-cleanup/reassignment of team-pool or user+team stakeholders, no commission reallocation, no "restore team" flow. Pending `EntityTransfer` is not blocked (v1, matches user removal).
+</Check>
