@@ -1,0 +1,626 @@
+---
+title: "Portal Syndication Specification v7"
+description: "Complete architectural specification for the Portal Syndication Module with three-tier architecture, listing management, and portal integration workflows"
+---
+
+# Portal Syndication Module — Specification
+
+<Note>
+**Version:** 3.0 — Architectural revision: introduced `Listing` entity as the marketing layer between `InventoryUnit` (inventory) and `ListingPortalSync` (per-portal state). Consolidated from system design plan, PF API guide, Bayut/dubizzle XML guide, and gap analysis.
+</Note>
+
+<Info>
+**Status:** Authoritative design document. The `.cursor/plans/portal_syndication_system_design` plan tracks implementation progress against this spec.
+</Info>
+
+## Module Overview
+
+The Portal Syndication Module allows real estate agents to publish property listings to three UAE property portals directly from PropWise CRM, and automatically receive leads back into the CRM pipeline.
+
+### Three-Tier Architecture
+
+```
+InventoryUnit  →  Listing  →  ListingPortalSync
+  (inventory)     (marketing)   (per-portal state)
+```
+
+<CardGroup cols={3}>
+  <Card title="InventoryUnit" icon="building">
+    What the unit *is* (rooms, area, price, physical attributes). Unchanged by portal syndication logic.
+  </Card>
+  <Card title="Listing" icon="megaphone">
+    How the unit is *marketed* (title, descriptions, permit number, portal classifications, marketing media). Created by an agent from an `InventoryUnit`.
+  </Card>
+  <Card title="ListingPortalSync" icon="sync">
+    Where the listing is *published* and its current state on each portal.
+  </Card>
+</CardGroup>
+
+<Tip>
+This separation ensures `InventoryUnit` stays a clean inventory record and the `Listing` layer can eventually support off-plan units (`refUnitId`) without any structural change to the sync system.
+</Tip>
+
+### Integration Model Per Portal
+
+| Portal | Listing Syndication | Lead Ingestion | Listing Timing |
+|---|---|---|---|
+| Property Finder | REST API Push (JSON) | Webhook push (primary) + REST poll fallback (15 min) | Real-time (seconds) |
+| Bayut | XML Feed Pull (unified) | Pull API polling — scheduled every 15 min | 30 min – 2 hr delay |
+| dubizzle | XML Feed Pull (same as Bayut) | Pull API polling — same API + endpoint as Bayut | 30 min – 2 hr delay |
+
+<Warning>
+**Bayut / dubizzle lead ingestion note:** Bayut and dubizzle share one API endpoint and one Bearer token (per agency). The `source` field in each lead response (`"bayut"` or `"dubizzle"`) determines which `LeadSource` enum value is used when the CRM lead is created. Lead ingestion is gated by `PortalConfiguration.leadIngestionEnabled` (per portal).
+</Warning>
+
+### Data Flow Rules
+
+<Check>Listings flow **one direction only**: CRM → portals (CRM always wins)</Check>
+<Check>Leads flow **one direction only**: portals → CRM</Check>
+<Check>Portal data **never** overwrites CRM data</Check>
+<Check>`Listing` is the **single source of truth** for listing (marketing) content</Check>
+<Check>`InventoryUnit` is the **single source of truth** for unit inventory data</Check>
+
+### Module Location
+
+```typescript
+src/modules/real-estate/portal-syndication/
+```
+
+Imported in `src/modules/real-estate/real-estate.module.ts`.
+
+## Implementation Status
+
+<Info>
+This section reconciles the spec with the shipped implementation. Where the spec and the build diverge, **the build is authoritative**.
+</Info>
+
+### Phase A — Bayut/dubizzle Outbound (XML Feed) — BUILT
+
+<AccordionGroup>
+  <Accordion title="Self-contained Listing">
+    - **Self-contained `Listing`**: every field any portal needs now lives on `Listing` (snapshotted from the unit in linked mode via `ListingService.copyUnitToListing`, or entered directly in manual mode)
+    - Adapters + `PortalValidationService` read ONLY `listing.X` — never `listing.inventoryUnit.X`
+    - `inventoryUnit` FK is **nullable** (manual listings have none)
+    - New `ListingPurpose` enum (`Sale`/`Rent`)
+    - New columns added by `Migration20260531120000_SelfContainedListingFields`
+  </Accordion>
+
+  <Accordion title="Two Creation Modes">
+    Both converge on `ListingService.create(dto, userId, orgId)`:
+    - **Linked mode**: snapshots then applies DTO overrides
+    - **Manual mode**: `refreshFromUnit` re-pulls snapshot fields while preserving marketing content + agent overrides
+  </Accordion>
+
+  <Accordion title="Centralized Value Transforms">
+    Located in `src/modules/shared/portal-value-map.ts`:
+    - `purposeToBayut/purposeToPfPriceType`
+    - `furnishedToBayut/Pf`
+    - `bedroomsToBayut/Pf`
+    - `bathroomsToBayut/Pf`
+    - `rentalPeriodToBayut`
+    - `finishingToPf`
+    - `emirateToPfCompliance/UaeEmirate`
+    
+    Both adapters AND the validator consume these.
+  </Accordion>
+
+  <Accordion title="BayutDubizzleFeedAdapter">
+    - **`BayutDubizzleFeedAdapter`** + a CDATA XML serializer (`utils/bayut-xml.serializer.ts`)
+    - `Property_Ref_No = UNIT-{orgShortCode}-{listing.id}` with a null-`orgShortCode` fallback
+  </Accordion>
+
+  <Accordion title="Public Feed">
+    - **Public feed**: `GET /portal-syndication/feeds/:orgId?token=`
+    - `@PublicEndpoint`, `PortalFeedController` + `PortalFeedService`
+    - Built live via `executeWithBypass`
+    - Feed includes published rows as `Property_Status=live` AND recently-removed rows as `deleted` for ≥48h so portals delist promptly
+  </Accordion>
+
+  <Accordion title="Sync State Machine">
+    - `DRAFT → PUBLISHED` ADDED to `VALID_TRANSITIONS` for feed portals
+    - Mirrors the existing `REMOVED → PUBLISHED`
+    - `PENDING → PUBLISHED` remains invalid
+  </Accordion>
+</AccordionGroup>
+
+### Publish Authorization
+
+<Steps>
+  <Step title="Gate A Check">
+    `SyndicationService.publish` checks `real_estate.listing.publish` permission. Managers hold it via implication.
+  </Step>
+  
+  <Step title="Approval Workflow">
+    Without permission, listing goes to `ListingStatus.PENDING_APPROVAL` and a `real_estate.manage` user uses `POST /:listingId/approve|reject`.
+  </Step>
+  
+  <Step title="Rejection Handling">
+    **Reject** moves the listing to `ListingStatus.REJECTED` and persists the approver's note (`rejectionReason` + `rejectedAt`/`rejectedBy`).
+  </Step>
+  
+  <Step title="Approval Process">
+    **Approve** honors the submitter's publish intent (`publishOnApproval` on the publish body). Also stamps `Listing.approvedAt` / `approvedBy` (set-once, never cleared).
+  </Step>
+</Steps>
+
+### Owner Self-Manage Bypass
+
+<Note>
+The approval gate only blocks a non-publisher's **first** publish. Once `Listing.approvedAt` is set, the listing's **owner** can publish/unpublish/toggle portals **directly**.
+</Note>
+
+**New endpoints:**
+- `publish`
+- `approve` 
+- `reject`
+- `unpublish`
+- `refresh-from-unit`
+
+<Warning>
+**Delete** (`DELETE /:listingId`) soft-deletes (`isDeleted=true`) after removing from portals — there is no user-facing archived state.
+</Warning>
+
+### Listing Approval Notifications
+
+<CardGroup cols={2}>
+  <Card title="Submit for Approval" icon="paper-plane">
+    `LISTING_APPROVAL_REQUESTED` to every `real_estate.manage` approver
+  </Card>
+  <Card title="Approve" icon="check">
+    `LISTING_APPROVED` to the publisher (`createdBy`)
+  </Card>
+  <Card title="Reject" icon="x">
+    `LISTING_REJECTED` to the publisher with rejection reason
+  </Card>
+  <Card title="Delete" icon="trash">
+    `LISTING_DELETED` to the publisher, ONLY when deleter is not the publisher
+  </Card>
+</CardGroup>
+
+### Inventory Cascade (User Choice on Delete)
+
+<Tabs>
+  <Tab title="Remove Linked Listings (Default)">
+    `removeLinkedListings = true`
+    - Remove the unit's listings from all portals
+    - Archive them via `ListingService.archiveByUnit`
+  </Tab>
+  
+  <Tab title="Keep Listings">
+    `removeLinkedListings = false`
+    - Keep the listings live but sever the unit link
+    - Sets `inventoryUnit = null`, turning each into a self-contained manual listing
+  </Tab>
+</Tabs>
+
+The flag is passed from `DELETE /inventory/units/:id?removeLinkedListings=true|false`.
+
+## Phase A.5 — Unified Inbound Lead Capture — BUILT
+
+### New Lead Capture Module
+
+**Location:** `src/modules/crm/lead-capture/`
+
+<CardGroup cols={2}>
+  <Card title="Core Services" icon="gear">
+    - `LeadCaptureService.capture()`
+    - `CapturedLeadInput` contract
+    - `LeadCaptureSource` interface
+    - `LeadCaptureSourceRegistry`
+  </Card>
+  <Card title="Infrastructure" icon="server">
+    - Org-default `LeadCaptureSettings`
+    - `CapturedLead` idempotency ledger
+    - `lead-ingestion` pg-boss queue
+    - `LeadIngestionWorker`
+  </Card>
+</CardGroup>
+
+### Bayut Lead Integration
+
+<Steps>
+  <Step title="BayutLeadParserService">
+    Pure service handling 7 shapes → `NormalizedBayutLead`
+  </Step>
+  
+  <Step title="BayutLeadCaptureAdapter">
+    Adapts normalized leads to CRM format
+  </Step>
+  
+  <Step title="BayutLeadPollerService">
+    - `@Cron('*/15 …')` polling across organizations
+    - Selects Bayut rows with `leadIngestionEnabled = true` + token
+    - Decrypts Bearer token from `PortalConfiguration.apiKey`
+    - Polls 7 combinations, drops dubizzle-source leads unless org's dubizzle row has `leadIngestionEnabled = true`
+    - On 401, does NOT advance `lastLeadPollAt`
+  </Step>
+</Steps>
+
+**Configuration:** `app.bayut.leadApiBaseUrl`
+
+## Phase B — Property Finder (REST Push) — BUILT
+
+### Core Services
+
+<AccordionGroup>
+  <Accordion title="Token Management">
+    **`PfTokenService`**
+    - 30-minute token cache
+    - Invalidate-on-401 handling
+  </Accordion>
+
+  <Accordion title="Location & Agent Mapping">
+    **`PfLocationMappingService`** - 24-hour cache
+    
+    **`PfAgentMappingService`** - 24-hour cache + `refreshOrgAgentMappings` (replaces the 501 stub)
+  </Accordion>
+
+  <Accordion title="Compliance & Credits">
+    **`PfComplianceService`** - Handles compliance requirements
+    
+    **`PfCreditService`** - Manages credit allocation
+  </Accordion>
+
+  <Accordion title="Image Processing">
+    **`ListingImageService`**
+    - Sharp validate/auto-fix
+    - `processedMedia` cache with `constraintHash`
+  </Accordion>
+
+  <Accordion title="Syndication Workflow">
+    **`PropertyFinderAdapter`** - 6-step publish process
+    
+    **`PfSyndicationWorker`** - Handles `pf-syndication` queue
+  </Accordion>
+
+  <Accordion title="Webhook & Lead Management">
+    **`PfWebhookSubscriptionService`** - Manages webhook subscriptions
+    
+    **Public `PortalWebhookController`** - HMAC over raw body
+    
+    **`PfLeadCaptureAdapter`** - Processes incoming leads
+  </Accordion>
+
+  <Accordion title="Monitoring Services">
+    **`SyncReconciliationService`** - Cron-based sync monitoring
+    
+    **`ApiKeyExpirationCheckService`** - Cron-based key expiration checks
+  </Accordion>
+</AccordionGroup>
+
+**Configuration:** `app.propertyFinder.apiBaseUrl`
+
+<Note>
+All Property Finder and Bayut HTTP operations use plain `axios` following the codebase convention.
+</Note>
+
+## API Endpoints
+
+### Listing Management
+
+```typescript
+// Core listing operations
+POST   /listings                    // Create new listing
+GET    /listings/:id               // Get listing details
+PATCH  /listings/:id               // Update listing
+DELETE /listings/:id               // Soft delete listing
+
+// Syndication operations
+POST   /listings/:id/publish       // Publish to portals
+POST   /listings/:id/unpublish     // Remove from portals
+POST   /listings/:id/refresh-from-unit // Refresh linked listing
+
+// Approval workflow
+POST   /listings/:id/approve       // Approve pending listing
+POST   /listings/:id/reject        // Reject pending listing
+
+// Feed endpoints
+GET    /portal-syndication/feeds/:orgId // Public XML feed for Bayut/dubizzle
+```
+
+### Portal Configuration
+
+```typescript
+GET    /portal-configurations       // List org portal configs
+POST   /portal-configurations      // Create portal config
+PATCH  /portal-configurations/:id  // Update portal config
+```
+
+### Webhook Endpoints
+
+```typescript
+POST   /portal-webhooks/property-finder  // PF webhook receiver
+```
+
+## Database Schema
+
+### Core Entities
+
+<CodeGroup>
+```sql Listing Table
+CREATE TABLE listings (
+  id BIGSERIAL PRIMARY KEY,
+  inventoryUnitId BIGINT REFERENCES inventory_units(id),
+  
+  -- Marketing fields (self-contained)
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  purpose listing_purpose_enum NOT NULL,
+  price DECIMAL(15,2),
+  currency VARCHAR(3) DEFAULT 'AED',
+  
+  -- Property details
+  bedrooms INTEGER,
+  bathrooms DECIMAL(3,1),
+  area DECIMAL(10,2),
+  areaUnit area_unit_enum,
+  furnished furnished_enum,
+  
+  -- Portal-specific fields
+  permitNumber VARCHAR(100),
+  emirate uae_emirate_enum,
+  
+  -- Approval workflow
+  approvedAt TIMESTAMP,
+  approvedBy BIGINT REFERENCES users(id),
+  rejectionReason TEXT,
+  rejectedAt TIMESTAMP,
+  rejectedBy BIGINT REFERENCES users(id),
+  
+  -- Standard fields
+  createdAt TIMESTAMP DEFAULT NOW(),
+  updatedAt TIMESTAMP DEFAULT NOW(),
+  createdBy BIGINT REFERENCES users(id),
+  organizationId BIGINT REFERENCES organizations(id),
+  isDeleted BOOLEAN DEFAULT FALSE
+);
+```
+
+```sql ListingPortalSync Table
+CREATE TABLE listing_portal_syncs (
+  id BIGSERIAL PRIMARY KEY,
+  listingId BIGINT REFERENCES listings(id),
+  portal portal_enum NOT NULL,
+  status listing_sync_status_enum NOT NULL,
+  
+  -- Portal-specific identifiers
+  portalListingId VARCHAR(255),
+  portalUrl TEXT,
+  
+  -- Sync metadata
+  lastSyncAt TIMESTAMP,
+  lastSyncError TEXT,
+  syncAttempts INTEGER DEFAULT 0,
+  
+  -- Standard fields
+  createdAt TIMESTAMP DEFAULT NOW(),
+  updatedAt TIMESTAMP DEFAULT NOW(),
+  organizationId BIGINT REFERENCES organizations(id)
+);
+```
+
+```sql PortalConfiguration Table
+CREATE TABLE portal_configurations (
+  id BIGSERIAL PRIMARY KEY,
+  portal portal_enum NOT NULL,
+  
+  -- Credentials (encrypted)
+  apiKey TEXT,
+  apiSecret TEXT,
+  username VARCHAR(255),
+  
+  -- Configuration flags
+  isEnabled BOOLEAN DEFAULT FALSE,
+  listingSyndicationEnabled BOOLEAN DEFAULT FALSE,
+  leadIngestionEnabled BOOLEAN DEFAULT FALSE,
+  
+  -- Lead polling state
+  lastLeadPollAt TIMESTAMP,
+  
+  -- Standard fields
+  organizationId BIGINT REFERENCES organizations(id),
+  createdAt TIMESTAMP DEFAULT NOW(),
+  updatedAt TIMESTAMP DEFAULT NOW()
+);
+```
+</CodeGroup>
+
+### Enums
+
+<Tabs>
+  <Tab title="Portal Types">
+    ```sql
+    CREATE TYPE portal_enum AS ENUM (
+      'PROPERTY_FINDER',
+      'BAYUT', 
+      'DUBIZZLE'
+    );
+    ```
+  </Tab>
+  
+  <Tab title="Listing Status">
+    ```sql
+    CREATE TYPE listing_sync_status_enum AS ENUM (
+      'DRAFT',
+      'PENDING_APPROVAL',
+      'PUBLISHED',
+      'ACTIVE',
+      'REMOVED',
+      'REJECTED',
+      'ERROR'
+    );
+    ```
+  </Tab>
+  
+  <Tab title="Listing Purpose">
+    ```sql
+    CREATE TYPE listing_purpose_enum AS ENUM (
+      'Sale',
+      'Rent'
+    );
+    ```
+  </Tab>
+</Tabs>
+
+## Error Handling
+
+### Validation Errors
+
+<CodeGroup>
+```typescript Portal Validation
+export class PortalValidationService {
+  validateForBayut(listing: Listing): ValidationResult {
+    const errors: string[] = [];
+    
+    if (!listing.permitNumber) {
+      errors.push('Permit number required for Bayut');
+    }
+    
+    if (!listing.emirate) {
+      errors.push('Emirate required for Bayut');
+    }
+    
+    return { isValid: errors.length === 0, errors };
+  }
+  
+  validateForPropertyFinder(listing: Listing): ValidationResult {
+    // PF-specific validation rules
+  }
+}
+```
+
+```typescript Sync Error Handling
+export class SyndicationService {
+  async handleSyncError(
+    sync: ListingPortalSync,
+    error: Error
+  ): Promise<void> {
+    sync.lastSyncError = error.message;
+    sync.syncAttempts += 1;
+    sync.status = ListingSyncStatus.ERROR;
+    
+    // Exponential backoff for retries
+    if (sync.syncAttempts >= 5) {
+      await this.notificationService.notifyAgentOfFailure(sync);
+    }
+    
+    await this.listingPortalSyncRepository.save(sync);
+  }
+}
+```
+</CodeGroup>
+
+### Rate Limiting
+
+<Warning>
+**Property Finder:** 100 requests per minute per organization
+**Bayut/dubizzle:** Feed polling limited to every 30 minutes
+</Warning>
+
+## Security Considerations
+
+### API Key Management
+
+<Steps>
+  <Step title="Encryption at Rest">
+    All API keys stored encrypted using organization-specific encryption keys
+  </Step>
+  
+  <Step title="Secure Transmission">
+    API keys transmitted over HTTPS only with proper certificate validation
+  </Step>
+  
+  <Step title="Access Control">
+    Portal configuration requires `real_estate.manage` permission
+  </Step>
+  
+  <Step title="Audit Logging">
+    All portal sync operations logged with user attribution
+  </Step>
+</Steps>
+
+### Webhook Security
+
+<CodeGroup>
+```typescript HMAC Verification
+export class PortalWebhookController {
+  @Post('property-finder')
+  @PublicEndpoint()
+  async handlePropertyFinderWebhook(
+    @Body() body: any,
+    @Headers('x-signature') signature: string
+  ) {
+    const isValid = this.verifyHmacSignature(
+      JSON.stringify(body),
+      signature,
+      process.env.PF_WEBHOOK_SECRET
+    );
+    
+    if (!isValid) {
+      throw new UnauthorizedException('Invalid webhook signature');
+    }
+    
+    // Process webhook...
+  }
+}
+```
+</CodeGroup>
+
+## Monitoring and Observability
+
+### Metrics to Track
+
+<CardGroup cols={2}>
+  <Card title="Syndication Metrics" icon="chart-line">
+    - Listings published per portal
+    - Sync success/failure rates
+    - API response times
+    - Error rates by portal
+  </Card>
+  
+  <Card title="Lead Metrics" icon="users">
+    - Leads received per portal
+    - Lead processing latency
+    - Lead conversion rates
+    - Webhook delivery success
+  </Card>
+</CardGroup>
+
+### Health Checks
+
+```typescript
+export class PortalHealthService {
+  @Interval(300000) // 5 minutes
+  async checkPortalConnectivity() {
+    for (const portal of [Portal.PROPERTY_FINDER, Portal.BAYUT]) {
+      try {
+        await this.testPortalConnection(portal);
+        this.metricsService.recordPortalHealth(portal, 'healthy');
+      } catch (error) {
+        this.metricsService.recordPortalHealth(portal, 'unhealthy');
+        this.logger.error(`Portal ${portal} health check failed`, error);
+      }
+    }
+  }
+}
+```
+
+### Alerting Rules
+
+<AccordionGroup>
+  <Accordion title="Critical Alerts">
+    - Portal API authentication failures
+    - Webhook endpoint downtime > 5 minutes
+    - Lead ingestion stopped > 30 minutes
+    - Sync failure rate > 10% over 1 hour
+  </Accordion>
+  
+  <Accordion title="Warning Alerts">
+    - API rate limiting threshold reached (80%)
+    - Listing validation failure rate > 5%
+    - Portal response time > 10 seconds
+    - Queue processing lag > 15 minutes
+  </Accordion>
+</AccordionGroup>
+
+This specification provides the complete architectural foundation for the Portal Syndication Module, ensuring robust integration with UAE property portals while maintaining clean separation of concerns and comprehensive error handling.

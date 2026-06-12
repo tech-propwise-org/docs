@@ -1,0 +1,362 @@
+---
+title: "Queue Module Specification v32"
+description: "Complete specification for the PropWise CRM Queue module using PostgreSQL-based job processing with pg-boss"
+---
+
+# Queue Module Specification v32
+
+**Last Updated:** 2026-06-02  
+**Status:** Active
+
+## Overview
+
+The Queue module provides a centralized job queue system for PropWise CRM using PostgreSQL-based job processing via the pg-boss library. This module enables asynchronous processing of background tasks such as notifications, data processing, and other long-running operations that should be decoupled from HTTP request/response cycles.
+
+<Info>
+The module implements a queue service abstraction that allows other modules to enqueue jobs for background processing while providing features like job retries, priorities, batching, and worker management.
+</Info>
+
+## Architecture
+
+### Design Decisions
+
+The Queue module follows these key architectural principles:
+
+- **PostgreSQL-based queuing**: Uses pg-boss library for reliability and ACID compliance
+- **Interface-driven design**: Implements `IQueueService` interface for potential future queue provider swapping
+- **Global module**: Available throughout the application without explicit imports
+- **Worker abstraction**: Provides flexible worker registration with configurable options
+- **Lifecycle management**: Properly handles startup and shutdown of queue connections
+
+### Queue Provider Selection
+
+<Check>
+The module uses pg-boss as the underlying queue implementation for several advantages:
+- Leverages existing PostgreSQL infrastructure
+- Provides ACID guarantees for job persistence
+- Supports advanced features like job scheduling, retries, and priorities
+- No additional infrastructure dependencies
+</Check>
+
+## Core Interfaces
+
+### QueueJob
+
+Represents a job in the queue system:
+
+```typescript
+interface QueueJob<T> {
+  id: string; // Unique job identifier
+  data: T; // Job payload data
+  retryCount: number; // Current retry attempt count
+  retryLimit: number; // Maximum retry attempts allowed
+}
+```
+
+### QueueJobOptions
+
+Configuration options for job enqueueing:
+
+```typescript
+interface QueueJobOptions {
+  retryLimit?: number; // Max retry attempts (default: 3)
+  retryDelay?: number; // Delay between retries in seconds
+  retryBackoff?: boolean; // Use exponential backoff for retries
+  expireInSeconds?: number; // Job expiration time
+  singletonKey?: string; // Ensure only one job with this key exists
+  priority?: number; // Job priority (higher = more priority)
+}
+```
+
+### QueuePolicy
+
+<Warning>
+The queue policy is **critical** for singletonKey deduplication. The default `'standard'` policy applies no unique index on `singleton_key`, so deduplication will not work unless you specify a proper policy.
+</Warning>
+
+Controls how `singletonKey` deduplication is enforced at the database level:
+
+```typescript
+type QueuePolicy =
+  | 'standard' // No dedup — singletonKey stored but no unique constraint
+  | 'short' // ≤ 1 job per singletonKey in `created` state
+  | 'singleton' // ≤ 1 job per singletonKey in `active` state
+  | 'stately' // ≤ 1 job per singletonKey in created | retry | active
+  | 'exclusive' // Same uniqueness as stately, different fetch semantics
+  | 'key_strict_fifo';
+```
+
+<Note>
+Any queue that uses `singletonKey` for deduplication **must** be created with `policy: 'stately'` (or `'exclusive'`), otherwise `ON CONFLICT DO NOTHING` never fires and every insert creates a new row regardless of pending jobs.
+</Note>
+
+## Worker Configuration
+
+### WorkerOptions
+
+Configuration for single-job workers:
+
+```typescript
+interface WorkerOptions {
+  concurrency?: number; // Independent worker invocations (default: 1)
+  pollingIntervalSeconds?: number; // How often to poll for new jobs
+  policy?: QueuePolicy; // Queue policy — REQUIRED for singletonKey dedup
+}
+```
+
+### BatchWorkerOptions
+
+Configuration for batch workers:
+
+```typescript
+interface BatchWorkerOptions {
+  batchSize?: number; // Jobs per handler invocation (default: 1)
+  pollingIntervalSeconds?: number; // How often to poll for new jobs
+  policy?: QueuePolicy; // Queue policy — REQUIRED for singletonKey dedup
+}
+```
+
+<Tip>
+The `policy` is enforced by `ensureQueue` inside both `registerWorker` and `registerBatchWorker`. Use `'stately'` whenever jobs are submitted with `singletonKey` and you need "at most one pending/active job per key".
+</Tip>
+
+## IQueueService Interface
+
+The core queue service contract provides these methods:
+
+<AccordionGroup>
+<Accordion title="Job Management Methods">
+
+| Method | Description |
+|--------|-------------|
+| `enqueue<T>(queueName, data, options?)` | Add single job to queue |
+| `enqueueBatch<T>(queueName, data[], options?)` | Add multiple jobs to queue |
+| `purgeQueuedJobs(queueName)` | Delete pending jobs (`created` + `retry`); leaves `active` |
+
+</Accordion>
+
+<Accordion title="Worker Management Methods">
+
+| Method | Description |
+|--------|-------------|
+| `registerWorker<T>(queueName, handler, options?)` | Register job processor (accepts `policy`) |
+| `registerBatchWorker<T>(queueName, handler, options?)` | Register batch job processor |
+
+</Accordion>
+
+<Accordion title="Scheduling Methods">
+
+| Method | Description |
+|--------|-------------|
+| `schedule(queueName, cron, data?)` | Register recurring cron (pg-boss `schedule`) |
+| `unschedule(queueName, key?)` | Remove recurring schedule (pg-boss `unschedule`) |
+
+</Accordion>
+
+<Accordion title="System Methods">
+
+| Method | Description |
+|--------|-------------|
+| `checkHealth(timeoutMs?)` | Active liveness probe |
+| `start()` | Start queue processing |
+| `stop()` | Stop queue processing |
+
+</Accordion>
+</AccordionGroup>
+
+### Health Checking
+
+The `checkHealth(timeoutMs?)` method provides an active liveness probe that returns `Promise<QueueHealthResult>`:
+
+```typescript
+interface QueueHealthResult {
+  healthy: boolean;
+  reason?: string;
+  latencyMs?: number;
+}
+```
+
+<Info>
+The health check performs a real database round-trip through pg-boss's connection, bounded by `QUEUE_HEALTH_PROBE_TIMEOUT_MS` (default 2000ms). This provides more accurate health status than just checking the `isStarted` boolean.
+</Info>
+
+Health check behavior:
+- **Not started** → `{ healthy: false, reason: 'boss.start() has not completed' }`
+- **Query rejects** → `{ healthy: false, reason: <driver error> }`
+- **Query timeout** → `{ healthy: false, reason: 'queue health probe timed out after <n>ms' }`
+- **Success** → `{ healthy: true, latencyMs }`
+
+## Service Implementation
+
+### PgBossQueueService
+
+The main service implementation using pg-boss:
+
+```typescript
+@Injectable()
+export class PgBossQueueService implements IQueueService, OnModuleInit, OnModuleDestroy
+```
+
+<Steps>
+<Step title="Connection Configuration">
+Database connection configured via `ConfigService` from centralized `app.database.*` config using `app.database.url` and `app.database.ssl`. TLS options are resolved by the shared `resolveDatabaseSsl()` helper.
+</Step>
+
+<Step title="Lifecycle Management">
+Implements proper startup/shutdown via NestJS lifecycle hooks. `src/main.ts` must call `app.enableShutdownHooks()` so SIGTERM/SIGINT trigger graceful shutdown.
+</Step>
+
+<Step title="Worker Management">
+Supports worker registration with type-safe job handlers and parallel processing via `localConcurrency` mapping.
+</Step>
+</Steps>
+
+### Key Features
+
+- **Automatic queue creation tracking** via `createdQueues` Set
+- **Parallel per-job processing**: When `batchSize` is specified, it maps to pg-boss's `localConcurrency` option
+- **Test utilities**: `__test__offWork(queueName)` for E2E testing (test environment only)
+- **Signal handling**: Graceful shutdown on SIGTERM/SIGINT
+
+## Business Rules
+
+### Job Processing Rules
+
+<CardGroup cols={2}>
+<Card title="Retry Logic" icon="repeat">
+Jobs can be configured with retry limits and exponential backoff strategies
+</Card>
+
+<Card title="Job Uniqueness" icon="key">
+`singletonKey` deduplication only works with proper queue policies (`'stately'` or `'exclusive'`)
+</Card>
+
+<Card title="Priority Processing" icon="arrow-up">
+Higher priority jobs are processed first in the queue
+</Card>
+
+<Card title="Job Expiration" icon="clock">
+Jobs can expire if not processed within specified time limits
+</Card>
+</CardGroup>
+
+### Authorization for User-Initiated Jobs
+
+<Warning>
+Queue payloads should carry stable identifiers, not trusted authorization snapshots. Workers that perform user-initiated writes must reload current organization membership and RBAC permissions before execution.
+</Warning>
+
+Workers should:
+1. Load current user permissions from the database
+2. Validate the user still has required permissions
+3. Fail the job if authorization is insufficient
+4. Process the job with current authorization context
+
+### Queue Management
+
+1. **Queue Creation**: Queues are created automatically when first used
+2. **Worker Registration**: Each queue can have multiple workers with different configurations
+3. **Connection Management**: Single pg-boss instance per service lifetime
+4. **Signal Handling**: Proper shutdown hook integration for graceful termination
+
+## Integration Points
+
+### Module Dependencies
+
+<Tabs>
+<Tab title="Database">
+Requires PostgreSQL connection via `app.database.url`. pg-boss uses the owner/superuser URL because it creates and manages queue tables.
+</Tab>
+
+<Tab title="Configuration">
+Uses NestJS `ConfigService` for connection setup from `src/config/app.config.ts`.
+</Tab>
+
+<Tab title="Logging">
+Integrates with NestJS Logger for operational monitoring and debugging.
+</Tab>
+</Tabs>
+
+### Consumer Modules
+
+The queue module is designed to be consumed by multiple system modules:
+
+<AccordionGroup>
+<Accordion title="Core System Modules">
+- **NotificationModule**: Asynchronous notification sending
+- **MessagingModule**: Messaging workflow processing
+- **AuditModule**: Background audit log processing
+</Accordion>
+
+<Accordion title="AI and Automation">
+- **AiModule**: AI agent execution via AiAgentExecuteWorker
+- **WorkflowModule**: Workflow step execution and automation
+</Accordion>
+
+<Accordion title="Real Estate Processing">
+- **Real Estate Module**: Data processing tasks, including `PropertyMatchJobHandler` for multi-source lead matching
+- **SearchModule**: Async reindexing and maintenance jobs
+</Accordion>
+</AccordionGroup>
+
+### Testing
+
+<Note>
+`jest-e2e-queue.json` runs distribution, escalation, and miscellaneous queue E2E tests to ensure proper queue functionality across different scenarios.
+</Note>
+
+## Example Usage
+
+### Basic Job Enqueueing
+
+```typescript
+// Enqueue a single job
+await queueService.enqueue('email-notifications', {
+  userId: '123',
+  templateId: 'welcome',
+  data: { name: 'John Doe' }
+}, {
+  retryLimit: 3,
+  priority: 1
+});
+
+// Enqueue batch jobs
+await queueService.enqueueBatch('data-processing', [
+  { recordId: '1', action: 'process' },
+  { recordId: '2', action: 'process' }
+], {
+  singletonKey: 'batch-process-1'
+});
+```
+
+### Worker Registration
+
+```typescript
+// Register a single-job worker
+await queueService.registerWorker(
+  'email-notifications',
+  async (job: QueueJob<EmailNotificationData>) => {
+    // Process single job
+    await sendEmail(job.data);
+  },
+  {
+    concurrency: 5,
+    policy: 'stately'
+  }
+);
+
+// Register a batch worker
+await queueService.registerBatchWorker(
+  'data-processing',
+  async (jobs: QueueJob<DataProcessingJob>[]) => {
+    // Process multiple jobs
+    for (const job of jobs) {
+      await processData(job.data);
+    }
+  },
+  {
+    batchSize: 10,
+    policy: 'stately'
+  }
+);
+```

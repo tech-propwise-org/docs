@@ -1,6 +1,6 @@
 ---
 title: "Escalation & Distribution: Scale and Safety Proposal"
-description: "Comprehensive proposal for scaling escalation and distribution systems with connection pool constraints, safety measures, and go-live readiness checklist"
+description: "Comprehensive proposal for scaling escalation and distribution engines with safety measures, connection pool management, and go-live readiness assessment"
 ---
 
 <Note>
@@ -15,18 +15,26 @@ The escalation and distribution engines are **architecturally sound for producti
 
 This document proposes a prioritized fix plan: pool-safe throughput bounds, self-healing reconciliation, observability, and redistribution safety — without increasing concurrent transactions beyond what `DB_POOL_MAX` can sustain.
 
-## Current architecture (reference)
+## Current architecture reference
 
 ### Escalation (two-stage pg-boss model)
 
-| Stage | Queue / cron | Behavior |
-| ----- | ------------ | -------- |
-| **Stage 1 — Dispatcher** | `escalation-scheduler`, cron `* * * * *` (~60s) | Cluster-wide tick: `UNION` of orgs with active rules or active trackers → one `escalation-org` job per org (`singletonKey: esc-org:<orgId>`) |
-| **Stage 2 — Per-org worker** | `escalation-org`, `batchSize: 5`, `stately` policy | Up to 5 orgs in parallel; per org: `TriggerDetector.scan()` (LIMIT 500/rule) → due trackers → sequential `executeTrackerTier()` |
+<CardGroup cols={2}>
+  <Card title="Stage 1 - Dispatcher" icon="clock">
+    **Queue:** `escalation-scheduler`  
+    **Schedule:** `* * * * *` (~60s)  
+    **Behavior:** Cluster-wide tick: `UNION` of orgs with active rules or active trackers → one `escalation-org` job per org (`singletonKey: esc-org:<orgId>`)
+  </Card>
+  <Card title="Stage 2 - Per-org worker" icon="gear">
+    **Queue:** `escalation-org`  
+    **Config:** `batchSize: 5`, `stately` policy  
+    **Behavior:** Up to 5 orgs in parallel; per org: `TriggerDetector.scan()` (LIMIT 500/rule) → due trackers → sequential `executeTrackerTier()`
+  </Card>
+</CardGroup>
 
-<Check>
+<Info>
 **Safeguards already in place:** partial unique index + `ON CONFLICT DO NOTHING` on tracker insert; `singletonKey` drops duplicate org jobs while one is in-flight; per-tracker try/catch; `expireInSeconds: 120` on org jobs.
-</Check>
+</Info>
 
 ### Distribution (event-driven + pg-boss)
 
@@ -40,16 +48,17 @@ This document proposes a prioritized fix plan: pool-safe throughput bounds, self
 **Safeguards already in place:** `singletonKey: lead:<leadId>`; idempotency in engine; two-phase capacity (advisory lock + re-count); post-commit `LEAD_ASSIGNED` notifications; `FAILED` `distribution_log` on exhausted worker retries.
 </Check>
 
-<Info>
-**What "noisy" local dev usually is**
-- Cron dispatcher every ~60s + per-org `.log()` even when `+0 trackers, 0 tiers`.
-- `EscalationAutoResolver` logging on every activity/stage/stakeholder event.
-- Not extra load — **log volume**, not a runaway loop.
-</Info>
+### What "noisy" local dev usually is
+
+- Cron dispatcher every ~60s + per-org `.log()` even when `+0 trackers, 0 tiers`
+- `EscalationAutoResolver` logging on every activity/stage/stakeholder event
+- Not extra load — **log volume**, not a runaway loop
 
 ## Governing constraint: connection pool budget
 
+<Warning>
 Production default: **`DB_POOL_MAX = 20` per app instance** (`app.config.ts` → `mikro-orm.config.ts`). Every `TenantContext.executeInOrg()` holds a connection for the transaction duration.
+</Warning>
 
 ### Concurrent consumers (worst-case ceiling)
 
@@ -59,9 +68,7 @@ Production default: **`DB_POOL_MAX = 20` per app instance** (`app.config.ts` →
 | Escalation org worker | **Up to 5** | One connection per org in batch; tracker tiers run **sequentially** per org |
 | HTTP / other crons | Remainder | Auth, messaging, search maintenance, user-status, etc. |
 
-<Warning>
 **Worst case on one instance:** ~**15 of 20** slots during overlap (bulk import + escalation cycle). This is why **parallelizing the inner escalation tracker loop is the wrong lever** — it would multiply against the 5-org batch and blow the pool.
-</Warning>
 
 ### Multi-instance note
 
@@ -79,6 +86,25 @@ Treat "total concurrent transactions" as a **fixed budget**. Prefer bounds, sequ
 
 At 100 orgs × 3 rules ≈ **300 scan queries/minute**. Unindexed paths degrade before the pool saturates.
 
+<CodeGroup>
+```sql Query Example
+SELECT l.* FROM lead l
+JOIN entity_stakeholder es ON l.id = es.entity_id
+JOIN activity a ON l.id = a.entity_id
+WHERE l.org_id = ? AND l.created_at > ?
+LIMIT 500
+```
+```typescript Mitigation
+// EXPLAIN (ANALYZE, BUFFERS) required
+await this.leadRepo.createQueryBuilder('lead')
+  .innerJoin('lead.entityStakeholders', 'stakeholder')
+  .innerJoin('lead.activities', 'activity')
+  .where('lead.orgId = :orgId', { orgId })
+  .limit(SCAN_BATCH_LIMIT)
+  .getMany();
+```
+</CodeGroup>
+
 | Mitigation | Priority |
 | ---------- | -------- |
 | `EXPLAIN (ANALYZE, BUFFERS)` on NFC + WENT_COLD scans against production-sized data | **Gate (P0)** |
@@ -90,6 +116,18 @@ Per org, **all** due trackers are selected (no `LIMIT`) and processed sequential
 
 Heavy tiers (`REDISTRIBUTE`, `NOTIFY_ADMIN`) can exceed naive ~100ms/tracker estimates.
 
+<Steps>
+  <Step title="Phase 1a: Add batch limits">
+    Implement `ORDER BY next_escalation_at ASC LIMIT $DUE_TRACKER_BATCH_LIMIT` (~50–100, or wall-clock budget ~60s) on due-tracker query
+  </Step>
+  <Step title="Keep inner loop sequential">
+    Maintain sequential processing to preserve pool safety
+  </Step>
+  <Step title="Default drain behavior">
+    Allow remainder to drain on next cron tick (~5 min for 1000 trackers @ 200/batch)
+  </Step>
+</Steps>
+
 | Mitigation | Priority |
 | ---------- | -------- |
 | **Phase 1a:** `ORDER BY next_escalation_at ASC LIMIT $DUE_TRACKER_BATCH_LIMIT` (~50–100, or wall-clock budget ~60s) on due-tracker query | **P1 — do first** |
@@ -97,36 +135,37 @@ Heavy tiers (`REDISTRIBUTE`, `NOTIFY_ADMIN`) can exceed naive ~100ms/tracker est
 | Drain remainder on next cron tick (~5 min for 1000 trackers @ 200/batch) | Default |
 | Optional **Phase 1b:** continuation job with distinct `singletonKey` (`esc-org-cont:<orgId>`) only if drain latency is unacceptable | **P5 — defer** |
 
-<Note>
-Mirror precedent: `SCAN_BATCH_LIMIT = 500` in `trigger-detector.ts`.
-</Note>
-
 ### Risk 3 — Silent dropped distribution enqueue
 
 `DistributionListener.enqueueWithRetry` retries 3×, then **only logs** — lead is created (HTTP 201) but **no job** and **no `distribution_log`**.
+
+<Warning>
+This creates a silent failure mode where leads appear to be created successfully but never get distributed.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Stuck-lead definition (all must hold)">
+    - Distribution enabled for org/team  
+    - Created > grace period (e.g. 10 min)  
+    - Not archived / not deleted  
+    - **No** user or team stakeholder  
+    - **No** terminal `distribution_log` outcome: `ASSIGNED | FALLBACK_POOL | FALLBACK_TEAM | QUEUED | ALREADY_ASSIGNED`  
+      (zero logs, or only `FAILED` logs)
+  </Accordion>
+  <Accordion title="Critical filters and guards">
+    **Critical filter:** `FALLBACK_POOL` is terminal — leads intentionally in the pool must not be re-enqueued.
+
+    **False-positive guard:** Manual unassignment leaves no terminal log. Sweeper should target **never-attempted** leads (e.g. no `distribution_log` at all, or only `enqueue_failed` / worker `FAILED`) — not leads an admin deliberately left unassigned.
+
+    **Module boundary:** No cross-module raw SQL. Expose e.g. `LeadService.findUndistributedLeadIdsInTransaction(...)` + compose with `EntityStakeholderService`; join `distribution_log` in distribution module only.
+  </Accordion>
+</AccordionGroup>
 
 | Mitigation | Priority |
 | ---------- | -------- |
 | **Phase 2:** Stuck-lead reconciliation cron (~10–15 min), re-enqueue via `enqueueBatch` | **P2 — highest silent-failure value** |
 | **Phase 3a:** On enqueue exhaustion, write `distribution_log` with `outcome: FAILED`, `failureReason: enqueue_failed` | **P3** |
 | **Phase 3b:** Metrics: failed logs window, `escalation-org` retry exhaustion, pg-boss failed-job depth | **P3** |
-
-**Stuck-lead definition (all must hold):**
-- Distribution enabled for org/team
-- Created > grace period (e.g. 10 min)
-- Not archived / not deleted
-- **No** user or team stakeholder
-- **No** terminal `distribution_log` outcome: `ASSIGNED | FALLBACK_POOL | FALLBACK_TEAM | QUEUED | ALREADY_ASSIGNED` (zero logs, or only `FAILED` logs)
-
-<Warning>
-**Critical filter:** `FALLBACK_POOL` is terminal — leads intentionally in the pool must not be re-enqueued.
-
-**False-positive guard:** Manual unassignment leaves no terminal log. Sweeper should target **never-attempted** leads (e.g. no `distribution_log` at all, or only `enqueue_failed` / worker `FAILED`) — not leads an admin deliberately left unassigned.
-</Warning>
-
-<Info>
-**Module boundary:** No cross-module raw SQL. Expose e.g. `LeadService.findUndistributedLeadIdsInTransaction(...)` + compose with `EntityStakeholderService`; join `distribution_log` in distribution module only.
-</Info>
 
 ### Risk 4 — Pool saturation under burst
 
@@ -156,31 +195,31 @@ We analyzed escalation `REDISTRIBUTE` when org-level distribution is **off**.
 
 ### What we found (verified in code)
 
-<AccordionGroup>
-<Accordion title="1. distributionEnabled is a trigger gate, not an engine kill-switch">
-Checked in `DistributionListener.handleLeadCreated` and team Path B routing only. Org pipeline (`runDistribution`) still runs when off — **"off" = manual assignment mode**, not "engine disabled".
-</Accordion>
+<Tabs>
+  <Tab title="Distribution toggle behavior">
+    1. **`distributionEnabled` is a trigger gate, not an engine kill-switch**  
+       Checked in `DistributionListener.handleLeadCreated` and team Path B routing only. Org pipeline (`runDistribution`) still runs when off — **"off" = manual assignment mode**, not "engine disabled".
 
-<Accordion title="2. Escalation REDISTRIBUTE bypasses the toggle">
-`TierExecutor.handleRedistribute` → `DistributionEngineService.redistribute()` with **no** `distributionEnabled` check (`tier-executor.ts`).
-</Accordion>
+    2. **Escalation `REDISTRIBUTE` bypasses the toggle**  
+       `TierExecutor.handleRedistribute` → `DistributionEngineService.redistribute()` with **no** `distributionEnabled` check (`tier-executor.ts`).
+  </Tab>
+  <Tab title="Destructive behavior">
+    3. **`redistribute()` removes the current agent up-front**  
+       `removeAllForEntityInTransaction` runs **before** the pipeline (`distribution-engine.service.ts`), with `excludeAgentIds: [previousAgent]`.
 
-<Accordion title="3. redistribute() removes the current agent up-front">
-`removeAllForEntityInTransaction` runs **before** the pipeline (`distribution-engine.service.ts`), with `excludeAgentIds: [previousAgent]`.
-</Accordion>
+    4. **Default off state → `POOL` fallback**  
+       No matching rule + `defaultMethod = POOL` → `FALLBACK_POOL` log, **no** new stakeholder, agent availability ignored.
 
-<Accordion title="4. Default off state → POOL fallback">
-No matching rule + `defaultMethod = POOL` → `FALLBACK_POOL` log, **no** new stakeholder, agent availability ignored.
-</Accordion>
-
-<Accordion title="5. Auto-create side effect">
-Missing `DistributionSettings` row is created with `distributionEnabled = false`, `defaultMethod = POOL` — then pipeline proceeds anyway.
-</Accordion>
-</AccordionGroup>
+    5. **Auto-create side effect**  
+       Missing `DistributionSettings` row is created with `distributionEnabled = false`, `defaultMethod = POOL` — then pipeline proceeds anyway.
+  </Tab>
+</Tabs>
 
 ### The gap
 
+<Warning>
 `REDISTRIBUTE` is **destructive** when distribution is off: removes Agent X, fails to reassign, leaves lead **orphaned in pool**. Escalation logs tier action `FAILED`; un-assignment is already committed.
+</Warning>
 
 | Problem | Description |
 | ------- | ----------- |
@@ -189,138 +228,104 @@ Missing `DistributionSettings` row is created with `distributionEnabled = false`
 
 ### Proposed fix (redistribution safety)
 
-| Part | Change | Fixes |
-| ---- | ------ | ----- |
-| **Part 1 — Toggle guard** | In `handleRedistribute`, before any removal: `getDistributionFlags(orgId, teamId)`. If both org and team off → `ActionResult.SKIPPED`, `reason: distribution_disabled`. Other tier actions still run. | Intent (A) |
-| **Part 2 — Confirm before remove** | In `redistribute()`, only remove stakeholders **after** confirmed replacement (`ASSIGNED`). On pool / no eligible / failed → retain assignment, return non-assigned outcome. | Safety (B), all failure modes |
-| **Part 3 — UI warning (optional)** | Warn when saving escalation rule with `REDISTRIBUTE` tier while distribution disabled. | UX only |
+<Steps>
+  <Step title="Part 1 — Toggle guard">
+    In `handleRedistribute`, before any removal: `getDistributionFlags(orgId, teamId)`. If both org and team off → `ActionResult.SKIPPED`, `reason: distribution_disabled`. Other tier actions still run.
+    
+    **Fixes:** Intent (A)
+  </Step>
+  <Step title="Part 2 — Confirm before remove">
+    In `redistribute()`, only remove stakeholders **after** confirmed replacement (`ASSIGNED`). On pool / no eligible / failed → retain assignment, return non-assigned outcome.
+    
+    **Fixes:** Safety (B), all failure modes
+  </Step>
+  <Step title="Part 3 — UI warning (optional)">
+    Warn when saving escalation rule with `REDISTRIBUTE` tier while distribution disabled.
+    
+    **Fixes:** UX only
+  </Step>
+</Steps>
 
 ## Proposed fixes (prioritized)
 
-<Steps>
-<Step title="Phase 0: Go-live gates">
 | # | Change | Addresses | Risk | When |
 | - | ------ | --------- | ---- | ---- |
 | **0** | `EXPLAIN ANALYZE` + index verification on escalation scans | Steady-state DB load at scale | Low | **Go-live gate** |
 | **0** | Size `DB_POOL_MAX` for `N_instances × max` vs Neon limit | Pool exhaustion | Low | **Go-live gate** |
-</Step>
-
-<Step title="Phase 1: Due-tracker bounds">
-| # | Change | Addresses | Risk | When |
-| - | ------ | --------- | ---- | ---- |
-| **1a** | `LIMIT` (+ `ORDER BY next_escalation_at`) on due-tracker query; sequential processing | Unbounded per-org loops | High | **P1 — do first** |
-| **1b** | Redistribution safety (toggle guard + confirm-before-remove) | Destructive `REDISTRIBUTE` | Med | **P1** |
-</Step>
-
-<Step title="Phase 2: Self-healing reconciliation">
-| # | Change | Addresses | Risk | When |
-| - | ------ | --------- | ---- | ---- |
-| **2** | Stuck-lead reconciliation cron (~10–15 min interval) | Silent dropped enqueues | Med | **P2** |
-</Step>
-
-<Step title="Phase 3: Observability and error handling">
-| # | Change | Addresses | Risk | When |
-| - | ------ | --------- | ---- | ---- |
-| **3a** | On enqueue exhaustion, write `distribution_log` with `outcome: FAILED` | Silent failures | Low | **P3** |
-| **3b** | Wire `PgBossHealthIndicator` into readiness | Operations visibility | Low | **P3** |
-| **3c** | Metrics: failed logs, retry exhaustion, queue depth | Monitoring | Low | **P3** |
-</Step>
-</Steps>
+| **1a** | `LIMIT` (+ `ORDER BY next_escalation_at`) on due-tracker query; sequential processing | Unbounded per-org tracker execution | Medium | **P1 — do first** |
+| **1b** | Redistribution safety: toggle guard + confirm-before-remove | Silent orphaning on `REDISTRIBUTE` | High | **P1 — do first** |
+| **2** | Stuck-lead reconciliation cron (~10–15 min) | Silent dropped distribution enqueues | Medium | **P2** |
+| **3a** | Terminal `distribution_log` on enqueue exhaustion (`FAILED` + `enqueue_failed`) | Observability gap on enqueue failures | Low | **P3** |
+| **3b** | Wire `PgBossHealthIndicator` into readiness endpoint | Queue health visibility | Low | **P3** |
+| **4** | Optional env-configurable `batchSize` for distribution worker | Burst handling flexibility | Low | **P5** |
 
 ## Pre-go-live checklist
 
-<CardGroup cols={2}>
-<Card title="Database preparation" icon="database">
-- [ ] `EXPLAIN ANALYZE` on NFC + WENT_COLD scans
-- [ ] Verify indexes on all join paths
-- [ ] Size `DB_POOL_MAX` for expected instance count
-</Card>
-
-<Card title="Connection pool safety" icon="link">
-- [ ] Test worst-case: bulk import + escalation cycle
-- [ ] Confirm 15/20 pool slots maximum usage
-- [ ] Multi-instance pool budget calculated
-</Card>
-
-<Card title="Due-tracker bounds" icon="clock">
-- [ ] Implement `DUE_TRACKER_BATCH_LIMIT`
-- [ ] Test large org backlog scenarios
-- [ ] Verify sequential processing maintained
-</Card>
-
-<Card title="Redistribution safety" icon="shield">
-- [ ] Toggle guard implemented
-- [ ] Confirm-before-remove logic
-- [ ] Test with distribution disabled
-</Card>
-</CardGroup>
-
-### Environment configuration
-
-<CodeGroup>
-```env Production
-# Connection pool sizing (per instance)
-DB_POOL_MAX=20
-
-# Due tracker processing bounds
-DUE_TRACKER_BATCH_LIMIT=100
-
-# Optional distribution worker tuning
-DISTRIBUTION_BATCH_SIZE=10
-
-# Reconciliation interval (minutes)
-STUCK_LEAD_RECONCILIATION_INTERVAL=15
-```
-
-```env Staging
-# Lower pool for testing
-DB_POOL_MAX=10
-
-# Smaller batches for validation
-DUE_TRACKER_BATCH_LIMIT=50
-DISTRIBUTION_BATCH_SIZE=5
-
-# More frequent reconciliation for testing
-STUCK_LEAD_RECONCILIATION_INTERVAL=5
-```
-</CodeGroup>
+<Steps>
+  <Step title="Database performance validation">
+    - [ ] Run `EXPLAIN (ANALYZE, BUFFERS)` on NFC + WENT_COLD scan queries with production-sized data
+    - [ ] Verify indexes exist on: `entity_stakeholder`, `activity`, `lead`, `escalation_tracker.next_escalation_at`
+    - [ ] Confirm query execution times < 100ms at expected scale
+  </Step>
+  <Step title="Connection pool sizing">
+    - [ ] Calculate `N_instances × DB_POOL_MAX` vs Neon connection limit
+    - [ ] Verify worst-case concurrent usage (15 of 20 slots) leaves buffer for HTTP traffic
+    - [ ] Test multi-instance deployment with realistic load
+  </Step>
+  <Step title="Critical fixes implementation">
+    - [ ] Implement due-tracker batch limiting (`LIMIT` + `ORDER BY next_escalation_at`)
+    - [ ] Implement redistribution safety (toggle guard + confirm-before-remove)
+    - [ ] Test both fixes under load
+  </Step>
+  <Step title="Monitoring and observability">
+    - [ ] Set up monitoring for queue depth and processing times
+    - [ ] Configure alerts for failed jobs and enqueue failures
+    - [ ] Verify `PgBossHealthIndicator` integration
+  </Step>
+</Steps>
 
 ## Testing and documentation requirements
 
 ### Load testing scenarios
 
 <Tabs>
-<Tab title="Escalation load test">
-- 100 orgs with active rules
-- 1000+ due trackers across orgs
-- Measure cycle completion time
-- Verify no pool exhaustion
-</Tab>
-
-<Tab title="Distribution burst test">
-- Bulk import (1000+ leads)
-- Concurrent escalation cycle
-- Monitor connection usage
-- Verify queue processing
-</Tab>
-
-<Tab title="Mixed workload test">
-- Normal HTTP traffic
-- Background cron jobs
-- Distribution + escalation
-- Pool utilization under 80%
-</Tab>
+  <Tab title="Escalation load">
+    - 100 orgs with 3 active rules each
+    - 1000+ due trackers across orgs
+    - Business hours backlog simulation
+    - Pool saturation during overlap with distribution
+  </Tab>
+  <Tab title="Distribution load">
+    - Bulk import of 10,000 leads
+    - Concurrent single-lead creation
+    - Mixed priority queue processing
+    - Enqueue failure and recovery scenarios
+  </Tab>
+  <Tab title="Edge cases">
+    - Distribution disabled with `REDISTRIBUTE` escalation
+    - Worker retry exhaustion
+    - Database connection failures
+    - Large organization with complex rules
+  </Tab>
 </Tabs>
 
 ### Documentation updates required
 
-<Check>
-- [ ] Update escalation architecture docs
-- [ ] Document connection pool constraints
-- [ ] Add troubleshooting guide for stuck leads
-- [ ] Update deployment runbook with sizing guidance
-</Check>
+<CardGroup cols={2}>
+  <Card title="Operations guide" icon="book">
+    - Connection pool sizing guidelines
+    - Monitoring and alerting setup
+    - Troubleshooting common issues
+    - Performance tuning recommendations
+  </Card>
+  <Card title="Development guide" icon="code">
+    - Architecture overview updates
+    - New configuration options
+    - Testing procedures
+    - Debugging tools and techniques
+  </Card>
+</CardGroup>
 
-<Warning>
-**Critical pre-deployment verification:** Run all load tests in staging environment with production-equivalent data volumes and instance configurations.
-</Warning>
+<Note>
+This proposal ensures the escalation and distribution engines can safely scale to production volumes while maintaining correctness and observability. The prioritized approach allows for incremental rollout with gate checks at each phase.
+</Note>
