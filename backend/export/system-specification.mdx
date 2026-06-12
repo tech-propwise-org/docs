@@ -1,0 +1,203 @@
+---
+title: "Export System Specification"
+description: "Authoritative description of CRM data export endpoints for Lead, Deal, Contact, and Company entities, including permissions, scoping, and data portability policies."
+---
+
+Authoritative description of the CRM data-export endpoints (`GET /{entity}/export`) for **Lead**, **Deal**, **Contact**, and **Company**: what they return, who is allowed to call them, and exactly how the result set is scoped.
+
+<Note>
+**Scope of this doc.** This covers user-facing CSV/XLSX exports of CRM entities. It does **not** cover import (`Docs/CRM_MODULE_SPECIFICATION.md`), audit-log exports, or analytics report downloads.
+</Note>
+
+## Endpoints at a glance
+
+| Entity  | Endpoint                   | Service method                   | Scoping model        |
+| ------- | -------------------------- | -------------------------------- | -------------------- |
+| Lead    | `GET /v1/leads/export`     | `LeadService.exportLeads`        | **Accessible union** |
+| Deal    | `GET /v1/deals/export`     | `DealService.exportDeals`        | **Accessible union** |
+| Contact | `GET /v1/contacts/export`  | `ContactService.exportContacts`  | **Accessible union** |
+| Company | `GET /v1/companies/export` | `CompanyService.exportCompanies` | **Accessible union** |
+
+All four exports use the same **permission-free accessible-union model**: no `crm.view`, `sales.view`, or `team_crm.view` gate at the export endpoint, only the **data-portability policy** (§3) and the caller's own per-entity visibility (§4/§5).
+
+All four exports share the **same two hard gates** (§3), the **same RLS backstop** (§6), the **same filter/`selectedIds` narrowing semantics** (§7), and the **same file-format rules** (§8).
+
+## The two-layer mental model
+
+Every export answer is the intersection of two independent questions:
+
+<Steps>
+<Step title="Data portability policy gate">
+**"Are you allowed to export at all?"** → the **data-portability policy** gate (`assertDataPortabilityPolicy`). This is an org-level governance switch, not a CRM-visibility check.
+</Step>
+<Step title="Row-scoping model">
+**"Which rows are you allowed to see?"** → the **row-scoping** model, which differs per entity.
+</Step>
+</Steps>
+
+<Info>
+These are orthogonal. Passing gate 1 never widens gate 2, and vice versa. A user who clears the portability policy still only ever receives rows their CRM visibility allows.
+</Info>
+
+## Gate 1 — Data-portability policy (all four exports)
+
+Enforced in the controller **before** the service runs:
+
+```typescript
+await this.accessService.assertDataPortabilityPolicy(user, 'export');
+```
+
+### Policy logic
+
+`AccessService.assertDataPortabilityPolicy(user, 'export')` logic (`src/modules/auth/services/access.service.ts`):
+
+<Steps>
+<Step title="System bypass check">
+**System bypass.** System admin / system owner (`hasSystemBypass`) → always allowed, short-circuit.
+</Step>
+<Step title="Resolve org policy">
+Resolve the org's `settings.dataExportPolicy`, defaulting to `DEFAULT_DATA_PORTABILITY_POLICY` when unset.
+</Step>
+<Step title="Apply policy rules">
+- If policy is `'all'` → **any authenticated member** of the org may export.
+- If policy is `'admins_only'` → caller **must** hold `OrgPermissionKey.SYSTEM_ADMIN`, otherwise `403 ForbiddenException`: `"Your organisation requires Admin or Owner role to export data."`
+</Step>
+</Steps>
+
+### Policy values
+
+| `dataExportPolicy`          | Who can export                                                 |
+| --------------------------- | -------------------------------------------------------------- |
+| `all`                       | Any authenticated org member (subject to row-scoping in §4/§5) |
+| `admins_only` **(default)** | Only Admin / Owner (`system.admin`) + system bypass            |
+
+<Warning>
+**Important default.** `DEFAULT_DATA_PORTABILITY_POLICY = 'admins_only'`. Out of the box, **regular agents cannot export anything** until an Owner/Admin flips the org's export policy to `all`. The "any agent can export what they see" behaviour is only true once the policy is `all`.
+</Warning>
+
+The policy is a per-org setting (`Organization.settings.dataExportPolicy`), editable by org admins via the organization settings API. The frontend mirrors the same rule in `src/lib/data-portability-policy.ts` and matches the 403 message via `isDataPortabilityPolicyError`.
+
+## Gate 2 — Lead row-scoping (accessible-union model)
+
+The lead export has **no `crm.view` gate** and **never calls `validateTypeAccess`**. After the portability gate, the rows returned are scoped purely by the caller's own permissions and memberships. There are exactly **two scopes**:
+
+| `type` value                                               | Rows returned                                                                  | Filename prefix |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------- |
+| `my`                                                       | Only leads the user **created** or is a **direct (user-level) stakeholder** on | `leads-my-`     |
+| anything else — omitted, `all`, `pool`, `team`, `teamPool` | **Accessible union** of every tab the user can see (see below)                 | `leads-all-`    |
+
+### How the accessible union is built
+
+`exportLeads` (`src/modules/crm/lead/lead.service.ts`):
+
+```typescript
+// type !== MY → resolve the access predicate first (async), then build QB synchronously
+const accessFragment =
+  type !== LeadViewType.MY ? await this.resolveAccessibleLeadsFragment(em, user) : null;
+
+if (type === LeadViewType.MY) {
+  qb = this.buildLeadQueryForType(em, user, LeadViewType.MY); // created_by OR stakeholder
+} else {
+  qb = this.buildLeadQueryForType(em, user, LeadViewType.ALL); // base query, no access filter
+  if (accessFragment) {
+    qb.andWhere(accessFragment.sql, accessFragment.params); // OR-combined predicate
+  }
+}
+```
+
+`resolveAccessibleLeadsFragment(em, user)`:
+
+- **Returns `null`** when the user has org-wide CRM view (`crm.view` → `canViewAll`). A `null` fragment means **no access predicate is added**, so the user sees every (non-deleted) lead in the org — equivalent to the `ALL` tab. This is the **only** path that returns `null`.
+- **Otherwise** it ORs together one fragment per tab the user can see:
+  - **MY** — always (`myLeadsFragment`: `created_by_id = user` OR a direct `entity_stakeholder` row for the user).
+  - **POOL** — always (`poolLeadsFragment`: `NOT EXISTS` any stakeholder row → unassigned leads).
+  - **TEAM** — one `teamLeadsFragment` per team returned by `getAvailableTeams(em, user, orgId, false)` (teams where the user holds `team_crm.view`), **only if** the `team` tab is available.
+  - **TEAM_POOL** — one `teamPoolLeadsFragment` per team returned by `getAllMemberTeams(em, user.id, false)` (teams the user is a member of), **only if** the `teamPool` tab is available.
+
+The fragments are combined into a single `(... OR ... OR ...)` SQL predicate, so deduplication is automatic — a lead visible via multiple tabs appears once.
+
+### Why this matches "only what the user can see"
+
+The export reuses the **exact same** building blocks as the lead list/kanban view (the canonical definition of "what the user sees"):
+
+- The list view's per-tab filters delegate to the **same** fragment methods the export ORs together:
+  - `applyMyLeadsFilter → myLeadsFragment`
+  - `applyPoolLeadsFilter → poolLeadsFragment`
+  - `applyTeamLeadsFilter → teamLeadsFragment`
+  - `applyTeamPoolLeadsFilter → teamPoolLeadsFragment`
+- The list/kanban view resolves tabs and teams with the **same** helpers: `getAvailableTabs`, `getAvailableTeams`, `getAllMemberTeams`.
+
+<Check>
+Because the export is a literal OR of the same per-tab predicates, it can never return a lead the list view wouldn't show for that user.
+</Check>
+
+### Tab availability rules (`getAvailableTabs`)
+
+| Tab        | Available when                                |
+| ---------- | --------------------------------------------- |
+| `all`      | `crm.view` (`canViewAll`)                     |
+| `my`       | always                                        |
+| `pool`     | always — **anyone can see unassigned leads**  |
+| `team`     | `crm.view` **or** `team_crm.view`             |
+| `teamPool` | `crm.view` **or** the user belongs to ≥1 team |
+
+<Note>
+**Product note on POOL.** Because `pool` is unconditionally available, a user with zero permissions and zero teams can still export **every unassigned lead in the org**. This is consistent with the list view (which also shows them the pool), so the export is faithful — but it is a deliberate visibility-model decision, not an export quirk. If pool should be narrower, fix it in `getAvailableTabs`/`poolLeadsFragment` and the export inherits the fix automatically.
+</Note>
+
+### `teamId` is ignored
+
+The lead export accepts a `teamId` query param for backward compatibility but **does not use it**. The union is always computed server-side from the caller's own memberships/permissions, so a caller-supplied `teamId` cannot be used to read another team's leads. There is no cross-team access risk.
+
+### Implementation footgun (maintainers read this)
+
+<Warning>
+The union path builds the **unfiltered** `ALL` base query and then _conditionally_ adds the predicate. The safety of this branch rests entirely on the invariant:
+
+> `resolveAccessibleLeadsFragment` returns `null` **if and only if** the user has `canViewAll`.
+
+If a future refactor ever makes that method return `null`/empty on any other path (e.g. an early `return null` when the fragment list is empty), **every non-privileged caller would silently export the entire org's leads**, and the RLS backstop (§6) would not catch it (same org). When touching `resolveAccessibleLeadsFragment`, preserve the invariant and keep the regression test that asserts a no-permission user gets a predicate containing both `created_by_id` (MY) and `NOT EXISTS` (POOL).
+</Warning>
+
+## Gate 2 — Deal / Contact / Company row-scoping (accessible-union model)
+
+Deal, Contact, and Company exports use the **same permission-free accessible-union model as leads**. `validateTypeAccess` is **never called** by any of these export endpoints. Two scopes are offered by the frontend:
+
+| Frontend scope | Sent `type`             | Rows returned                                                                        |
+| -------------- | ----------------------- | ------------------------------------------------------------------------------------ |
+| `my`           | `MY` (entity-specific)  | Only deals/contacts/companies the user **created** or is a **direct stakeholder** on |
+| `all`          | `ALL` (entity-specific) | **Accessible union** — every row the user can see across their tabs                  |
+| `selected`     | `ALL` + `selectedIds`   | Same as `all` but AND-intersected with the supplied ID list                          |
+
+### How the accessible union is built per entity
+
+Each entity has a `resolveAccessible<Entity>Fragment(em, user)` method that mirrors the lead pattern:
+
+- **Returns `null`** when the user has the org-wide view permission for that entity (`crm.view` for contacts/companies; `sales.view` for deals) — they see every row.
+- **Otherwise** returns an OR-combined SQL predicate covering:
+  - **MY**: rows the user created or is a direct stakeholder on.
+  - **TEAM**: rows for each team where the user holds `team_sales.view` (deals) or `team_crm.view` (contacts/companies).
+    - _Non-privileged team members_ (members without `team_crm.view`): can still see rows where they are a personal stakeholder within that team's scope.
+  - **DEAL-LINKED contacts** (contact export only): contacts linked to active deals, **if** the user holds `sales.view`.
+
+The `teamId` query param is **ignored** for all three — the union is always computed server-side from the caller's own memberships/permissions.
+
+### Why the same invariant applies
+
+<Warning>
+The same footgun from §4.5 applies to all three entities. Each `resolveAccessible<Entity>Fragment` must return `null` **if and only if** the user has `canViewAll` for that entity. The same regression tests cover this invariant.
+</Warning>
+
+## RLS backstop (all four exports)
+
+Every export runs inside:
+
+```typescript
+return this.tenantContext.executeReadOnly(organizationId, async (em) => { ... });
+```
+
+This sets the tenant (organization) context, so **PostgreSQL row-level security physically scopes every query to the caller's organization**. Even if there were a bug in the accessible-union logic that leaked data, RLS ensures no cross-org access is possible.
+
+<Tip>
+The RLS backstop provides defense-in-depth security, ensuring that even logic bugs in the export system cannot expose data across organizational boundaries.
+</Tip>

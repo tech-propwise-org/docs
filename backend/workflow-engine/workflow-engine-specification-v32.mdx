@@ -1,0 +1,296 @@
+---
+title: "Workflow Engine Specification v32"
+description: "Comprehensive specification for the Workflow Engine providing rule-based automation for the messaging module, including visual workflow builder, triggers, and step execution."
+---
+
+## Overview
+
+The Workflow Engine provides rule-based automation for the messaging module. It evaluates configurable automation rules against messaging events (new messages, new conversations, AI escalations) and executes actions such as assigning agents, sending templates, creating tasks, and updating lead stages.
+
+<Info>
+Rules are evaluated in **Phase B** of the webhook processor pipeline, isolated in a try-catch block so failures never affect message persistence or delivery.
+</Info>
+
+## Core Concepts
+
+### Visual Workflow
+
+The current workflow builder persists visual automations in the `workflow` table. Each workflow has a `triggerType`, optional `triggerConfig`, and a JSONB `graph` containing ordered step definitions and their connections.
+
+<CardGroup cols={2}>
+  <Card title="Save Actions" icon="floppy-disk">
+    PATCH /v1/workflows/:id without lifecycle for existing workflows
+  </Card>
+  <Card title="Publish Actions" icon="rocket">
+    POST /v1/workflows with status: PUBLISHED for new drafts
+  </Card>
+</CardGroup>
+
+The frontend builder uses an explicit-save model:
+
+<Steps>
+  <Step title="Save">
+    `PATCH /v1/workflows/:id` without lifecycle for existing workflows
+  </Step>
+  <Step title="Publish (New)">
+    A new unsaved draft calls `POST /v1/workflows` with `status: PUBLISHED` (atomic create + publish)
+  </Step>
+  <Step title="Publish (Existing)">
+    An existing row sends `PATCH /v1/workflows/:id` with the editor payload plus `status: PUBLISHED` (merge, publish-grade validation, version bump when structural fields change)
+  </Step>
+</Steps>
+
+#### Starting Options
+
+- **Start from scratch** — Opens a local draft with an empty graph and no trigger selected. The user must choose a trigger before saving.
+- **Template** — Opens a local draft from a system-level `WorkflowTemplate` record, copying its trigger type and graph into an editable local workflow. The database row is created only on explicit save.
+
+#### Builder Action Gating
+
+<Warning>
+A non-empty **name is required** before any action. **Save**, **Test**, and **Publish** are all disabled while `name` is empty/whitespace-only (the "Untitled workflow" placeholder does not count).
+</Warning>
+
+Action requirements:
+- **Test** - Always requires a selected trigger
+- **Save** - Requires a trigger except for metadata-only edits on published workflows
+- **Publish** - Requires zero `getWorkflowValidationIssues` (name, trigger, at least one step, and valid per-step config)
+
+### Workflow Templates
+
+Workflow templates are stored in the database, not hardcoded in the frontend. The canonical catalog and its idempotent slug-based upsert live in `WorkflowTemplateSeederService`.
+
+<Note>
+`AppInitializerService.onModuleInit()` runs the seeder on **every server boot** inside a `TenantContext.executeWithBypass()` transaction, ensuring the global `workflow_template` catalog is always present.
+</Note>
+
+Templates are exposed through `GET /v1/workflows/templates` and are global system catalog records with no organization ownership.
+
+#### Template Requirements
+
+Seeded templates must be ready-to-publish in any organization:
+- ✅ Generic message, question, branch, date/time, task, contact-update, and unassign steps
+- ❌ Organization-specific AI agents, users, teams, lead stages, or notification recipients
+
+### Workflow Actor Resolution
+
+The engine resolves the workflow actor once per execution and threads it onto every step's `StepContext.actorUserId`:
+
+<Tabs>
+  <Tab title="Organization Scope">
+    Uses the per-org AI service user via shared `resolveAiServiceUserId` utility
+  </Tab>
+  <Tab title="Personal Scope">
+    Uses the workflow owner as the actor
+  </Tab>
+</Tabs>
+
+<Warning>
+When the actor cannot be resolved (missing AI service user or deleted owner), handlers fail with appropriate error codes rather than writing unattributed records.
+</Warning>
+
+### Workflow Scoping
+
+Workflows can be organization-scoped or personal:
+
+<AccordionGroup>
+  <Accordion title="Organization Workflows">
+    - Users with `MESSAGING_MANAGE` can create by default
+    - May choose personal scope in the builder
+    - Require messaging view/manage for read and `MESSAGING_MANAGE` for MODIFY/DELETE
+  </Accordion>
+  <Accordion title="Personal Workflows">
+    - Users without `MESSAGING_MANAGE` always create personal workflows
+    - Owned by the authenticated user
+    - Fully accessible to the owner
+    - Non-owners need messaging permissions per `ACCESS_CONTROL_SYSTEM.md`
+  </Accordion>
+</AccordionGroup>
+
+#### Publishing Constraints
+
+Publishing is unique by scope:
+- One published organization workflow per `(organization_id, trigger_type)`
+- One published personal workflow per `(organization_id, owner_user_id, trigger_type)`
+
+Database enforcement through partial unique indexes:
+- `workflow_org_published_trigger_unique`
+- `workflow_personal_published_trigger_unique`
+
+## Triggers
+
+The visual builder trigger picker exposes this reduced set:
+
+<CodeGroup>
+```json Supported Triggers
+{
+  "FIRST_MESSAGE_RECEIVED": "First Message Received",
+  "MESSAGING_WINDOW_REOPENED": "Messaging Window Reopened", 
+  "CONTACT_FIELD_UPDATED": "Contact Field Updated",
+  "ASSIGNMENT_CHANGED": "Assignment Changed",
+  "LEAD_CREATED_FROM_CAMPAIGN": "Lead Created from Campaign",
+  "LIFECYCLE_UPDATED": "Lead Moved to Stage",
+  "INCOMING_WEBHOOK": "Webhook / Integration Event"
+}
+```
+</CodeGroup>
+
+<Check>
+The backend `WorkflowTriggerType` enum, frontend API enum, and database CHECK constraints are aligned to this same seven-trigger set.
+</Check>
+
+## Branching Logic
+
+Visual workflow branches use the structured backend `BranchCondition` schema with the following components:
+
+- `category` - The data source category
+- `field` - Specific field within the category  
+- `operator` - Comparison operator
+- `value` - Optional comparison value
+- `stepId` - Optional, only when `category` is `previous_step_output`
+
+### Supported Categories
+
+<Tabs>
+  <Tab title="Contact Field">
+    `contact_field` - Values resolve through `PersonService` workflow branch helpers
+  </Tab>
+  <Tab title="Previous Step Output">
+    `previous_step_output` - Reads from `execution.variables.steps[stepId]`
+  </Tab>
+  <Tab title="Assignee Status">
+    `assignee_status` - Current assignment state
+  </Tab>
+  <Tab title="Message Fields">
+    - `last_incoming_message`
+    - `last_outgoing_message` 
+    - `time_since_last_incoming_message`
+    - `time_since_last_outgoing_message`
+  </Tab>
+  <Tab title="Lead Stage">
+    `lead_stage` - Compares against organization's effective lead stages
+  </Tab>
+</Tabs>
+
+### Operators
+
+<AccordionGroup>
+  <Accordion title="Comparison Operators">
+    `eq`, `neq`, `gt`, `gte`, `lt`, `lte` - Standard comparison operations
+  </Accordion>
+  <Accordion title="String Operators">
+    `contains`, `not_contains` - Text matching operations
+  </Accordion>
+  <Accordion title="Array Operators">
+    `in`, `has_any_of`, `has_all_of`, `has_none_of` - Array/set operations
+  </Accordion>
+  <Accordion title="Range Operators">
+    `between` - Requires a two-element bound array
+  </Accordion>
+  <Accordion title="Existence Operators">
+    `exists`, `not_exists` - Require no value parameter
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+Legacy raw field paths, wrapped variables, and deprecated categories (`trigger`, `contact`, `lead`, `conversation`, `previous_step`, `webhook_payload`) are rejected at publish time.
+</Warning>
+
+### Branch Connections
+
+Branching steps must persist explicit output targets:
+
+- `BRANCH` stores `connections.branches[].nextStepId`
+- `DATE_TIME` stores `connections.inWindowBranch` and `connections.outOfWindowBranch`  
+- `CHECK_TEAM_AVAILABILITY` stores `connections.availableBranch` and `connections.unavailableBranch`
+- Advanced failure branches store `connections.onFailure`
+- Ask Question branches store `connections.onMessageFailure` and `connections.onTimeout`
+
+## Graph Validation
+
+Publish-grade graph validation is server-side and uses `node.connections` as the executable source of truth:
+
+<Steps>
+  <Step title="Entry Validation">
+    Requires exactly one entry node in the graph
+  </Step>
+  <Step title="Connection Validation">
+    Verifies every connection target references an existing node
+  </Step>
+  <Step title="Reachability Check">
+    Rejects unreachable nodes in the workflow graph
+  </Step>
+  <Step title="Cycle Detection">
+    Rejects regular graph cycles, permits intentional loops through `JUMP_TO`
+  </Step>
+  <Step title="End Node Validation">
+    `END` nodes cannot have any outgoing connections
+  </Step>
+</Steps>
+
+<Note>
+The `edges` array is retained for visual/editor parity and legacy entry/reachability checks, but runtime step progression follows connections and handler overrides.
+</Note>
+
+## Step Management
+
+### Adding Steps
+
+In the current vertical builder, adding steps wires the selected output connection to the new node automatically.
+
+### Deleting Steps  
+
+Deleting a step is graph-aware:
+
+<Warning>
+If the selected step has downstream targets through `connections.default`, `onFailure`, `onTimeout`, or named branch outputs, the builder prompts for confirmation and removes the selected step plus the reachable downstream path while preserving unrelated sibling branches.
+</Warning>
+
+The deletion process also removes references to deleted nodes from:
+- Named output connections
+- Branch targets
+
+This ensures the saved graph does not retain broken references.
+
+### Wait Steps
+
+<Info>
+The Wait step stores duration as `durationMs`. Frontend controls may display seconds, minutes, hours, or days, but saved workflow JSON must use milliseconds for queue worker compatibility.
+</Info>
+
+Wait duration constraints:
+- Minimum: 1 second
+- Maximum: 7 days
+
+The handler schedules a delayed resume job for the same wait node, then the engine continues execution when the delay expires.
+
+## Access Control
+
+Service-level enforcement uses `AccessService.assertWorkflowAccessInTransaction`:
+
+<Tabs>
+  <Tab title="Organization Workflows">
+    - Read access: Requires messaging view/manage permissions
+    - Modify/Delete: Requires `MESSAGING_MANAGE` permission
+  </Tab>
+  <Tab title="Personal Workflows">
+    - Owner: Full access to their own workflows
+    - Non-owners: Need messaging permissions per access control system
+  </Tab>
+</Tabs>
+
+### Workflow Chaining
+
+<Check>
+Workflow-to-workflow chains enforce strict scope matching:
+- Organization workflows can trigger only organization workflows
+- Personal workflows can trigger only personal workflows owned by the same user
+</Check>
+
+`MESSAGING_MANAGE` does not allow a personal workflow to trigger organization workflows.
+
+### AI-Triggered Workflows
+
+AI-triggered child workflows are scope-checked:
+- Personal agents can trigger only their owner's personal workflows
+- Organization agents can trigger only organization workflows

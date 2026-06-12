@@ -1,0 +1,255 @@
+---
+title: "Search Suite Boot Failures"
+description: "Root cause analysis and fixes for circular dependency issues causing search suite boot failures"
+---
+
+<Note>
+**Status:** FIXED & verified. Two independent boot blockers were found and resolved.  
+**Discovered:** 2026-05-29 while running `pnpm test:e2e:queue:search`.  
+**Revised:** 2026-05-29 after empirical verification.
+</Note>
+
+## Overview
+
+The search suite boot failures were caused by two distinct issues that prevented the NestJS application from starting properly. This document provides a detailed analysis of both blockers and their verified fixes.
+
+<CardGroup cols={2}>
+  <Card title="Blocker #1" icon="circle-1">
+    Runtime ES-module load-order cycle causing `EntityStakeholderModule.providers[0]` to be `undefined`
+  </Card>
+  <Card title="Blocker #2" icon="circle-2">
+    Missing provider registration for `LeadAiService` in `LeadModule`
+  </Card>
+</CardGroup>
+
+## Root Cause Summary
+
+| # | Blocker | Class | Fix that actually works |
+|---|---------|--------|-------------------------|
+| 1 | `EntityStakeholderModule.providers[0]` is `undefined` → `CircularDependencyException` | Runtime ES-module (CommonJS) load-order cycle | `unit-access.service.ts` imports `User` from `@/modules/user/user.entity` instead of the `@/modules/user` **barrel** (1 line) |
+| 2 | `Nest can't resolve … LeadAiToolsProvider … LeadAiService at index [0]` | **Missing provider** (not a cycle) | Register `LeadAiService` in `LeadModule` `providers` + `exports` |
+
+<Warning>
+**Important correction:** The first draft recommended breaking `commission-payment.service.ts → entity-stakeholder.service.ts` with a DI token + `import type` ("Option A"). **That fix does not work** — the verified fix is the `unit-access` barrel import change.
+</Warning>
+
+## Blocker #1: Runtime ES-Module Load-Order Cycle
+
+### Symptom
+
+`pnpm test:e2e:queue:search` failed during Nest test-app boot with:
+
+```
+A circular dependency has been detected inside EntityStakeholderModule.
+Please, make sure that each side of a bidirectional relationships are decorated with "forwardRef()".
+```
+
+Runtime inspection revealed the actual issue:
+
+```typescript
+Providers: [
+  undefined,                       // <-- should be EntityStakeholderService
+  EntityStakeholderHistoryService,
+  StakeholderSyncService,
+]
+```
+
+### The Circular Import Chain
+
+This is a **CommonJS load-order cycle**, not a NestJS DI cycle. The problematic import chain:
+
+<Steps>
+  <Step title="Initial Import">
+    `entity-stakeholder.service.ts` (line 63) imports `unit-access.service.ts`
+  </Step>
+  
+  <Step title="Barrel Import">
+    `unit-access.service.ts` (line 26) imports the `@/modules/user` BARREL
+  </Step>
+  
+  <Step title="Controller Hub">
+    `user/index.ts` exports `user.controller.ts` which imports 5 CRM services + the `../auth` barrel
+  </Step>
+  
+  <Step title="Cycle Completion">
+    Services like `commission-payment.service.ts`, `lead.service.ts`, etc. loop back to `entity-stakeholder.service.ts`
+  </Step>
+</Steps>
+
+### Why Load-Order Sensitivity Matters
+
+The issue is latent and depends on which file initiates the cycle:
+
+| Entry point | `providers[0]` Result |
+|-------------|----------------------|
+| `entity-stakeholder.module.ts` loaded first (≈ `AppModule` / `pnpm start`) | `EntityStakeholderService` ✅ |
+| `search-backfill.service.ts` (what `test/helpers/search-e2e.ts` imports) | `UNDEFINED` ❌ |
+| `commission-payment.service.ts` loaded first | `UNDEFINED` ❌ |
+
+### Why `forwardRef()` Cannot Help
+
+<Info>
+`forwardRef()` defers **token lookup inside Nest's DI container** but assumes the class reference is defined at decorator-evaluation time. Here the class reference is `undefined` because the ES-module cycle returned partial exports.
+</Info>
+
+## Blocker #1: The Verified Fix
+
+<Tip>
+The solution is a single line change that breaks the import cycle at the barrel level.
+</Tip>
+
+```typescript
+// src/modules/real-estate/inventory/unit-access/unit-access.service.ts
+- import { User } from '@/modules/user';
++ import { User } from '@/modules/user/user.entity';
+```
+
+This change:
+- Severs `user.controller.ts` from `unit-access.service.ts`'s import tree
+- Prevents `EntityStakeholderService` from being re-entered mid-load
+- Matches existing convention used elsewhere in the codebase
+
+### Additional Hardening
+
+To prevent similar issues, redirect remaining barrel imports to specific modules:
+
+```typescript
+// event.service.ts, notification.dto.ts, notification-preference.dto.ts
+- import { UserDto } from '@/modules/user';
++ import { UserDto } from '@/modules/user/user.dto';
+```
+
+<Check>
+After these changes, **no file under `src/` imports the `@/modules/user` barrel**, eliminating this entire class of cycles.
+</Check>
+
+## Blocker #2: Missing LeadAiService Provider
+
+### Symptom
+
+After fixing the circular dependency, a new error appeared:
+
+```
+Nest can't resolve dependencies of the LeadAiToolsProvider (?).
+Please make sure that the argument LeadAiService at index [0] is available in the LeadModule module.
+```
+
+### Root Cause
+
+`LeadAiService` was being injected by three consumers but wasn't registered as a provider in any module:
+- `LeadAiToolsProvider` (registered in both `LeadModule` and `AiAssistantModule`)
+- `AiContextBuilderService`
+- `AiAssistantOrchestratorService`
+
+### The Fix
+
+<CodeGroup>
+```typescript src/modules/crm/lead/lead.module.ts
+import { LeadAiService } from './lead-ai.service';
+
+@Module({
+  // ...
+  providers: [
+    LeadService,
+    LeadAiService,  // Add this
+    // ...
+  ],
+  exports: [
+    MikroOrmModule,
+    LeadService,
+    LeadAiService,  // Export for AiAssistantModule
+    // ...
+  ],
+})
+export class LeadModule {}
+```
+</CodeGroup>
+
+## Diagnostic Commands
+
+Use this command to inspect provider metadata and verify the fix:
+
+```bash
+NODE_PATH="node_modules/.pnpm/zod@4.4.3/node_modules" node -e "
+require('ts-node/register/transpile-only');
+const tsconfig = require('./tsconfig.json');
+require('tsconfig-paths').register({ baseUrl: '.', paths: tsconfig.compilerOptions.paths });
+require('reflect-metadata');
+require('./src/modules/search/maintenance/search-backfill.service.ts');
+const m = require('./src/modules/crm/entity-stakeholder/entity-stakeholder.module.ts');
+const p = Reflect.getMetadata('providers', m.EntityStakeholderModule);
+console.log(p.map((x,i)=>'['+i+']: '+(x?x.name:'UNDEFINED')));
+"
+```
+
+Expected output:
+- **Before fix:** `[ '[0]: UNDEFINED', '[1]: EntityStakeholderHistoryService', '[2]: StakeholderSyncService' ]`
+- **After fix:** `[ '[0]: EntityStakeholderService', '[1]: EntityStakeholderHistoryService', '[2]: StakeholderSyncService' ]`
+
+## Regression Prevention
+
+### Madge Baseline-Delta Guard
+
+A new CI guard prevents future runtime cycles:
+
+<Tabs>
+  <Tab title="Check for New Cycles">
+    ```bash
+    pnpm lint:circular
+    ```
+    Fails if new cycles are detected that aren't in the baseline.
+  </Tab>
+  
+  <Tab title="Update Baseline">
+    ```bash
+    pnpm lint:circular:update
+    ```
+    Regenerate baseline after reviewing new cycles.
+  </Tab>
+</Tabs>
+
+The guard uses `madge` with `skipTypeImports` to focus on runtime cycles only, since type-only imports are erased at runtime and cannot cause load-order issues.
+
+<Warning>
+A hard "zero cycles" gate is not viable as the codebase has ~156 intentional NestJS module cycles resolved by `forwardRef()`. The baseline-delta approach catches only new problematic cycles.
+</Warning>
+
+## Verification Results
+
+<AccordionGroup>
+  <Accordion title="Before Fixes">
+    ```text
+    Normal-order AppModule compile: Nest can't resolve … EntityStakeholderModule circular …
+    pnpm test:e2e:queue:search: CircularDependencyException - app never boots
+    ```
+  </Accordion>
+  
+  <Accordion title="After Fix #1">
+    ```text
+    Normal-order AppModule compile: Nest can't resolve … LeadAiService at index [0] …
+    pnpm test:e2e:queue:search: Still fails but progresses further
+    ```
+  </Accordion>
+  
+  <Accordion title="After Both Fixes">
+    ```text
+    Normal-order AppModule compile: OK ✅
+    pnpm test:e2e:queue:search: App boots successfully; 0 DI/cycle errors
+    Remaining failures: 401 "Unauthorized" at loginUser (need test DB seeding)
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+Run `pnpm test:seed-users` for full test suite success as documented in `.cursor/rules/e2e-testing.mdc`.
+</Note>
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `src/modules/real-estate/inventory/unit-access/unit-access.service.ts` | Import `User` from entity file instead of barrel |
+| `src/modules/crm/lead/lead.module.ts` | Add `LeadAiService` to providers and exports |
+| `scripts/check-circular-deps.ts` | New madge-based cycle detection |
+| `scripts/circular-deps.baseline.json` | Baseline file for existing cycles |
+| Various DTO/service files | Redirect barrel imports to specific modules |
