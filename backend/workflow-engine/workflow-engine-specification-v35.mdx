@@ -1,0 +1,663 @@
+---
+title: "Workflow Engine Specification v35"
+description: "Comprehensive specification for the Workflow Engine module providing rule-based automation for messaging events with visual workflow builder support"
+---
+
+<Note>
+**Last Updated:** 2026-06-05  
+**Status:** Active
+</Note>
+
+## Overview
+
+The Workflow Engine provides rule-based automation for the messaging module. It evaluates configurable automation rules against messaging events (new messages, new conversations, AI escalations) and executes actions such as assigning agents, sending templates, creating tasks, and updating lead stages.
+
+Rules are evaluated in **Phase B** of the webhook processor pipeline, isolated in a try-catch block so failures never affect message persistence or delivery.
+
+---
+
+## Core Concepts
+
+### Visual Workflow
+
+The current workflow builder persists visual automations in the `workflow` table. Each workflow has a `triggerType`, optional `triggerConfig`, and a JSONB `graph` containing ordered step definitions and their connections.
+
+<Info>
+The frontend builder uses an explicit-save model for **Save** and **Publish/Republish** operations.
+</Info>
+
+#### Save and Publish Flow
+
+<Steps>
+  <Step title="Save (Draft)">
+    **`PATCH /v1/workflows/:id`** without lifecycle parameter saves changes to an existing draft workflow
+  </Step>
+  
+  <Step title="Publish (New Workflow)">
+    **`POST /v1/workflows`** with `status: PUBLISHED` creates and publishes atomically
+  </Step>
+  
+  <Step title="Republish (Existing Workflow)">
+    **`PATCH /v1/workflows/:id`** with the editor payload plus `status: PUBLISHED` merges changes, applies publish-grade validation, and bumps version when structural fields change
+  </Step>
+  
+  <Step title="Unpublish or Archive">
+    **`PATCH`** with `status: DRAFT` or `status: ARCHIVED` (lifecycle-only rules apply — no structural fields on those transitions)
+  </Step>
+</Steps>
+
+#### Starting a Workflow
+
+<Tabs>
+  <Tab title="Start from Scratch">
+    Opens a local draft with an empty graph and no trigger selected. The user must choose a trigger before saving.
+  </Tab>
+  
+  <Tab title="From Template">
+    Opens a local draft from a system-level `WorkflowTemplate` record, copying its trigger type and graph into an editable local workflow. The database row is created only on explicit save.
+  </Tab>
+</Tabs>
+
+### Workflow Execution Tracking
+
+Each workflow execution is tracked via `WorkflowExecution` entity with `source` field indicating how it was initiated:
+
+- **TRIGGER** - Automatic trigger from messaging event
+- **MANUAL_TEST** - Test run from builder
+- **MANUAL_RUN** - Manual trigger from conversation
+
+<Info>
+Step executions are tracked in `WorkflowStepExecution` with status, timestamps, input/output data, and error details. The `workflow-timeout` queue monitors pending responses (for `ask_question` steps) and times them out after the configured duration.
+</Info>
+
+---
+
+## Builder Action Gating
+
+<Warning>
+A non-empty **name is required** before any action. **Save**, **Test**, and **Publish** are all disabled while `name` is empty or whitespace-only (the "Untitled workflow" placeholder does not count).
+</Warning>
+
+### Action Requirements
+
+<CardGroup cols={2}>
+  <Card title="Test" icon="flask">
+    - Non-empty name
+    - Selected trigger (always required)
+  </Card>
+  
+  <Card title="Save" icon="floppy-disk">
+    - Non-empty name
+    - Selected trigger (except for metadata-only edits on published workflows)
+  </Card>
+  
+  <Card title="Publish" icon="rocket">
+    - Non-empty name
+    - Selected trigger
+    - At least one step
+    - Zero `getWorkflowValidationIssues`
+    - Valid per-step configuration
+  </Card>
+</CardGroup>
+
+The name check is enforced for Publish as the first entry in `getWorkflowValidationIssues` and for Save/Test via a shared `hasName` flag on the editor page. The backend applies its own create/publish validation independently.
+
+---
+
+## Workflow Templates
+
+<Note>
+Workflow templates are stored in the database, not hardcoded in the frontend. The canonical catalog and its idempotent slug-based upsert live in `WorkflowTemplateSeederService`.
+</Note>
+
+### Template Seeding
+
+The `WorkflowTemplateSeederService` (in the workflow module) is run by `AppInitializerService.onModuleInit()` on **every server boot** inside a `TenantContext.executeWithBypass()` transaction. This ensures the global `workflow_template` catalog is always present without a manual seed step.
+
+<Tip>
+The thin `WorkflowTemplateSeeder` MikroORM CLI seeder (run via `DatabaseSeeder` / `pnpm seed`) delegates to the same service.
+</Tip>
+
+### Template Requirements
+
+Seeded templates must be ready-to-publish in any organization:
+
+<Check>
+**Allowed in templates:**
+- Generic message steps
+- Question steps
+- Branch steps
+- Date/time steps
+- Task steps
+- Contact update steps
+</Check>
+
+<Warning>
+**Must NOT preselect organization-specific:**
+- AI agents
+- Users
+- Teams
+- Lead stages
+- Notification recipients
+</Warning>
+
+Templates are exposed through `GET /v1/workflows/templates`, and are global system catalog records with no organization ownership.
+
+### Template Management
+
+- Templates are upserted by stable slug
+- Previously soft-deleted slugs are reactivated if seeded again
+- Catalog edits replace stale template graphs instead of leaving invalid versions
+- The frontend builder stores scratch workflows and template selections locally until **Save** or **Publish**
+
+---
+
+## Workflow Actor Resolution
+
+<Info>
+The engine resolves the workflow actor once per execution and threads it onto every step's `StepContext.actorUserId`.
+</Info>
+
+### Resolution Logic
+
+<CodeGroup>
+```typescript Organization Scope
+// Uses per-org AI service user via shared resolveAiServiceUserId utility
+const actorUserId = await resolveAiServiceUserId(organizationId);
+```
+
+```typescript Personal Scope
+// Uses the workflow owner
+const actorUserId = workflow.createdBy;
+```
+</CodeGroup>
+
+### Actor Usage
+
+The resolved actor is used for:
+
+1. **Domain Attribution**
+   - Task creation
+   - Lead updates
+   - Conversation assignments
+
+2. **Audit Row Attribution**
+   - Via `auditContextForActor`
+   - Single source of truth for workflow attribution
+
+<Warning>
+When the actor cannot be resolved (missing AI service user or deleted owner), handlers fail with appropriate error codes rather than writing unattributed records.
+</Warning>
+
+Step handlers access the resolved actor through `context.actorUserId` and no longer load `workflow.createdBy` themselves.
+
+---
+
+## Supported Triggers
+
+The visual builder trigger picker exposes this reduced set:
+
+<CardGroup cols={2}>
+  <Card title="First Message Received" icon="message">
+    `FIRST_MESSAGE_RECEIVED`
+  </Card>
+  
+  <Card title="Messaging Window Reopened" icon="window-restore">
+    `MESSAGING_WINDOW_REOPENED`
+  </Card>
+  
+  <Card title="Contact Field Updated" icon="user-pen">
+    `CONTACT_FIELD_UPDATED`
+  </Card>
+  
+  <Card title="Assignment Changed" icon="user-check">
+    `ASSIGNMENT_CHANGED`
+  </Card>
+  
+  <Card title="Lead Created from Campaign" icon="bullhorn">
+    `LEAD_CREATED_FROM_CAMPAIGN`
+  </Card>
+  
+  <Card title="Lead Moved to Stage" icon="layer-group">
+    `LIFECYCLE_UPDATED`
+  </Card>
+  
+  <Card title="Webhook / Integration Event" icon="webhook">
+    `INCOMING_WEBHOOK`
+  </Card>
+  
+  <Card title="Manual Trigger" icon="hand-pointer">
+    `MANUAL`
+  </Card>
+</CardGroup>
+
+<Note>
+The backend `WorkflowTriggerType` enum, frontend API enum, and database CHECK constraints are aligned to this same eight-trigger set.
+</Note>
+
+---
+
+## Manual Workflows
+
+<Warning>
+`MANUAL` has **no automatic event listener**. A manual workflow runs only when explicitly invoked for a conversation.
+</Warning>
+
+### Invocation Methods
+
+Manual workflows can be triggered via:
+
+1. **Chat Composer** - "Trigger workflow" button (`POST /v1/workflows/:id/trigger`)
+2. **AI Agent Action** - `trigger_workflow` action
+
+Both call `WorkflowEngineService.startWorkflow()` with `requireTriggerType: MANUAL`, which rejects non-manual workflows.
+
+### Manual Workflow Characteristics
+
+- Carry full conversation context (conversational steps are allowed)
+- Permitted in both organization and personal scope
+- **Multiple manual workflows may be published** in the same scope
+- Exempt from the one-published-workflow-per-trigger rule
+- Must have **unique published names** within their scope
+
+### Concurrency Control
+
+<Warning>
+Only **one** manual workflow may be active (`RUNNING`/`WAITING`) per conversation at a time.
+</Warning>
+
+This is enforced race-safely by the partial unique index `we_conv_active_manual_unique` on `workflow_execution` (which snapshots `triggerType`).
+
+#### Conflict Resolution
+
+<Steps>
+  <Step title="Manual vs Manual">
+    A second manual start on a busy conversation returns the running execution if it is the same workflow, otherwise fails with a `409 Conflict`
+  </Step>
+  
+  <Step title="Manual vs Auto">
+    `startWorkflow` **proactively** rejects a manual trigger (`409 Conflict`) whenever *any* workflow execution — auto-triggered or manual — is already active on the conversation
+  </Step>
+  
+  <Step title="Same Workflow Re-fire">
+    Re-firing the same workflow heals and returns the in-progress run
+  </Step>
+</Steps>
+
+This blocks a manual run from racing an active auto workflow's Ask Question wait. The `we_conv_active_manual_unique` index remains the race-safe recovery for the manual-vs-manual case.
+
+---
+
+## Workflow Scope
+
+Workflows can be **organization-scoped** or **personal**:
+
+### Organization-Scoped Workflows
+
+- Created by users with `MESSAGING_MANAGE` permission
+- May choose personal scope in the builder
+- Accessible to all users with appropriate permissions
+- One published workflow per `(organization_id, trigger_type)`
+
+### Personal Workflows
+
+- Created by users without `MESSAGING_MANAGE` (always personal)
+- Owned by the authenticated user
+- One published workflow per `(organization_id, owner_user_id, trigger_type)`
+
+<Info>
+Organization and personal workflows with the same `triggerType` may coexist because they target different audiences.
+</Info>
+
+### Database Constraints
+
+The database enforces publishing uniqueness with partial unique indexes:
+
+- `workflow_org_published_trigger_unique` - Organization workflows
+- `workflow_personal_published_trigger_unique` - Personal workflows
+
+### Access Control
+
+<Tabs>
+  <Tab title="Users with MESSAGING_VIEW/MANAGE">
+    - List both organization and personal workflows according to filters
+    - Organization workflows require `MESSAGING_MANAGE` for MODIFY/DELETE
+    - Personal workflows are fully accessible to the owner
+  </Tab>
+  
+  <Tab title="Users without Messaging Permissions">
+    - Receive **only their own personal workflows**
+    - `scope=ORGANIZATION` returns **no rows**
+  </Tab>
+</Tabs>
+
+Service-level enforcement uses `AccessService.assertWorkflowAccessInTransaction` consistent with `ACCESS_CONTROL_SYSTEM.md`.
+
+### Scope Rules for Triggered Workflows
+
+<Warning>
+AI-triggered child workflows are scope-checked:
+</Warning>
+
+- **Personal agents** can trigger only their owner's personal workflows
+- **Organization agents** can trigger only organization workflows
+
+<Warning>
+Workflow-to-workflow chains require strict scope matches:
+</Warning>
+
+- **Organization workflows** can trigger only organization workflows
+- **Personal workflows** can trigger only personal workflows owned by the same user
+- `MESSAGING_MANAGE` does **not** allow a personal workflow to trigger organization workflows
+
+---
+
+## Branch Conditions
+
+Visual workflow branches use the structured backend `BranchCondition` schema:
+
+- `category` - Condition category
+- `field` - Field identifier
+- `operator` - Comparison operator
+- `value` - Optional comparison value
+- `stepId` - Optional, only when `category` is `previous_step_output`
+
+<Warning>
+Legacy raw field paths, wrapped variables, deprecated categories, and any serialized `source` property on a condition object are rejected at publish time.
+</Warning>
+
+### Deprecated Categories
+
+The following categories are **no longer supported**:
+
+- `trigger`
+- `contact`
+- `lead`
+- `conversation`
+- `previous_step`
+- `webhook_payload`
+
+### Supported Categories
+
+<AccordionGroup>
+  <Accordion title="contact_field">
+    Values resolve through `PersonService` workflow branch helpers.
+  </Accordion>
+  
+  <Accordion title="previous_step_output">
+    - Reads from `execution.variables.steps[stepId]`
+    - Publish validation requires the selected `stepId` to be the Branch node's single direct previous step
+  </Accordion>
+  
+  <Accordion title="assignee_status">
+    Resolves through `WorkflowMessageStatusReaderService` with explicit organization filters inside the workflow transaction.
+  </Accordion>
+  
+  <Accordion title="last_incoming_message">
+    Latest incoming message fields resolved via `WorkflowMessageStatusReaderService`. Orders by `createdAt DESC, id DESC` and exposes only Branch catalog fields.
+  </Accordion>
+  
+  <Accordion title="last_outgoing_message">
+    Latest outgoing message fields resolved via `WorkflowMessageStatusReaderService`. Orders by `createdAt DESC, id DESC` and exposes only Branch catalog fields. Outbound `senderType` is not branchable.
+  </Accordion>
+  
+  <Accordion title="time_since_last_incoming_message">
+    Time duration since the last incoming message.
+  </Accordion>
+  
+  <Accordion title="time_since_last_outgoing_message">
+    Time duration since the last outgoing message.
+  </Accordion>
+  
+  <Accordion title="lead_stage">
+    - `lead_stage.stageId` compares against the organization's effective lead stages (including global stages without org overrides)
+    - Publish validation rejects unknown stage ids
+  </Accordion>
+</AccordionGroup>
+
+Each category is gated by trigger compatibility in the catalog.
+
+### Branch Catalog Management
+
+<Note>
+Backend validation and runtime use the backend branch catalog constants as the final authority.
+</Note>
+
+The editor intentionally keeps a matching local static catalog so Branch condition controls are available without a metadata API call.
+
+<Tip>
+Org-scoped lead stage options are the only dynamic exception and are loaded through the existing lead stage API, filtered to active stages.
+</Tip>
+
+<Warning>
+Any Branch catalog change must update both the backend constants and the frontend local catalog.
+</Warning>
+
+---
+
+## Step Management
+
+### Adding Steps
+
+In the current vertical builder, adding steps wires the selected output connection to the new node automatically.
+
+### Deleting Steps
+
+<Warning>
+Deleting a step is graph-aware and requires confirmation if downstream dependencies exist.
+</Warning>
+
+When deleting a step:
+
+<Steps>
+  <Step title="Check Downstream Targets">
+    If the selected step has downstream targets through `connections.default`, `onFailure`, `onTimeout`, or named branch outputs, the builder prompts for confirmation
+  </Step>
+  
+  <Step title="Remove Step and Path">
+    The builder removes the selected step plus the reachable downstream path while preserving unrelated sibling branches
+  </Step>
+  
+  <Step title="Clean References">
+    Deleting a step also removes references to deleted nodes from named output connections and branch targets so the saved graph does not retain broken references
+  </Step>
+</Steps>
+
+---
+
+## API Reference
+
+### Workflow Management
+
+<CodeGroup>
+```http Create and Publish
+POST /v1/workflows
+Content-Type: application/json
+
+{
+  "name": "Welcome Flow",
+  "triggerType": "FIRST_MESSAGE_RECEIVED",
+  "status": "PUBLISHED",
+  "graph": { ... }
+}
+```
+
+```http Update Draft
+PATCH /v1/workflows/:id
+Content-Type: application/json
+
+{
+  "name": "Updated Welcome Flow",
+  "graph": { ... }
+}
+```
+
+```http Publish Existing
+PATCH /v1/workflows/:id
+Content-Type: application/json
+
+{
+  "name": "Welcome Flow",
+  "status": "PUBLISHED",
+  "graph": { ... }
+}
+```
+
+```http Unpublish
+PATCH /v1/workflows/:id
+Content-Type: application/json
+
+{
+  "status": "DRAFT"
+}
+```
+</CodeGroup>
+
+### Workflow Execution
+
+<CodeGroup>
+```http Manual Trigger
+POST /v1/workflows/:id/trigger
+Content-Type: application/json
+
+{
+  "conversationId": "conv_123"
+}
+```
+
+```http Get Templates
+GET /v1/workflows/templates
+```
+
+```http List Workflows
+GET /v1/workflows?scope=ORGANIZATION
+GET /v1/workflows?scope=PERSONAL
+```
+</CodeGroup>
+
+---
+
+## Validation Rules
+
+### Publish Validation
+
+A workflow must pass the following validations before publishing:
+
+<Check>
+1. **Non-empty name** - First check in `getWorkflowValidationIssues`
+2. **Selected trigger** - Required trigger type
+3. **At least one step** - Graph must contain steps
+4. **Valid step configuration** - All steps properly configured
+5. **Valid branch conditions** - No deprecated categories or legacy formats
+6. **Scope-appropriate resources** - No org-specific selections in templates
+</Check>
+
+### Runtime Validation
+
+During execution, the engine validates:
+
+- Actor can be resolved (AI service user or workflow owner exists)
+- Branch conditions resolve successfully
+- Previous step outputs exist when referenced
+- Lead stages are valid for the organization
+- Scope rules are enforced for triggered workflows
+
+<Warning>
+Validation failures result in workflow execution errors with appropriate error codes rather than silent failures or unattributed records.
+</Warning>
+
+---
+
+## Technical Runtime Fields
+
+<Note>
+Technical runtime tracking fields are maintained internally and not exposed through branch conditions:
+</Note>
+
+- `messageId` - Internal message identifier
+- `pendingResponseId` - Pending response tracking
+- `outboundPurpose` - Outbound message purpose classification
+
+These fields support workflow execution tracking but are not available for branching logic.
+
+---
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Scope Selection" icon="layer-group">
+    Choose organization scope for shared workflows, personal scope for individual automation needs
+  </Card>
+  
+  <Card title="Template Design" icon="palette">
+    Design templates to be organization-agnostic, avoiding preselected resources
+  </Card>
+  
+  <Card title="Branch Logic" icon="code-branch">
+    Use structured branch conditions from the supported catalog, avoid legacy formats
+  </Card>
+  
+  <Card title="Error Handling" icon="triangle-exclamation">
+    Monitor workflow executions for actor resolution and validation failures
+  </Card>
+  
+  <Card title="Manual Workflows" icon="hand-pointer">
+    Use unique names for manual workflows and check for active executions
+  </Card>
+  
+  <Card title="Step Organization" icon="list-check">
+    Keep workflows focused and use workflow-to-workflow triggering for complex flows
+  </Card>
+</CardGroup>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workflow fails to publish">
+    **Check:**
+    - Name is non-empty and not whitespace-only
+    - Trigger is selected
+    - At least one step exists
+    - All branch conditions use supported categories
+    - No deprecated condition formats
+    - No org-specific selections in templates
+  </Accordion>
+  
+  <Accordion title="Manual workflow returns 409 Conflict">
+    **Cause:** Another workflow (manual or auto) is already active on the conversation
+    
+    **Resolution:**
+    - Wait for the active workflow to complete
+    - If the same workflow, the existing execution is returned
+    - If different workflow, wait or cancel the active execution
+  </Accordion>
+  
+  <Accordion title="Actor resolution fails">
+    **Check:**
+    - Organization scope: AI service user exists for the organization
+    - Personal scope: Workflow owner has not been deleted
+    
+    **Resolution:** Ensure required actor exists before workflow execution
+  </Accordion>
+  
+  <Accordion title="Branch condition fails to resolve">
+    **Check:**
+    - Category is in the supported catalog
+    - Field exists for the selected category
+    - Lead stage IDs are valid for the organization
+    - Previous step output references correct stepId
+    
+    **Resolution:** Update branch conditions to use valid catalog entries
+  </Accordion>
+  
+  <Accordion title="Workflow template missing after deployment">
+    **Cause:** Template seeder runs on every server boot but may fail silently
+    
+    **Resolution:**
+    - Check server logs for seeder errors
+    - Verify database connectivity during boot
+    - Manually run `pnpm seed` if needed
+  </Accordion>
+</AccordionGroup>

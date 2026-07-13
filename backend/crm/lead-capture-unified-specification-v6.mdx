@@ -1,0 +1,754 @@
+---
+title: "Lead Capture Unified Specification v6"
+description: "Universal inbound lead ingestion pipeline with source adapters, identity resolution, deduplication, and assignment orchestration"
+---
+
+## Overview
+
+The Lead Capture module provides a single, universal pipeline that transforms any captured lead — from Property Finder, Bayut/dubizzle, and later Meta Ads, website forms, etc. — into a CRM `Lead` with consistent source fields, person reuse, deduplication, and assignment.
+
+<Note>
+**Core principle:** Reuse, don't rebuild. This layer sits above existing CRM primitives and orchestrates them. It does NOT reimplement lead creation, person matching, dedup, stakeholders, or distribution.
+</Note>
+
+### Module location
+
+```
+src/modules/crm/lead-capture/
+├── lead-capture.service.ts              # LeadCaptureService.capture()
+├── lead-capture-source.interface.ts     # Adapter contract
+├── captured-lead-input.ts               # Input/result types
+├── lead-capture-settings.entity.ts      # Org-level defaults
+├── captured-lead.entity.ts              # Idempotency ledger
+├── queue/lead-ingestion.worker.ts       # pg-boss worker
+└── enums/capture-assignment-strategy.enum.ts
+```
+
+### Implementation status
+
+<Check>
+**BUILT.** The module ships with `LeadCaptureService`, complete contracts, source registry, org settings, `captured_lead` ledger with RLS, source-agnostic `lead-ingestion` pg-boss queue, and `LeadIngestionWorker`.
+</Check>
+
+Portal adapters live in `portal-syndication`:
+- `BayutLeadCaptureAdapter` (source `Bayut`, splits dubizzle per-lead)
+- `PfLeadCaptureAdapter` (source `PropertyFinder`)
+
+---
+
+## Scope
+
+### In scope
+
+- Canonical captured-lead contract
+- Source-adapter pattern and registry
+- Orchestration of source-field mapping, identity resolution, dedup/attach, and assignment
+- Async transport (queue + worker)
+- Idempotency ledger with RLS
+
+### Out of scope
+
+<Warning>
+Meta Ads and website-form ingestion are **not** designed here. The contract reserves fields they will need (`externalLeadId`, `assignmentHint`) so they can plug in later without refactoring.
+</Warning>
+
+Outbound listing syndication is documented in the Portal Syndication specification.
+
+---
+
+## Reused components
+
+The Lead Capture module orchestrates existing CRM primitives rather than reimplementing them:
+
+| Concern | Component | Location |
+|---------|-----------|----------|
+| Lead creation | `LeadService.createLeadInTransaction` | `crm/lead/lead.service.ts` |
+| Deduplication | `LeadService.findDuplicateLeadMatchInTransaction` | `crm/lead/lead.service.ts` |
+| Person reuse | `PersonService.findOrCreatePersonFullInTransaction` | `crm/person/person.service.ts` |
+| Channel identity | `PersonChannel` + contact matchers | `crm/person/channel/` |
+| Assignment | `EntityStakeholderService` + `DistributionEngineService` | `crm/entity-stakeholder/`, `crm/distribution/` |
+| Source vocabulary | `LeadSource` enum | `shared/lead-source.enum.ts` |
+| System actor | `resolveSystemActorId`, `SYSTEM_AUDIT_CONTEXT` | `shared/org-member.utils.ts` |
+
+<Info>
+Leads already carry source fields: `leadSource`, `sourceDetail`, `referenceId`, `sourceChannel` (PersonChannel FK), `sourceConversation` (Conversation FK). Person carries `originalSource` (first-touch).
+</Info>
+
+---
+
+## Dependency architecture
+
+<Tip>
+**Dependency rule:** `crm/lead-capture` depends only on intra-CRM services. Source modules depend on lead-capture, never the reverse.
+</Tip>
+
+```
+crm/lead-capture/                    ← Contract + orchestrator
+  ↑
+  │ depends on
+  │
+real-estate/portal-syndication/      ← Provides PF + Bayut adapters
+messaging/                            ← May call inline (already in transaction)
+meta-platform/ (future)              ← Will provide Meta Ads adapter
+```
+
+---
+
+## Canonical contract
+
+### CapturedLeadInput
+
+```typescript
+interface CapturedLeadInput {
+  orgId: string;
+  source: LeadSource;                  // Bayut | PropertyFinder | Dubizzle | Website | Instagram
+  sourceDetail?: string;               // Campaign / form / "WhatsApp message"
+  inboundChannel?: InboundChannel;     // call | whatsapp | email | sms
+  referenceId?: string;                // Listing / campaign / form id
+  externalLeadId?: string;             // Source's own lead id (idempotency key)
+
+  identity: {                          // For Person reuse (match-priority order)
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    phone?: string;
+    channel?: { 
+      type: ChannelType; 
+      identifier: string 
+    };  // WhatsApp / IG / Messenger id
+  };
+
+  intent?: LeadIntent;
+  propertyRef?: { 
+    listingId?: string; 
+    refUnitId?: number 
+  };  // Resolves attributed agent
+  assignmentHint?: CaptureAssignmentConfig;  // Adapter's suggestion
+  capturedAt?: Date;
+  rawPayload: unknown;                 // Stored verbatim for audit/replay
+}
+```
+
+### CaptureResult
+
+```typescript
+interface CaptureResult {
+  leadId: string;
+  personId: string;
+  outcome: 'created' | 'attached' | 'skipped';  // attached = re-inquiry on open lead
+  assignment: 'agent' | 'team_pool' | 'org_pool' | 'queued' | 'none';
+}
+```
+
+### LeadCaptureSource (adapter contract)
+
+```typescript
+interface LeadCaptureSource {
+  readonly source: LeadSource;
+  toCapturedInput(
+    raw: unknown, 
+    ctx: { orgId: string }
+  ): CapturedLeadInput | CapturedLeadInput[];
+}
+```
+
+---
+
+## Capture pipeline
+
+The `LeadCaptureService.capture(input)` method runs entirely inside `tenantContext.executeInOrg(input.orgId)` with the system actor as `createdBy`.
+
+<Steps>
+
+<Step title="Idempotency guard">
+Look up the `captured_lead` ledger by `(orgId, source, externalLeadId)`. If present, return the prior `CaptureResult` (no-op).
+
+This makes webhook retries and poll overlaps safe.
+</Step>
+
+<Step title="Source-field normalization">
+Derive `leadSource`, `sourceDetail`, `referenceId`, and any `sourceChannel`/`sourceConversation` from the input.
+</Step>
+
+<Step title="Identity resolution">
+Resolve or create the `Person` using existing `PersonService` methods with the provided identity data.
+</Step>
+
+<Step title="Deduplication">
+Use `LeadService.findDuplicateLeadMatchInTransaction` to decide whether to create a new lead or attach to an existing open lead.
+</Step>
+
+<Step title="Assignment">
+Resolve the assignment directive and execute via stakeholder service or distribution engine.
+</Step>
+
+<Step title="Create/attach and record">
+Create via `createLeadInTransaction` (or attach a re-inquiry activity), write the `captured_lead` ledger row with status, lead ID, person ID, and raw payload, then return `CaptureResult`.
+</Step>
+
+</Steps>
+
+<Warning>
+Failures inside a job bubble to the worker so pg-boss retries. The ledger guard makes retries idempotent.
+</Warning>
+
+### System actor availability
+
+<Info>
+`resolveSystemActorId` now returns the dedicated per-org System service user (`isSystemServiceUser = true`), seeded at org provisioning and backfilled at startup. This means **memberless orgs no longer skip capture** — their leads are captured and attributed to the System actor.
+</Info>
+
+The `null` guard in `captureInTransaction` (return `outcome: 'skipped'`) is retained as defense-in-depth for edge cases where the System user is missing and no human member exists.
+
+---
+
+## Source field policy
+
+The pipeline applies consistent rules for mapping captured lead data to CRM fields:
+
+<AccordionGroup>
+
+<Accordion title="Lead.leadSource">
+Set to `input.source` — the source of THIS inquiry (the portal/origin).
+</Accordion>
+
+<Accordion title="Lead.sourceDetail">
+Set to `input.sourceDetail` (campaign name, "WhatsApp message", entity/agent/agency target, etc.). Human-readable; **not** the structured channel.
+</Accordion>
+
+<Accordion title="Lead.inboundChannel">
+Set to `input.inboundChannel` — the **structured delivery channel** of the inquiry (`InboundChannel`: `call | whatsapp | email | sms`), distinct from `leadSource` (the portal).
+
+**First-touch only.** Queryable/indexed for "all WhatsApp leads", channel routing, and analytics. Re-inquiries on other channels are recorded per-inquiry on the `captured_lead` ledger (`captured_lead.inboundChannel`), not by overwriting the lead.
+</Accordion>
+
+<Accordion title="Lead.referenceId">
+Set to `input.referenceId` (listing/campaign/form id). Used for attribution and as part of the dedup key. Not unique.
+</Accordion>
+
+<Accordion title="Lead.sourceChannel">
+The resolved `PersonChannel` when the lead arrived through a persistent messaging identity (WhatsApp/IG/Messenger).
+
+**Distinct from `inboundChannel`:** `sourceChannel` is the Person's channel *identity*; `inboundChannel` is *how this inquiry arrived*.
+</Accordion>
+
+<Accordion title="Lead.sourceConversation">
+Set when captured from a messaging conversation.
+</Accordion>
+
+<Accordion title="Person.originalSource">
+Set on **FIRST creation only** (first-touch attribution); never overwritten on later inquiries.
+</Accordion>
+
+</AccordionGroup>
+
+### InboundChannel vocabulary
+
+The `InboundChannel` enum (`src/modules/shared/inbound-channel.enum.ts`) defines:
+
+```typescript
+enum InboundChannel {
+  EMAIL = 'email',
+  WHATSAPP = 'whatsapp',
+  CALL = 'call',
+  SMS = 'sms'
+}
+```
+
+Stored as plain `text` (no DB CHECK constraint — mirrors `Lead.intent`).
+
+**Portal mapping:**
+- **Property Finder** `payload.channel` (`email | whatsapp | call`) → 1:1 mapping
+- **Bayut/dubizzle** `lead_data.via` (`phone` → `call`, `email`, `whatsapp`) → mapped
+
+<Note>
+`inboundChannel` is distinct from `leadSource`. A lead can have `leadSource: PropertyFinder` and `inboundChannel: whatsapp`, meaning "this PropertyFinder inquiry arrived via WhatsApp."
+</Note>
+
+---
+
+## Listing leads query
+
+### findCapturedLeadsForListing
+
+A read-only projection over the `captured_lead` ledger that powers the portal-syndication listing detail "Leads" tab.
+
+```typescript
+findCapturedLeadsForListing(listingId: string, orgId: string): Promise<ListingCapturedLead[]>
+```
+
+**Filters:**
+- `referenceId = listingId`
+- `source IN (PropertyFinder, Bayut, Dubizzle)`
+- `leadId != null` (only `created`/`attached` rows)
+- Newest first
+
+**Returns:** `ListingCapturedLead[]`
+
+```typescript
+interface ListingCapturedLead {
+  capturedLeadId: string;
+  leadId?: string;
+  personId?: string;
+  source: LeadSource;
+  inboundChannel?: InboundChannel;
+  fullName: string;
+  email?: string;
+  phone?: string;
+  outcome: 'created' | 'attached';
+  capturedAt?: Date;
+}
+```
+
+<Tip>
+Listing-targeted portal leads set `captured_lead.referenceId` to the local listing ID (portal adapters resolve it from the portal reference via `resolveListingIdFromReference`).
+</Tip>
+
+The `inboundChannel` field lets the listing "Leads" tab show how each inquiry arrived (call/whatsapp/email/sms). The portal-syndication `ListingLeadDto` re-exposes both `source`→`portal` (brand logo) and `inboundChannel`.
+
+<Info>
+The `captured_lead` table stays owned by this module. Portal-syndication's `ListingService` delegates to this method rather than querying the ledger directly.
+</Info>
+
+---
+
+## Source adapters
+
+### Adapter pattern
+
+Adapters implement the `LeadCaptureSource` interface and self-register with `LeadCaptureSourceRegistry` in `onModuleInit`.
+
+```typescript
+@Injectable()
+export class PfLeadCaptureAdapter implements LeadCaptureSource, OnModuleInit {
+  readonly source = LeadSource.PropertyFinder;
+
+  constructor(private registry: LeadCaptureSourceRegistry) {}
+
+  onModuleInit() {
+    this.registry.register(this);
+  }
+
+  toCapturedInput(raw: unknown, ctx: { orgId: string }): CapturedLeadInput {
+    // Parse raw webhook payload
+    // Map to CapturedLeadInput
+    // Return normalized input
+  }
+}
+```
+
+### Existing adapters
+
+<CardGroup cols={2}>
+
+<Card title="Property Finder" icon="building">
+**Source:** `PropertyFinder`
+
+Reads the documented `WHPayloadLead` webhook envelope:
+- `payload.channel` → `inboundChannel`
+- `payload.entityType`
+- `payload.sender.contacts[]`
+
+Includes flattened legacy fallback.
+</Card>
+
+<Card title="Bayut/dubizzle" icon="house">
+**Source:** `Bayut` (splits dubizzle per-lead)
+
+Maps `lead_data.via` to `inboundChannel`:
+- `phone` → `call`
+- `email` → `email`
+- `whatsapp` → `whatsapp`
+</Card>
+
+</CardGroup>
+
+### Listing agent resolution
+
+The `LISTING_AGENT_RESOLVER` seam is satisfied via `LeadCaptureService.registerListingAgentResolver()` — a setter that portal-syndication calls at bootstrap to register `PortalListingAgentResolver`.
+
+```typescript
+// lead-capture never imports portal-syndication
+LeadCaptureService.registerListingAgentResolver(resolver: ListingAgentResolver)
+```
+
+**Agent email hint:** `agentEmailHint` on `CapturedLeadInput` carries agent-targeted emails, resolved to an in-org user (via `UserOrgRole`) for the `LISTING_PUBLISHER` fallback.
+
+---
+
+## Assignment strategies
+
+### CaptureAssignmentConfig
+
+```typescript
+interface CaptureAssignmentConfig {
+  strategy: CaptureAssignmentStrategy;
+  teamId?: string;        // For TEAM_POOL
+  userId?: string;        // For DIRECT_ASSIGN
+}
+
+enum CaptureAssignmentStrategy {
+  LISTING_AGENT = 'listing_agent',      // Resolve from propertyRef
+  TEAM_POOL = 'team_pool',              // Use teamId + distribution
+  ORG_POOL = 'org_pool',                // Use org-level distribution
+  DIRECT_ASSIGN = 'direct_assign',      // Assign to userId directly
+  NONE = 'none'                         // Create unassigned
+}
+```
+
+### Resolution order
+
+<Steps>
+
+<Step title="Adapter hint">
+If `input.assignmentHint` is provided, use that strategy.
+</Step>
+
+<Step title="Org default">
+Fall back to `LeadCaptureSettings.defaultAssignmentStrategy` for the org.
+</Step>
+
+<Step title="Final fallback">
+If no settings exist, default to `LISTING_AGENT` (for portal leads) or `ORG_POOL` (for other sources).
+</Step>
+
+</Steps>
+
+### Strategy execution
+
+<Tabs>
+  <Tab title="LISTING_AGENT">
+Resolve agent from `propertyRef.listingId` via the registered listing agent resolver.
+
+If resolved, create stakeholder with role `LISTING_PUBLISHER`. If not resolved or no `propertyRef`, fall back to `ORG_POOL`.
+  </Tab>
+  
+  <Tab title="TEAM_POOL">
+Use `EntityStakeholderService` to assign to the specified team, then trigger distribution within that team via `DistributionEngineService`.
+  </Tab>
+  
+  <Tab title="ORG_POOL">
+Create lead with `skipDistribution: false` and let `DistributionListener` (triggered by `LeadCreatedEvent`) handle assignment via org-level distribution rules.
+  </Tab>
+  
+  <Tab title="DIRECT_ASSIGN">
+Create stakeholder directly for the specified `userId` with appropriate role.
+  </Tab>
+  
+  <Tab title="NONE">
+Create lead with `skipDistribution: true`. Lead remains unassigned.
+  </Tab>
+</Tabs>
+
+---
+
+## Async transport
+
+### Queue configuration
+
+**Queue name:** `lead-ingestion`
+
+**Handler:** `LeadIngestionWorker`
+
+**Job payload:**
+
+```typescript
+interface LeadIngestionJob {
+  capturedInput: CapturedLeadInput;
+}
+```
+
+### Worker behavior
+
+```typescript
+@Injectable()
+export class LeadIngestionWorker {
+  @Process('lead-ingestion')
+  async handleLeadIngestion(job: Job<LeadIngestionJob>) {
+    const { capturedInput } = job.data;
+    
+    try {
+      const result = await this.leadCaptureService.capture(capturedInput);
+      return result;
+    } catch (error) {
+      // Error bubbles to pg-boss for retry
+      throw error;
+    }
+  }
+}
+```
+
+<Warning>
+Failures bubble to pg-boss for automatic retry. The idempotency guard in `capture()` makes retries safe.
+</Warning>
+
+### Enqueuing leads
+
+Portal webhooks and polling jobs enqueue captured leads:
+
+```typescript
+await this.queueService.add('lead-ingestion', {
+  capturedInput: adapter.toCapturedInput(rawPayload, { orgId })
+});
+```
+
+---
+
+## Idempotency ledger
+
+### captured_lead entity
+
+```sql
+CREATE TABLE captured_lead (
+  id UUID PRIMARY KEY,
+  org_id UUID NOT NULL REFERENCES org(id),
+  
+  -- Idempotency key
+  source TEXT NOT NULL,
+  external_lead_id TEXT,
+  
+  -- Outcome
+  status TEXT NOT NULL,  -- 'created' | 'attached' | 'skipped'
+  lead_id UUID REFERENCES lead(id),
+  person_id UUID REFERENCES person(id),
+  
+  -- Source fields (per-inquiry)
+  source_detail TEXT,
+  inbound_channel TEXT,  -- call | whatsapp | email | sms
+  reference_id TEXT,
+  
+  -- Audit
+  raw_payload JSONB NOT NULL,
+  captured_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  
+  UNIQUE (org_id, source, external_lead_id)
+);
+
+-- RLS enabled
+ALTER TABLE captured_lead ENABLE ROW LEVEL SECURITY;
+```
+
+### Idempotency guarantee
+
+<Check>
+The unique constraint on `(org_id, source, external_lead_id)` ensures that duplicate webhooks or overlapping polls cannot create duplicate leads.
+</Check>
+
+When `capture()` is called:
+
+1. Check for existing `captured_lead` row with same key
+2. If found, return the stored `CaptureResult` immediately
+3. If not found, proceed with pipeline and write ledger row atomically
+
+<Info>
+Per-inquiry `inboundChannel` is persisted on the ledger, allowing historical analysis of how re-inquiries arrived even though `Lead.inboundChannel` is first-touch only.
+</Info>
+
+---
+
+## Migrations
+
+### Migration20260531130000_LeadCaptureFoundation
+
+Creates:
+- `lead_capture_settings` table (org defaults)
+- `captured_lead` table with unique constraint
+- `lead_capture_source_registry` (in-memory, no table)
+- RLS policies for both tables
+
+### Migration20260605200000_AddInboundChannel
+
+Adds:
+- `inbound_channel` column to `lead` table (first-touch)
+- `inbound_channel` column to `captured_lead` table (per-inquiry)
+- Index on `lead.inbound_channel` for filtering/analytics
+
+---
+
+## Usage examples
+
+### Portal webhook handler
+
+```typescript
+@Post('webhooks/property-finder/lead')
+async handlePfWebhook(@Body() payload: WHPayloadLead) {
+  const adapter = this.registry.getAdapter(LeadSource.PropertyFinder);
+  const input = adapter.toCapturedInput(payload, { 
+    orgId: this.resolveOrgId(payload) 
+  });
+  
+  await this.queueService.add('lead-ingestion', { capturedInput: input });
+  
+  return { received: true };
+}
+```
+
+### Direct inline capture (messaging)
+
+```typescript
+async handleInboundMessage(message: InboundMessage, conversation: Conversation) {
+  // Already in transaction context
+  const input: CapturedLeadInput = {
+    orgId: conversation.orgId,
+    source: LeadSource.WhatsApp,
+    sourceDetail: 'WhatsApp message',
+    inboundChannel: InboundChannel.WHATSAPP,
+    identity: {
+      channel: {
+        type: ChannelType.WhatsApp,
+        identifier: message.from
+      }
+    },
+    capturedAt: message.timestamp,
+    rawPayload: message
+  };
+  
+  // Call directly, skip queue
+  const result = await this.leadCaptureService.capture(input);
+}
+```
+
+### Listing leads tab
+
+```typescript
+@Get('listings/:id/leads')
+async getListingLeads(@Param('id') listingId: string) {
+  const leads = await this.leadCaptureService.findCapturedLeadsForListing(
+    listingId,
+    this.currentOrgId
+  );
+  
+  return leads.map(lead => ({
+    id: lead.capturedLeadId,
+    leadId: lead.leadId,
+    portal: lead.source,  // Badge color
+    channel: lead.inboundChannel,  // Icon
+    contact: {
+      name: lead.fullName,
+      email: lead.email,
+      phone: lead.phone
+    },
+    outcome: lead.outcome,
+    capturedAt: lead.capturedAt
+  }));
+}
+```
+
+---
+
+## Related documentation
+
+<CardGroup cols={2}>
+
+<Card title="CRM Module" icon="address-book" href="/backend/crm/crm-module-specification">
+Core CRM entities and services
+</Card>
+
+<Card title="Distribution Module" icon="route" href="/backend/crm/distribution-module-specification">
+Assignment rules and pool routing
+</Card>
+
+<Card title="Stakeholder System" icon="users" href="/backend/crm/stakeholder-system">
+Entity stakeholder management
+</Card>
+
+<Card title="Portal Syndication" icon="globe" href="/backend/real-estate/portal-syndication-specification">
+Outbound listing sync and inbound lead webhooks
+</Card>
+
+</CardGroup>
+
+---
+
+## API reference
+
+### LeadCaptureService
+
+<AccordionGroup>
+
+<Accordion title="capture(input: CapturedLeadInput): Promise<CaptureResult>">
+**Main pipeline.** Runs idempotency check, identity resolution, dedup, assignment, and creates/attaches lead.
+
+**Parameters:**
+- `input`: Complete `CapturedLeadInput` with source, identity, and assignment data
+
+**Returns:** `CaptureResult` with lead ID, person ID, outcome, and assignment type
+
+**Throws:** Bubbles errors to caller (pg-boss worker for retry)
+</Accordion>
+
+<Accordion title="findCapturedLeadsForListing(listingId: string, orgId: string)">
+**Query projection.** Returns all portal leads captured for a specific listing.
+
+**Parameters:**
+- `listingId`: Local listing ID (from `referenceId`)
+- `orgId`: Organization ID for RLS
+
+**Returns:** `Promise<ListingCapturedLead[]>` ordered by newest first
+</Accordion>
+
+<Accordion title="registerListingAgentResolver(resolver: ListingAgentResolver)">
+**Seam injection.** Called by portal-syndication at bootstrap to register listing-to-agent resolver.
+
+**Parameters:**
+- `resolver`: Implementation of `ListingAgentResolver` interface
+
+**Returns:** `void`
+</Accordion>
+
+</AccordionGroup>
+
+### LeadCaptureSourceRegistry
+
+<AccordionGroup>
+
+<Accordion title="register(adapter: LeadCaptureSource)">
+**Adapter registration.** Called by adapters in `onModuleInit()`.
+
+**Parameters:**
+- `adapter`: Implementation of `LeadCaptureSource` interface
+
+**Returns:** `void`
+</Accordion>
+
+<Accordion title="getAdapter(source: LeadSource): LeadCaptureSource">
+**Adapter lookup.** Retrieves registered adapter for a source.
+
+**Parameters:**
+- `source`: The `LeadSource` enum value
+
+**Returns:** The registered adapter
+
+**Throws:** Error if no adapter registered for source
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Best practices
+
+<CardGroup cols={2}>
+
+<Card title="Always provide externalLeadId" icon="key">
+Ensures idempotency for webhook retries and poll overlaps. Use the source's native lead ID.
+</Card>
+
+<Card title="Set inboundChannel explicitly" icon="message">
+Captures how the inquiry arrived (call/whatsapp/email/sms) for routing and analytics. Distinct from `leadSource`.
+</Card>
+
+<Card title="Include rawPayload" icon="database">
+Store the complete original payload for audit trails and replay scenarios.
+</Card>
+
+<Card title="Use assignment hints wisely" icon="user-check">
+Let adapters suggest assignment strategies, but respect org defaults as fallback.
+</Card>
+
+</CardGroup>
+
+<Tip>
+When building new source adapters, start with the `LeadCaptureSource` interface and register in `onModuleInit`. The pipeline handles everything else.
+</Tip>

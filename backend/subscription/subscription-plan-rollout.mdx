@@ -1,652 +1,1599 @@
 ---
 title: "Subscription Plan Rollout"
-description: "Implementation plan for Free/Pro/Business tier rollout with AED pricing, including backend and frontend phases"
+description: "Implementation plan for Free/Pro/Business subscription tiers with 90-day trial, unified credit wallet, and seat consolidation"
 ---
 
-This document outlines the comprehensive rollout plan for the three-tier subscription system (Free/Pro/Business) with AED pricing. The implementation follows a backend-first approach across 11 phases.
+<Note>
+This implementation plan executes the subscription packaging strategy with a backend-first approach, followed by frontend integration. All phases are backed by code-level verification passes confirming current-state facts and dependencies.
+</Note>
 
 ## Overview
 
-The rollout implements the subscription packaging strategy with:
-- **Free/Pro/Business tiers** with AED pricing
-- **90-day evergreen trial** for Pro & Business
-- **Unified credit wallet** with shared org pool and per-user ceilings
-- **Entity caps** for Free tier (10 companies, 25 inventory units)
-- **Single-seat model** (collapsed from manager/agent dual-SKU)
+This rollout implements three subscription tiers (Free, Professional, Business) with:
 
-<Note>
-This plan addresses 12 identified gaps from the strategy document and has been code-verified against the current implementation.
-</Note>
+- **90-day evergreen trial** on Pro & Business (card-upfront)
+- **Unified credit wallet** (consolidated AI + messaging consumption)
+- **Single per-agent seat model** (manager/agent SKUs collapsed)
+- **Entity caps for Free tier** (10 companies, 25 units, 1GB storage)
+- **Open inventory** to all tiers (25-unit cap on Free)
 
-## Phase 0: Foundation Setup
+## Key Design Decisions
+
+<AccordionGroup>
+  <Accordion title="Tier Naming & Enum Strategy">
+    **Internal tier ID remains `professional`** but displays as "Pro" throughout UI. This avoids renaming the enum across:
+    - Database rows
+    - Stripe `metadata.tier`
+    - `OrganizationDto.subscriptionPlanTier`
+    - Frontend types
+    
+    **Starter tier is hard-removed** via data migration (repoint existing Starter subscriptions → Professional) before enum deletion.
+  </Accordion>
+
+  <Accordion title="Unified Credit Wallet Architecture">
+    - **Single org-level credit pool** replaces dual AI budget planes (`AiUsageAccount`, `AiCreditUsage`)
+    - **Per-user ceilings** cap individual consumption from shared pool (not reserved carve-outs)
+    - **Consumption order**: org pool first → personal credits fallback
+    - **Managed by** new `CreditMeteringService` facade (wraps `CreditService` + consolidated allocation table)
+    - **OpenAI-only** for billable traffic (per-org project key); Anthropic stays for eval judge only
+  </Accordion>
+
+  <Accordion title="Seat Model Consolidation">
+    Collapse manager/agent two-SKU model into **single per-agent seat SKU**:
+    - Repurpose existing `agentSeats*` columns as single seat counter
+    - Zero out `managerSeats*` (no DDL required)
+    - Backfill `agentSeatsTotal = manager + agent` for existing rows
+    - Replace dual Stripe line items on cutover
+  </Accordion>
+
+  <Accordion title="Entity Cap Enforcement">
+    **Count predicate**: non-imported AND `isDeleted = false` (archived rows still count)
+    
+    **Write enforcement split**:
+    - **Hard-block**: user-initiated creates (manual, create-from-listing, API) → 403
+    - **Soft-degrade**: inbound WhatsApp/Meta auto-create (create + emit over-limit signal)
+    - **Skip**: bulk-import path (doesn't count against cap)
+    
+    **Source-of-record**:
+    - Leads: reuse `Lead.leadSource === LeadSource.IMPORTED`
+    - Contact/Deal/Company: new `isImported` boolean (migration required)
+    - Auto-created companies during contact import MUST be stamped `isImported = true`
+  </Accordion>
+
+  <Accordion title="Budget Model & Allocation">
+    **Shared pool with per-user ceilings**:
+    - Effective user draw = `min(userLimit - userSpent, orgPoolRemaining)`
+    - Ceilings MAY oversubscribe (no Σ caps ≤ allowance validation)
+    - Remove `allowance - Σ budgets` math from agent budget allocation
+    
+    **Personal credit fallback**:
+    - Applies to ANY human actor (owner/admin included)
+    - Org-level-channel auto-reply has no human actor → no personal layer
+    
+    **Routing**:
+    - Owner/Admin + org-level-channel AI → org pool
+    - Regular agent assistant/Propilot + personal-channel AI → user allocation → personal credits
+  </Accordion>
+
+  <Accordion title="Access Control Split">
+    **Organization buying & subscription management**: `system.owner` only
+    - Route: `/settings/billing`
+    - Actions: view balance/usage, buy credits/storage, manage subscription
+    
+    **Per-user ceiling distribution**: admin-level (`SYSTEM_ADMIN`)
+    - Managed within org settings (no standalone `/settings/ai-credits` page)
+  </Accordion>
+</AccordionGroup>
+
+## Phase 0: Plan Definitions & Starter Removal
 
 <Steps>
-<Step title="Update plan definitions">
-Remove Starter tier and establish new tier structure:
-
-```typescript
-// Remove PlanTier.STARTER from enum
-enum PlanTier {
-  FREE = 'free',
-  PROFESSIONAL = 'professional', // Internal ID, displays as "Pro"
-  BUSINESS = 'business'
-}
-
-// Update plan definitions
-const PLAN_DEFINITIONS = {
-  free: {
-    aiCreditsPerMonth: 20, // Will increase to 2000 in Phase 6
-    maxCompanies: 10,
-    maxInventoryUnits: 25,
-    storageLimit: '5GB'
-  },
-  professional: {
-    aiCreditsPerMonth: 10000, // Per seat
-    storageLimit: '100GB'
-  },
-  business: {
-    aiCreditsPerMonth: 20000, // Per seat  
-    storageLimit: '500GB'
-  }
-}
-```
-</Step>
-
-<Step title="Data migration for Starter removal">
-```sql
--- Migrate existing Starter subscriptions to Professional
-UPDATE organization SET subscription_plan_tier = 'professional' 
-WHERE subscription_plan_tier = 'starter';
-
--- Remove Starter plan definition
-DELETE FROM subscription_plan WHERE tier = 'starter';
-```
-</Step>
-</Steps>
-
-## Phase 1: Webhook Infrastructure
-
-Extend Stripe webhook handling for one-time credit purchases and trial events.
-
-<CodeGroup>
-```typescript
-// webhook.service.ts
-async routeEvent(event: Stripe.Event) {
-  switch (event.type) {
-    // Existing subscription events...
-    case 'checkout.session.completed':
-      return this.handleCheckoutCompleted(event.data.object);
-    case 'customer.subscription.trial_will_end':
-      return this.handleTrialWillEnd(event.data.object);
-    // Add other credit pack events
-  }
-}
-
-private async handleCheckoutCompleted(session: Stripe.Checkout.Session) {
-  // Remove early return for mode !== 'subscription'
-  if (session.mode === 'subscription') {
-    return this.handleSubscriptionCheckout(session);
-  } else if (session.mode === 'payment') {
-    return this.handleCreditPackPurchase(session);
-  }
-}
-```
-
-```typescript
-// New credit pack purchase handler
-private async handleCreditPackPurchase(session: Stripe.Checkout.Session) {
-  const orgId = session.metadata.orgId;
-  const creditAmount = parseInt(session.metadata.creditAmount);
-  
-  await this.creditMeteringService.addCredits(orgId, creditAmount, {
-    source: 'PURCHASE',
-    stripeSessionId: session.id
-  });
-}
-```
-</CodeGroup>
-
-<Note>
-One-time credit pack refunds/disputes (charge.refunded) are out of scope for v1.
-</Note>
-
-## Phase 2: Trial System
-
-Implement 90-day evergreen trial for Pro & Business tiers.
-
-<Steps>
-<Step title="Update activation logic">
-```typescript
-// subscription.service.ts
-private buildActivationParamsFromCheckoutMetadata(session: Stripe.Checkout.Session) {
-  const tier = session.metadata.tier as PlanTier;
-  const isTrialEligible = tier !== PlanTier.FREE;
-  
-  return {
-    tier,
-    status: isTrialEligible ? SubscriptionStatus.TRIALING : SubscriptionStatus.ACTIVE,
-    trialEndsAt: isTrialEligible ? addDays(new Date(), 90) : null,
-    // ... other params
-  };
-}
-```
-</Step>
-
-<Step title="Add trial end notification">
-```typescript
-// Handle trial_will_end webhook
-private async handleTrialWillEnd(subscription: Stripe.Subscription) {
-  const orgId = this.getOrgIdFromSubscription(subscription);
-  
-  await this.notificationService.sendTrialEndingNotification(orgId, {
-    daysRemaining: 7, // Stripe sends this 7 days before
-    upgradeUrl: this.buildUpgradeUrl(orgId)
-  });
-}
-```
-</Step>
-</Steps>
-
-## Phase 3: Credit Metering Service
-
-Create unified credit wallet system with enforcement flags.
-
-<CodeGroup>
-```typescript
-// credit-metering.service.ts
-@Injectable()
-export class CreditMeteringService {
-  async getBalance(orgId: string): Promise<CreditBalance> {
-    if (!this.configService.isSubscriptionEnforcementEnabled()) {
-      return { available: Number.MAX_SAFE_INTEGER, total: Number.MAX_SAFE_INTEGER };
-    }
+  <Step title="Update PLAN_DEFINITIONS constant">
+    Define Free, Professional, Business tiers in `subscription/constants/subscription-plans.ts`:
     
-    const usage = await this.getUsage(orgId);
-    const allowance = await this.getAllowance(orgId);
-    
-    return {
-      available: Math.max(0, allowance.total - usage.consumed),
-      total: allowance.total,
-      consumed: usage.consumed
+    ```typescript
+    export const PLAN_DEFINITIONS: Record<PlanTier, PlanDefinition> = {
+      [PlanTier.FREE]: {
+        tier: PlanTier.FREE,
+        name: 'Free',
+        maxCompanies: 10,
+        maxInventoryUnits: 25,
+        storageGB: 1,
+        aiCreditsPerMonth: 2000, // per seat; ~100× rebase from current 20
+        maxAgentSeats: 5,
+        features: ['basic_crm', 'whatsapp_integration', 'basic_ai_assistant'],
+        priceMonthly: 0,
+        priceYearly: 0,
+      },
+      [PlanTier.PROFESSIONAL]: {
+        tier: PlanTier.PROFESSIONAL,
+        name: 'Pro',
+        maxCompanies: null, // unlimited
+        maxInventoryUnits: null,
+        storageGB: 10,
+        aiCreditsPerMonth: 10000,
+        maxAgentSeats: null,
+        features: ['advanced_workflows', 'custom_fields', 'api_access', 'priority_support'],
+        priceMonthly: 199, // AED
+        priceYearly: 1990,
+        trialDays: 90,
+      },
+      [PlanTier.BUSINESS]: {
+        tier: PlanTier.BUSINESS,
+        name: 'Business',
+        maxCompanies: null,
+        maxInventoryUnits: null,
+        storageGB: 25,
+        aiCreditsPerMonth: 25000,
+        maxAgentSeats: null,
+        features: ['white_label', 'dedicated_support', 'advanced_analytics', 'sso'],
+        priceMonthly: 499,
+        priceYearly: 4990,
+        trialDays: 90,
+      },
     };
-  }
+    ```
+    
+    <Warning>
+    Free tier `aiCreditsPerMonth: 2000` is an intentional ~100× rebase from current code's 20 credits. Land this before Phase 6's threshold math.
+    </Warning>
+  </Step>
 
-  async canSpend(orgId: string, amount: number): Promise<boolean> {
-    if (!this.configService.isSubscriptionEnforcementEnabled()) {
-      return true;
+  <Step title="Migrate Starter subscriptions to Professional">
+    Create migration `2026-XX-repoint-starter-to-professional.ts`:
+    
+    ```typescript
+    export class RepointStarterToProfessional implements Migration {
+      async up(db: MongoClient): Promise<void> {
+        // Repoint active Starter subscriptions
+        await db.collection('subscriptions').updateMany(
+          { tier: 'starter', status: { $in: ['active', 'trialing'] } },
+          { $set: { tier: 'professional' } }
+        );
+        
+        // Archive cancelled Starter subscriptions
+        await db.collection('subscriptions').updateMany(
+          { tier: 'starter', status: { $in: ['cancelled', 'expired'] } },
+          { $set: { tier: 'professional', isArchived: true } }
+        );
+        
+        // Delete Starter plan definition row
+        await db.collection('subscription_plans').deleteOne({ tier: 'starter' });
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Remove PlanTier.STARTER from enum">
+    Update `subscription/enums/plan-tier.enum.ts`:
+    
+    ```typescript
+    export enum PlanTier {
+      FREE = 'free',
+      PROFESSIONAL = 'professional',
+      BUSINESS = 'business',
+      // STARTER removed after data migration
     }
     
-    const balance = await this.getBalance(orgId);
-    return balance.available >= amount;
-  }
-}
-```
+    export const PLAN_TIER_ORDER = [
+      PlanTier.FREE,
+      PlanTier.PROFESSIONAL,
+      PlanTier.BUSINESS,
+    ];
+    ```
+  </Step>
 
-```typescript
-// Integration with existing credit system
-async addCredits(orgId: string, amount: number, context: CreditContext) {
-  // Consolidate into single credit store
-  await this.creditService.addCredits(orgId, CreditType.AI, amount);
-  
-  // Record purchase if applicable
-  if (context.source === 'PURCHASE') {
-    await this.creditPurchaseService.record(orgId, amount, context);
-  }
-}
-```
-</CodeGroup>
+  <Step title="Audit TypeScript references">
+    Search codebase for `PlanTier.STARTER`, `tier: 'starter'`, and handle references (likely display logic, tests).
+  </Step>
+</Steps>
 
-<Warning>
-New gates must respect `isSubscriptionEnforcementEnabled()` like existing legacy gates.
-</Warning>
-
-## Phase 4: Entity Caps
-
-Implement company and inventory limits for Free tier.
+## Phase 1: Stripe Products & One-Time Credit Packs
 
 <Steps>
-<Step title="Add isImported columns">
-```sql
--- Migration for source-of-record tracking
-ALTER TABLE company ADD COLUMN is_imported BOOLEAN DEFAULT FALSE;
-ALTER TABLE deal ADD COLUMN is_imported BOOLEAN DEFAULT FALSE;
--- Contact already has this via existing lead import flow
-```
-</Step>
+  <Step title="Create Stripe products for three tiers">
+    Via Stripe Dashboard or API, create:
+    - **PropWise Free** (tier: `free`, seats: N/A)
+    - **PropWise Pro** (tier: `professional`, per-seat monthly/yearly prices in AED)
+    - **PropWise Business** (tier: `business`, per-seat monthly/yearly prices)
+    
+    Record product/price IDs in `config/stripe-ids.json`:
+    
+    ```json
+    {
+      "products": {
+        "professional": "prod_XXX",
+        "business": "prod_YYY"
+      },
+      "prices": {
+        "professional_monthly": "price_AAA",
+        "professional_yearly": "price_BBB",
+        "business_monthly": "price_CCC",
+        "business_yearly": "price_DDD"
+      }
+    }
+    ```
+  </Step>
 
-<Step title="Implement cap enforcement">
-```typescript
-// plan-limits.service.ts
-async enforceCompanyLimit(orgId: string): Promise<void> {
-  const tier = await this.subscriptionService.getOrgTier(orgId);
-  if (tier !== PlanTier.FREE) return;
+  <Step title="Create one-time credit pack products">
+    Stripe products for credit top-ups (mode: `payment`):
+    - **500 AI Credits** → 25 AED
+    - **2,000 AI Credits** → 90 AED
+    - **5,000 AI Credits** → 200 AED
+    
+    Metadata: `{ type: 'credit_pack', credits: 500 }`
+    
+    Add to `stripe-ids.json`:
+    
+    ```json
+    {
+      "creditPacks": {
+        "credits_500": "price_EEE",
+        "credits_2000": "price_FFF",
+        "credits_5000": "price_GGG"
+      }
+    }
+    ```
+  </Step>
 
-  const count = await this.companyService.count({
-    organizationId: orgId,
-    isDeleted: false,
-    // Note: archived rows still count toward cap
-    isImported: false
-  });
+  <Step title="Add webhook routing for checkout.session.completed (payment mode)">
+    Extend `StripeWebhookService.routeEvent()` to handle one-time purchases:
+    
+    ```typescript
+    private async routeEvent(event: Stripe.Event): Promise<void> {
+      switch (event.type) {
+        case 'checkout.session.completed':
+          const session = event.data.object as Stripe.Checkout.Session;
+          if (session.mode === 'subscription') {
+            return this.handleCheckoutCompleted(session);
+          } else if (session.mode === 'payment') {
+            return this.handleOneTimePurchase(session); // NEW
+          }
+          break;
+        // ... existing subscription events
+      }
+    }
+    ```
+    
+    <Note>
+    Current `handleCheckoutCompleted` early-returns unless `mode === 'subscription'`. One-time credit packs need NET-NEW routing.
+    </Note>
+  </Step>
 
-  if (count >= 10) {
-    throw new PlanLimitExceededError('Company limit reached for Free plan');
-  }
-}
-```
-</Step>
+  <Step title="Implement handleOneTimePurchase">
+    Parse metadata, credit the org's unified wallet:
+    
+    ```typescript
+    private async handleOneTimePurchase(session: Stripe.Checkout.Session): Promise<void> {
+      const orgId = session.metadata.organizationId;
+      const credits = parseInt(session.metadata.credits, 10);
+      const packType = session.metadata.type; // 'credit_pack' or 'storage_pack'
+      
+      if (packType === 'credit_pack') {
+        await this.creditMeteringService.addPurchasedCredits(orgId, {
+          amount: credits,
+          stripeSessionId: session.id,
+          userId: session.metadata.userId, // buyer
+        });
+      }
+      // storage_pack handling in Phase 3
+    }
+    ```
+    
+    <Info>
+    Credit-pack refunds (`charge.refunded`) are **out of scope** for v1. Document as deferred edge case.
+    </Info>
+  </Step>
+</Steps>
 
-<Step title="Update import services">
-```typescript
-// contact-import.service.ts
-async importContact(data: ContactImportData) {
-  const contact = await this.contactService.create({
-    ...data,
-    leadSource: LeadSource.IMPORTED // Reuse existing field
-  });
+## Phase 2: Trial Mechanics (90-Day Card-Upfront)
 
-  // Auto-created companies must be marked as imported
-  if (data.companyName && !data.existingCompanyId) {
-    await this.companyService.create({
-      name: data.companyName,
-      isImported: true // Critical for Free tier cap
+<Steps>
+  <Step title="Configure trial_period_days in Stripe checkout">
+    Update `SubscriptionService.createCheckoutSession()`:
+    
+    ```typescript
+    const session = await this.stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: seats }],
+      subscription_data: {
+        trial_period_days: PLAN_DEFINITIONS[tier].trialDays || 0, // 90 for Pro/Business
+        metadata: { organizationId, tier },
+      },
+      payment_method_collection: 'always', // card-upfront
+      // ...
     });
-  }
-}
-```
-</Step>
+    ```
+  </Step>
+
+  <Step title="Derive TRIALING status in buildActivationParamsFromCheckoutMetadata">
+    Single chokepoint for both webhook and `fulfillCheckoutSession`:
+    
+    ```typescript
+    private buildActivationParamsFromCheckoutMetadata(
+      subscription: Stripe.Subscription,
+      metadata: Record<string, string>
+    ): ActivationParams {
+      const status = subscription.status === 'trialing' 
+        ? SubscriptionStatus.TRIALING 
+        : SubscriptionStatus.ACTIVE;
+      
+      const trialEndsAt = subscription.trial_end 
+        ? new Date(subscription.trial_end * 1000) 
+        : null;
+      
+      return {
+        organizationId: metadata.organizationId,
+        tier: metadata.tier as PlanTier,
+        stripeSubscriptionId: subscription.id,
+        status,
+        trialEndsAt,
+        agentSeatsTotal: subscription.items.data[0].quantity,
+        // ...
+      };
+    }
+    ```
+    
+    <Check>
+    This shared builder ensures the webhook and direct-fulfillment paths cannot diverge on trial logic.
+    </Check>
+  </Step>
+
+  <Step title="Add trialEndsAt to SubscriptionUsage entity">
+    Migration `2026-XX-add-trial-ends-at.ts`:
+    
+    ```typescript
+    @Entity()
+    export class SubscriptionUsage {
+      @Property({ type: 'timestamp', nullable: true })
+      trialEndsAt?: Date;
+      
+      @Property({ type: 'string', length: 20 })
+      status: SubscriptionStatus; // TRIALING | ACTIVE | PAST_DUE | ...
+    }
+    ```
+  </Step>
+
+  <Step title="Add webhook handler for customer.subscription.trial_will_end">
+    Stripe fires this **3 days before trial expiry**:
+    
+    ```typescript
+    case 'customer.subscription.trial_will_end':
+      const sub = event.data.object as Stripe.Subscription;
+      await this.notificationService.sendTrialExpiryWarning(
+        sub.metadata.organizationId,
+        new Date(sub.trial_end * 1000)
+      );
+      break;
+    ```
+    
+    <Note>
+    Current `routeEvent` only handles 5 subscription events. `trial_will_end` is net-new.
+    </Note>
+  </Step>
+
+  <Step title="Expose trialEndsAt in OrganizationDto">
+    Update `subscription/dto/organization.dto.ts`:
+    
+    ```typescript
+    export class OrganizationDto {
+      @ApiProperty({ nullable: true })
+      trialEndsAt?: Date;
+      
+      @ApiProperty({ enum: SubscriptionStatus })
+      subscriptionStatus: SubscriptionStatus;
+    }
+    ```
+  </Step>
 </Steps>
 
-<Info>
-Entity caps count non-imported AND isDeleted = false entries. Archived rows still count toward the cap.
-</Info>
+## Phase 3: Storage Caps & One-Time +25GB Packs
 
-## Phase 5: AI Budget Integration
+<Steps>
+  <Step title="Add storageGB to PLAN_DEFINITIONS">
+    Already included in Phase 0 definitions (Free: 1GB, Pro: 10GB, Business: 25GB).
+  </Step>
 
-Replace existing AI budget system with unified credit metering.
+  <Step title="Create Stripe product for +25GB storage packs">
+    One-time purchase (mode: `payment`):
+    - **+25GB Storage** → 50 AED
+    - Metadata: `{ type: 'storage_pack', gigabytes: 25 }`
+  </Step>
+
+  <Step title="Extend SubscriptionUsage with storage tracking">
+    Migration `2026-XX-add-storage-fields.ts`:
+    
+    ```typescript
+    @Entity()
+    export class SubscriptionUsage {
+      @Property({ type: 'decimal', precision: 12, scale: 6, default: 0 })
+      storageUsedGB: number;
+      
+      @Property({ type: 'int', default: 0 })
+      storagePurchasedGB: number; // one-time pack purchases
+    }
+    ```
+  </Step>
+
+  <Step title="Implement StorageGuardService">
+    New service in `subscription/services/storage-guard.service.ts`:
+    
+    ```typescript
+    @Injectable()
+    export class StorageGuardService {
+      async assertCanUpload(orgId: string, fileSizeMB: number): Promise<void> {
+        if (!this.configService.isSubscriptionEnforcementEnabled()) {
+          return; // enforcement OFF → allow
+        }
+        
+        const usage = await this.getUsage(orgId);
+        const planLimit = PLAN_DEFINITIONS[usage.tier].storageGB;
+        const totalAllowance = planLimit + usage.storagePurchasedGB;
+        const projectedUsage = usage.storageUsedGB + (fileSizeMB / 1024);
+        
+        if (projectedUsage > totalAllowance) {
+          throw new StorageLimitExceededError(totalAllowance, projectedUsage);
+        }
+      }
+      
+      async incrementUsage(orgId: string, fileSizeMB: number): Promise<void> {
+        await this.subscriptionUsageRepository.increment(
+          { organizationId: orgId },
+          'storageUsedGB',
+          fileSizeMB / 1024
+        );
+      }
+    }
+    ```
+    
+    <Warning>
+    Must respect `isSubscriptionEnforcementEnabled()` like legacy gates. Define what balance reads return when enforcement is OFF (suggest: `Infinity` or a sentinel).
+    </Warning>
+  </Step>
+
+  <Step title="Integrate guards into file-upload endpoints">
+    Wrap `FileService.upload()` / `DocumentService.upload()`:
+    
+    ```typescript
+    async upload(file: Express.Multer.File, orgId: string): Promise<Document> {
+      const fileSizeMB = file.size / (1024 * 1024);
+      await this.storageGuard.assertCanUpload(orgId, fileSizeMB);
+      
+      const doc = await this.s3Service.upload(file);
+      await this.storageGuard.incrementUsage(orgId, fileSizeMB);
+      return doc;
+    }
+    ```
+    
+    **Soft-degrade inbound messaging media**: catch `StorageLimitExceededError`, log warning, emit telemetry, but allow the message creation (don't drop live inbound demand).
+  </Step>
+
+  <Step title="Handle storage_pack purchases in webhook">
+    Extend `handleOneTimePurchase` from Phase 1:
+    
+    ```typescript
+    if (packType === 'storage_pack') {
+      const gigabytes = parseInt(session.metadata.gigabytes, 10);
+      await this.subscriptionUsageRepository.increment(
+        { organizationId: orgId },
+        'storagePurchasedGB',
+        gigabytes
+      );
+    }
+    ```
+  </Step>
+</Steps>
+
+## Phase 4: Entity Caps (Free Tier: 10 Companies, 25 Units)
+
+<Steps>
+  <Step title="Add isImported to Contact, Deal, Company entities">
+    Migration `2026-XX-add-is-imported.ts`:
+    
+    ```typescript
+    // Contact
+    @Property({ type: 'boolean', default: false })
+    isImported: boolean = false;
+    
+    // Deal
+    @Property({ type: 'boolean', default: false })
+    isImported: boolean = false;
+    
+    // Company
+    @Property({ type: 'boolean', default: false })
+    isImported: boolean = false;
+    ```
+    
+    <Info>
+    **Rationale**: Leads already use `Lead.leadSource === LeadSource.IMPORTED`. Contact/Deal/Company have no source field, so they need the new boolean. Auto-created companies during contact import MUST be stamped `isImported = true`.
+    </Info>
+  </Step>
+
+  <Step title="Update import services to set isImported = true">
+    Code-verified: only `lead-import.service.ts` + `contact-import.service.ts` exist.
+    
+    **LeadImportService**: already sets `leadSource: LeadSource.IMPORTED` (no change needed).
+    
+    **ContactImportService**:
+    
+    ```typescript
+    async importContacts(file: Express.Multer.File, orgId: string): Promise<void> {
+      const contacts = await this.parseCSV(file);
+      
+      for (const row of contacts) {
+        const contact = this.contactRepository.create({
+          ...row,
+          isImported: true, // NEW
+          organizationId: orgId,
+        });
+        
+        // Auto-create company if name provided
+        if (row.companyName) {
+          const company = await this.companyRepository.findOneOrCreate(
+            { name: row.companyName, organizationId: orgId },
+            { isImported: true } // CRITICAL: imported company flag
+          );
+          contact.company = company;
+        }
+        
+        await this.contactRepository.persistAndFlush(contact);
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Implement EntityCapGuardService">
+    New service in `subscription/services/entity-cap-guard.service.ts`:
+    
+    ```typescript
+    @Injectable()
+    export class EntityCapGuardService {
+      async assertCanCreateCompany(orgId: string): Promise<void> {
+        if (!this.configService.isSubscriptionEnforcementEnabled()) {
+          return;
+        }
+        
+        const usage = await this.getUsage(orgId);
+        if (usage.tier !== PlanTier.FREE) return; // only Free has cap
+        
+        const count = await this.companyRepository.count({
+          organizationId: orgId,
+          isDeleted: false,
+          isImported: false, // exclude imported
+          // NO isArchived filter (archived still counts)
+        });
+        
+        if (count >= PLAN_DEFINITIONS[PlanTier.FREE].maxCompanies) {
+          throw new EntityCapExceededError('company', 10);
+        }
+      }
+      
+      async assertCanCreateInventoryUnit(orgId: string): Promise<void> {
+        // similar pattern, check maxInventoryUnits
+      }
+    }
+    ```
+    
+    <Check>
+    Count predicate: non-imported AND `isDeleted = false` (archived rows still count toward cap).
+    </Check>
+  </Step>
+
+  <Step title="Integrate guards into CRM write paths">
+    **Hard-block user-initiated creates** (manual, create-from-listing, API):
+    
+    ```typescript
+    @Post('companies')
+    async createCompany(@Body() dto: CreateCompanyDto, @OrgId() orgId: string) {
+      await this.entityCapGuard.assertCanCreateCompany(orgId);
+      return this.companyService.create(dto, orgId);
+    }
+    ```
+    
+    **Soft-degrade inbound auto-creates** (WhatsApp/Meta lead creation):
+    
+    ```typescript
+    async createLeadFromInbound(phone: string, orgId: string): Promise<Lead> {
+      try {
+        await this.entityCapGuard.assertCanCreateLead(orgId);
+      } catch (e) {
+        this.logger.warn(`Free org ${orgId} exceeded lead cap, creating anyway`);
+        this.metricsService.increment('subscription.entity_cap.soft_degrade.lead');
+      }
+      return this.leadRepository.create({ phone, organizationId: orgId });
+    }
+    ```
+    
+    **Skip bulk-import path** (already handled by `isImported` exclusion).
+  </Step>
+
+  <Step title="Add maxCompanies/maxInventoryUnits to SubscriptionUsage">
+    Denormalize for fast reads (avoid join on every count):
+    
+    ```typescript
+    @Property({ type: 'int', nullable: true })
+    maxCompanies?: number; // null = unlimited
+    
+    @Property({ type: 'int', nullable: true })
+    maxInventoryUnits?: number;
+    ```
+    
+    Populate in `activateSubscription`:
+    
+    ```typescript
+    usage.maxCompanies = PLAN_DEFINITIONS[params.tier].maxCompanies;
+    usage.maxInventoryUnits = PLAN_DEFINITIONS[params.tier].maxInventoryUnits;
+    ```
+  </Step>
+</Steps>
+
+## Phase 5: Unified Credit Wallet & Consumption Tracking
 
 <Warning>
-This phase has a forward dependency on Phase 9's seat count consolidation. Execute Phase 9 first.
+**Dependency**: Phase 5.4's per-seat allowance math requires `getSeatCount(orgId)` from Phase 9. Execute Phase 9's seat consolidation BEFORE landing Phase 5.4.
 </Warning>
 
 <Steps>
-<Step title="Update AiUsageGuardService">
-```typescript
-// Replace existing budget logic
-class AiUsageGuardService {
-  async assertCanCallModel(context: SpendContext, estimatedCost: number) {
-    // This is REPLACING existing gates, not adding new ones
-    const canSpend = await this.creditMeteringService.canSpend(
-      context.orgId, 
-      estimatedCost
-    );
+  <Step title="Create CreditMeteringService facade">
+    New service in `subscription/services/credit-metering.service.ts` (wraps `CreditService` + consolidated allocation table):
     
-    if (!canSpend) {
-      throw new AiBudgetExceededError('Insufficient AI credits');
+    ```typescript
+    @Injectable()
+    export class CreditMeteringService {
+      constructor(
+        private creditService: CreditService,
+        private subscriptionUsageRepo: Repository<SubscriptionUsage>,
+        private userCreditAllocationRepo: Repository<UserCreditAllocation>,
+      ) {}
+      
+      async getOrgBalance(orgId: string): Promise<CreditBalance> {
+        if (!this.configService.isSubscriptionEnforcementEnabled()) {
+          return { available: Infinity, used: 0 }; // enforcement OFF
+        }
+        
+        const usage = await this.subscriptionUsageRepo.findOne({ organizationId: orgId });
+        const allowance = this.calculateMonthlyAllowance(usage); // Phase 5.4
+        const purchased = await this.creditService.getPurchasedCredits(orgId);
+        const spent = usage.aiCreditsUsed; // numeric(12,6), currently 0
+        
+        return {
+          available: allowance + purchased - spent,
+          used: spent,
+          allowance,
+          purchased,
+        };
+      }
+      
+      async getUserBalance(userId: string, orgId: string): Promise<CreditBalance> {
+        const orgBalance = await this.getOrgBalance(orgId);
+        const allocation = await this.userCreditAllocationRepo.findOne({ userId, orgId });
+        const personalPurchased = await this.creditService.getUserPurchasedCredits(userId);
+        
+        const userOrgSpent = allocation?.spent || 0;
+        const userLimit = allocation?.limit || Infinity;
+        const effectiveOrgDraw = Math.min(userLimit - userOrgSpent, orgBalance.available);
+        
+        return {
+          available: effectiveOrgDraw + personalPurchased,
+          orgPoolAvailable: effectiveOrgDraw,
+          personalCredits: personalPurchased,
+          used: userOrgSpent,
+          limit: userLimit,
+        };
+      }
     }
-  }
-}
-```
-</Step>
+    ```
+  </Step>
 
-<Step title="Consolidate USD ledgers">
-```typescript
-// Migrate AiUsageAccount + AiCreditUsage to unified store
-async migrateUsdLedgers() {
-  // AiUsageAccount and AiCreditUsage contain the live USD data
-  // SubscriptionUsage.aiCreditsUsed is numeric but has no writer (effectively 0)
-  
-  const accounts = await this.aiUsageAccountRepository.findAll();
-  for (const account of accounts) {
-    await this.creditMeteringService.setBalance(account.orgId, account.balance);
-  }
-}
-```
-</Step>
-
-<Step title="Per-seat allowance calculation">
-```typescript
-// Depends on Phase 9's getSeatCount
-async getAllowance(orgId: string): Promise<CreditAllowance> {
-  const plan = await this.subscriptionService.getOrgPlan(orgId);
-  const seatCount = await this.getSeatCount(orgId); // From Phase 9
-  
-  return {
-    total: plan.aiCreditsPerMonth * seatCount,
-    perSeat: plan.aiCreditsPerMonth
-  };
-}
-```
-</Step>
-
-<Step title="Update agent budget service">
-```typescript
-// ai-agent-runtime.service.ts - Update 4 SUBSCRIPTION_GATE markers
-// Lines :225, :1681, :1735, :1873
-async executeAgent(context: AgentContext) {
-  if (context.requiresBudget) {
-    await this.creditMeteringService.assertCanSpend(
-      context.orgId, 
-      context.estimatedCost
-    );
-  }
-  // ... existing logic
-}
-```
-</Step>
-
-<Step title="Unit valuation charges">
-```typescript
-// 300 credits per valuation call, waive prompt charge
-async processValuation(context: SpendContext) {
-  const valuationCost = 300 * context.valuationCount;
-  await this.creditMeteringService.deductCredits(context.orgId, valuationCost);
-  
-  // Waive this turn's Propilot/prompt charge
-  context.waivePromptCharge = true;
-}
-```
-</Step>
-</Steps>
-
-## Phase 6: Credit Thresholds & Cost Mapping
-
-<Steps>
-<Step title="Update Free tier allowance">
-```typescript
-// Increase from 20 to 2000 credits (100x rebase)
-const FREE_PLAN_CREDITS = 2000; // aiCreditsPerMonth
-```
-</Step>
-
-<Step title="Implement cost mapping">
-```typescript
-// Cost mapping for OpenAI model usage
-const OPENAI_COST_MAP = {
-  'gpt-4': { input: 10, output: 30 }, // credits per 1k tokens
-  'gpt-3.5-turbo': { input: 1, output: 2 },
-  'text-embedding-3-small': { input: 0.1 }
-};
-```
-</Step>
-
-<Step title="Usage exhaustion contract">
-Document in `AI_ASSISTANT_MODULE_SPECIFICATION.md`:
-```markdown
-## Credit Exhaustion Handling
-
-When org credits are exhausted:
-1. Streaming chat returns HTTP 402 Payment Required
-2. Response includes current balance and upgrade URL
-3. Client shows "Credits exhausted" modal with top-up options
-```
-</Step>
-</Steps>
-
-<Tip>
-The cost mapping converts OpenAI's true-dollar telemetry into credits for customer billing.
-</Tip>
-
-## Phase 7: Storage Limits
-
-<Steps>
-<Step title="Implement storage enforcement">
-```typescript
-// storage-limit.service.ts
-async enforceStorageLimit(orgId: string, uploadSize: number): Promise<void> {
-  if (!this.configService.isSubscriptionEnforcementEnabled()) {
-    return; // Honor enforcement flag
-  }
-
-  const plan = await this.subscriptionService.getOrgPlan(orgId);
-  const currentUsage = await this.getStorageUsage(orgId);
-  
-  if (currentUsage + uploadSize > plan.storageLimit) {
-    throw new StorageLimitExceededError('Storage limit exceeded');
-  }
-}
-```
-</Step>
-
-<Step title="Update upload handlers">
-```typescript
-// Hard block user uploads, soft degrade messaging media
-async handleUserUpload(file: File, orgId: string) {
-  await this.storageLimitService.enforceStorageLimit(orgId, file.size);
-  // Proceed with upload
-}
-
-async handleMessagingMedia(media: Media, orgId: string) {
-  try {
-    await this.storageLimitService.enforceStorageLimit(orgId, media.size);
-    // Process normally
-  } catch (StorageLimitExceededError) {
-    // Emit over-limit signal but don't drop inbound demand
-    this.eventBus.emit('storage.limit.exceeded', { orgId, mediaId: media.id });
-  }
-}
-```
-</Step>
-</Steps>
-
-## Phase 8: Checkout & Billing Integration
-
-<Steps>
-<Step title="Update checkout flows">
-```typescript
-// Handle plan changes and credit purchases
-async createCheckoutSession(params: CheckoutParams) {
-  const session = await this.stripe.checkout.sessions.create({
-    mode: params.type === 'subscription' ? 'subscription' : 'payment',
-    line_items: this.buildLineItems(params),
-    metadata: {
-      orgId: params.orgId,
-      tier: params.tier,
-      action: params.action // 'upgrade', 'downgrade', 'credit_purchase'
+  <Step title="Create UserCreditAllocation entity">
+    New table for per-user ceiling tracking:
+    
+    ```typescript
+    @Entity()
+    export class UserCreditAllocation {
+      @PrimaryKey({ type: 'uuid' })
+      id: string;
+      
+      @ManyToOne(() => User)
+      user: User;
+      
+      @Property({ type: 'uuid' })
+      organizationId: string;
+      
+      @Property({ type: 'decimal', precision: 12, scale: 6, nullable: true })
+      limit?: number; // null = no user ceiling
+      
+      @Property({ type: 'decimal', precision: 12, scale: 6, default: 0 })
+      spent: number; // user's org-pool consumption this period
+      
+      @Property()
+      @Index()
+      periodStartDate: Date;
     }
-  });
-  
-  return session;
-}
-```
-</Step>
+    ```
+  </Step>
 
-<Step title="Implement billing portal">
-```typescript
-// Stripe billing portal for subscription management  
-async createBillingPortalSession(orgId: string) {
-  const customer = await this.getStripeCustomer(orgId);
-  
-  return this.stripe.billingPortal.sessions.create({
-    customer: customer.id,
-    return_url: `${this.configService.frontendUrl}/settings/billing`
-  });
-}
-```
-</Step>
+  <Step title="Create CreditPurchase entity for one-time packs">
+    Track purchased credits separately from allowance:
+    
+    ```typescript
+    @Entity()
+    export class CreditPurchase {
+      @PrimaryKey({ type: 'uuid' })
+      id: string;
+      
+      @Property({ type: 'uuid' })
+      organizationId: string;
+      
+      @Property({ type: 'uuid', nullable: true })
+      userId?: string; // null = org-level purchase
+      
+      @Property({ type: 'decimal', precision: 12, scale: 6 })
+      amount: number;
+      
+      @Property({ type: 'decimal', precision: 12, scale: 6, default: 0 })
+      used: number;
+      
+      @Property({ type: 'string' })
+      stripeSessionId: string;
+      
+      @Property()
+      purchasedAt: Date = new Date();
+    }
+    ```
+  </Step>
+
+  <Step title="Implement per-seat allowance calculation">
+    In `CreditMeteringService.calculateMonthlyAllowance()`:
+    
+    ```typescript
+    private async calculateMonthlyAllowance(usage: SubscriptionUsage): Promise<number> {
+      const planDef = PLAN_DEFINITIONS[usage.tier];
+      const seatCount = await this.subscriptionService.getSeatCount(usage.organizationId);
+      return planDef.aiCreditsPerMonth * seatCount;
+    }
+    ```
+    
+    <Note>
+    Requires `getSeatCount(orgId)` from Phase 9. Execute Phase 9 BEFORE this step.
+    </Note>
+  </Step>
+
+  <Step title="Consolidate AiUsageAccount + AiCreditUsage into unified store">
+    **Migration strategy**: these tables currently track USD, not credits. The migration:
+    
+    1. Zero out `AiUsageAccount.creditsUsed` + `AiCreditUsage.creditsUsed` (reset to 0)
+    2. Backfill `SubscriptionUsage.aiCreditsUsed` from new credit-denominated ledger
+    3. Archive `AiUsageAccount` + `AiCreditUsage` tables (keep for telemetry, stop writing)
+    
+    ```typescript
+    // Migration: 2026-XX-consolidate-ai-credit-stores.ts
+    export class ConsolidateAiCreditStores implements Migration {
+      async up(db: MongoClient): Promise<void> {
+        // Zero out USD-denominated ledgers
+        await db.collection('ai_usage_accounts').updateMany({}, { $set: { creditsUsed: 0 } });
+        await db.collection('ai_credit_usage').updateMany({}, { $set: { creditsUsed: 0 } });
+        
+        // New credit tracking goes to SubscriptionUsage.aiCreditsUsed
+        // (no backfill needed since we're resetting)
+      }
+    }
+    ```
+    
+    <Info>
+    Current fact: `SubscriptionUsage.aiCreditsUsed` is `numeric(12,6)` but has no live writer (effectively 0). The numeric→credits migration targets the two USD ledger tables.
+    </Info>
+  </Step>
+
+  <Step title="Replace AiUsageGuardService with CreditMeteringService">
+    **Current state**: `AiUsageGuardService.assertCanCallModel` already throws `AiBudgetExceededError` to BLOCK calls (not just telemetry). This is a **replacement**, not a new gate.
+    
+    Replace the guard logic:
+    
+    ```typescript
+    // OLD (ai-module)
+    await this.aiUsageGuard.assertCanCallModel(orgId, estimatedCost);
+    
+    // NEW (subscription-module)
+    await this.creditMetering.assertHasBalance(orgId, userId, estimatedCredits);
+    ```
+    
+    `CreditMeteringService.assertHasBalance()`:
+    
+    ```typescript
+    async assertHasBalance(orgId: string, userId: string, credits: number): Promise<void> {
+      if (!this.configService.isSubscriptionEnforcementEnabled()) {
+        return;
+      }
+      
+      const balance = await this.getUserBalance(userId, orgId);
+      if (balance.available < credits) {
+        throw new InsufficientCreditsError(balance.available, credits);
+      }
+    }
+    ```
+    
+    <Warning>
+    Must preserve behavior-equivalence with existing gate (blocks on insufficient balance). This is a critical replacement, not a greenfield feature.
+    </Warning>
+  </Step>
+
+  <Step title="Update ai-agent-runtime.service.ts spend tracking">
+    **Current state**: `ai-agent-runtime.service.ts` has FOUR `SUBSCRIPTION_GATE` block markers (`:225/:1681/:1735/:1873`), not three.
+    
+    Replace all four with `CreditMeteringService` calls:
+    
+    ```typescript
+    // Line 225: pre-call guard
+    await this.creditMetering.assertHasBalance(orgId, userId, estimatedCredits);
+    
+    // Lines 1681/1735/1873: post-call ledger
+    await this.creditMetering.incrementSpend(orgId, userId, actualCredits);
+    ```
+    
+    Remove the agent-side `AiAgentBudgetGuardService` guard + `incrementSpend` ledger (already live) in favor of unified metering.
+  </Step>
+
+  <Step title="Implement OpenAI cost map (USD → credits)">
+    Define conversion rates in `subscription/constants/openai-cost-map.ts`:
+    
+    ```typescript
+    export const OPENAI_COST_MAP: Record<string, { inputPer1k: number; outputPer1k: number }> = {
+      'gpt-4o': { inputPer1k: 5, outputPer1k: 15 },           // $0.005/$0.015 per 1k tokens
+      'gpt-4o-mini': { inputPer1k: 0.15, outputPer1k: 0.6 },  // $0.00015/$0.0006
+      'gpt-4-turbo': { inputPer1k: 10, outputPer1k: 30 },
+      'text-embedding-3-small': { inputPer1k: 0.02, outputPer1k: 0 },
+    };
+    
+    export function calculateCredits(model: string, inputTokens: number, outputTokens: number): number {
+      const rates = OPENAI_COST_MAP[model] || { inputPer1k: 10, outputPer1k: 30 }; // fallback
+      return (inputTokens / 1000) * rates.inputPer1k + (outputTokens / 1000) * rates.outputPer1k;
+    }
+    ```
+  </Step>
+
+  <Step title="Add unit valuation credit charge (300 credits/call)">
+    In `PropertyValuationService`:
+    
+    ```typescript
+    async valuateProperty(unitId: string, userId: string, orgId: string): Promise<Valuation> {
+      const VALUATION_COST = 300;
+      await this.creditMetering.assertHasBalance(orgId, userId, VALUATION_COST);
+      
+      const result = await this.callValuationModel(unitId);
+      await this.creditMetering.incrementSpend(orgId, userId, VALUATION_COST);
+      
+      return result;
+    }
+    ```
+    
+    <Info>
+    **Per-turn prompt-charge waiver**: when a Propilot turn triggers valuation, waive that turn's prompt charge (300 credits covers both). This is assistant-orchestrator-specific; N/A on the agent path unless the agent gains a valuation tool.
+    </Info>
+  </Step>
+
+  <Step title="Collapse CreditType.MESSAGING into CreditType.AI">
+    Enum simplification (messaging auto-reply draws from AI balance):
+    
+    ```typescript
+    export enum CreditType {
+      AI = 'ai',
+      // MESSAGING removed
+    }
+    ```
+    
+    Update `WhatsAppAutoReplyService` to charge AI credits:
+    
+    ```typescript
+    async sendAutoReply(messageId: string, orgId: string): Promise<void> {
+      const cost = this.estimateReplyCost(messageId);
+      await this.creditMetering.assertHasBalance(orgId, null, cost); // null userId = org-level
+      
+      const reply = await this.generateReply(messageId);
+      await this.creditMetering.incrementSpend(orgId, null, cost);
+      await this.whatsappService.send(reply);
+    }
+    ```
+  </Step>
 </Steps>
 
-## Phase 9: Seat Count Consolidation
-
-Collapse the dual manager/agent seat model into single per-agent seats.
+## Phase 6: Streaming Exhaustion & Credit Cost Transparency
 
 <Steps>
-<Step title="Consolidate seat counting">
-```typescript
-// Replace countSeatsByType with unified getSeatCount
-async getSeatCount(orgId: string): Promise<number> {
-  // Repurpose agentSeats* columns as total seat counter
-  const usage = await this.subscriptionUsageRepository.findOne({ 
-    organizationId: orgId 
-  });
-  
-  return usage?.agentSeatsTotal || 0;
-}
-```
-</Step>
+  <Step title="Define StreamExhaustedError">
+    New error in `subscription/errors/stream-exhausted.error.ts`:
+    
+    ```typescript
+    export class StreamExhaustedError extends Error {
+      constructor(
+        public readonly remainingCredits: number,
+        public readonly requiredCredits: number,
+        public readonly turnsSoFar: number,
+      ) {
+        super(`Insufficient credits to continue streaming (${remainingCredits} < ${requiredCredits})`);
+      }
+    }
+    ```
+  </Step>
 
-<Step title="Backfill existing data">
-```sql
--- Migrate existing split counters to unified model
-UPDATE subscription_usage 
-SET agent_seats_total = manager_seats_total + agent_seats_total,
-    manager_seats_total = 0
-WHERE manager_seats_total > 0;
-```
-</Step>
+  <Step title="Implement per-turn balance check in streaming orchestrator">
+    In `ai-assistant/services/streaming-orchestrator.service.ts`:
+    
+    ```typescript
+    async *streamResponse(prompt: string, context: ChatContext): AsyncGenerator<StreamChunk> {
+      for await (const chunk of this.openaiService.stream(prompt, context)) {
+        // Check balance BEFORE yielding (soft guard, not hard block)
+        const balance = await this.creditMetering.getUserBalance(context.userId, context.orgId);
+        const estimatedNextTurn = this.estimateTurnCost(context.model);
+        
+        if (balance.available < estimatedNextTurn) {
+          yield { type: 'exhausted', remainingCredits: balance.available };
+          throw new StreamExhaustedError(balance.available, estimatedNextTurn, context.turnsSoFar);
+        }
+        
+        yield chunk;
+      }
+    }
+    ```
+  </Step>
 
-<Step title="Update Stripe line items">
-```typescript
-// Replace dual SKU with single per-agent seat
-const lineItems = [{
-  price: this.getAgentSeatPrice(tier),
-  quantity: seatCount // Single line item
-}];
-```
-</Step>
+  <Step title="Add GET /me/credits endpoint">
+    New endpoint in `subscription/controllers/credits.controller.ts`:
+    
+    ```typescript
+    @Get('me/credits')
+    @UseGuards(JwtAuthGuard)
+    async getMyCredits(@CurrentUser() user: User): Promise<CreditBalanceDto> {
+      const balance = await this.creditMetering.getUserBalance(user.id, user.organizationId);
+      const costMap = OPENAI_COST_MAP; // expose for frontend
+      
+      return {
+        available: balance.available,
+        orgPoolAvailable: balance.orgPoolAvailable,
+        personalCredits: balance.personalCredits,
+        used: balance.used,
+        limit: balance.limit,
+        costMap, // NEW: frontend needs this for "X credits/message" display
+      };
+    }
+    ```
+    
+    <Check>
+    Must respect `isSubscriptionEnforcementEnabled()`. When enforcement is OFF, return `{ available: Infinity, ... }` so Phase 10 trackers don't render confusing "0 / unlimited".
+    </Check>
+  </Step>
+
+  <Step title="Document streaming exhaustion contract">
+    Update `AI_ASSISTANT_MODULE_SPECIFICATION.md`:
+    
+    ```markdown
+    ## Streaming Exhaustion Contract
+    
+    When a user's credit balance cannot cover the estimated cost of the next turn:
+    
+    1. Assistant emits `{ type: 'exhausted', remainingCredits: N }` chunk
+    2. Throws `StreamExhaustedError` to terminate stream gracefully
+    3. Frontend displays "Insufficient credits" banner with top-up CTA
+    4. Partial response up to exhaustion point is preserved in chat history
+    
+    **Balance check frequency**: before EACH turn yield (soft guard).
+    **Cost estimation**: uses `OPENAI_COST_MAP` per-model rates × 500 token average.
+    ```
+  </Step>
+
+  <Step title="Document current-actor balance endpoint">
+    Update `AI_ASSISTANT_MODULE_SPECIFICATION.md`:
+    
+    ```markdown
+    ## GET /me/credits
+    
+    Returns the current user's available credit balance + cost map.
+    
+    **Response**:
+    ```json
+    {
+      "available": 8234.5,
+      "orgPoolAvailable": 8000,
+      "personalCredits": 234.5,
+      "used": 1765.5,
+      "limit": 10000,
+      "costMap": {
+        "gpt-4o": { "inputPer1k": 5, "outputPer1k": 15 },
+        "gpt-4o-mini": { "inputPer1k": 0.15, "outputPer1k": 0.6 }
+      }
+    }
+    ```
+    
+    **Usage**: frontend polls this endpoint to update credit tracker in assistant header.
+    ```
+    
+    <Info>
+    The streaming-chat exhaustion contract + current-actor balance endpoint belong in `AI_ASSISTANT_MODULE_SPECIFICATION.md` (the assistant is the spend surface), not only `AI_MODULE_SPECIFICATION.md`.
+    </Info>
+  </Step>
 </Steps>
 
-<Note>
-Existing test/staging Stripe subscriptions with dual line items need backfill during cutover.
-</Note>
+## Phase 7: Self-Serve Plan Changes (Upgrade/Downgrade/Cancel)
+
+<Steps>
+  <Step title="Implement POST /subscription/change-plan endpoint">
+    In `SubscriptionController`:
+    
+    ```typescript
+    @Post('change-plan')
+    @UseGuards(SystemOwnerGuard) // OWNER-only
+    async changePlan(
+      @Body() dto: ChangePlanDto,
+      @OrgId() orgId: string,
+    ): Promise<SubscriptionDto> {
+      // dto: { targetTier, billingInterval, seats }
+      return this.subscriptionService.changePlan(orgId, dto);
+    }
+    ```
+  </Step>
+
+  <Step title="Implement SubscriptionService.changePlan()">
+    Handle proration, trial preservation, and Stripe subscription update:
+    
+    ```typescript
+    async changePlan(orgId: string, dto: ChangePlanDto): Promise<Subscription> {
+      const current = await this.getCurrentSubscription(orgId);
+      const targetPriceId = this.getPriceId(dto.targetTier, dto.billingInterval);
+      
+      // Upgrade: immediate, prorated credit
+      // Downgrade: schedule for period end
+      const proration = this.isUpgrade(current.tier, dto.targetTier)
+        ? 'always_invoice'
+        : 'none';
+      
+      const updated = await this.stripe.subscriptions.update(current.stripeSubscriptionId, {
+        items: [{ id: current.stripeItemId, price: targetPriceId, quantity: dto.seats }],
+        proration_behavior: proration,
+        billing_cycle_anchor: this.isUpgrade ? 'now' : 'unchanged',
+      });
+      
+      // Preserve trial if active
+      if (current.status === SubscriptionStatus.TRIALING) {
+        await this.stripe.subscriptions.update(updated.id, {
+          trial_end: current.trialEndsAt.getTime() / 1000,
+        });
+      }
+      
+      return this.syncSubscriptionFromStripe(updated);
+    }
+    ```
+  </Step>
+
+  <Step title="Implement POST /subscription/cancel endpoint">
+    ```typescript
+    @Post('cancel')
+    @UseGuards(SystemOwnerGuard)
+    async cancelSubscription(@OrgId() orgId: string): Promise<void> {
+      const sub = await this.getCurrentSubscription(orgId);
+      await this.stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        cancel_at_period_end: true,
+      });
+      
+      await this.subscriptionUsageRepository.update(
+        { organizationId: orgId },
+        { status: SubscriptionStatus.CANCELING }
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Handle customer.subscription.deleted webhook">
+    Downgrade to Free tier:
+    
+    ```typescript
+    case 'customer.subscription.deleted':
+      const subscription = event.data.object as Stripe.Subscription;
+      await this.downgradeToFree(subscription.metadata.organizationId);
+      break;
+    ```
+    
+    ```typescript
+    private async downgradeToFree(orgId: string): Promise<void> {
+      await this.subscriptionUsageRepository.update(
+        { organizationId: orgId },
+        {
+          tier: PlanTier.FREE,
+          status: SubscriptionStatus.ACTIVE,
+          stripeSubscriptionId: null,
+          trialEndsAt: null,
+          agentSeatsTotal: 5, // Free tier seat cap
+          maxCompanies: 10,
+          maxInventoryUnits: 25,
+        }
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Implement POST /subscription/resume endpoint">
+    For cancelled-but-not-yet-expired subscriptions:
+    
+    ```typescript
+    @Post('resume')
+    @UseGuards(SystemOwnerGuard)
+    async resumeSubscription(@OrgId() orgId: string): Promise<SubscriptionDto> {
+      const sub = await this.getCurrentSubscription(orgId);
+      await this.stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        cancel_at_period_end: false,
+      });
+      
+      await this.subscriptionUsageRepository.update(
+        { organizationId: orgId },
+        { status: SubscriptionStatus.ACTIVE }
+      );
+      
+      return this.toDto(await this.getCurrentSubscription(orgId));
+    }
+    ```
+  </Step>
+</Steps>
+
+## Phase 8: Billing Portal & Payment Method Updates
+
+<Steps>
+  <Step title="Implement POST /subscription/billing-portal endpoint">
+    Generate Stripe billing portal session:
+    
+    ```typescript
+    @Post('billing-portal')
+    @UseGuards(SystemOwnerGuard)
+    async createBillingPortalSession(@OrgId() orgId: string): Promise<{ url: string }> {
+      const org = await this.organizationRepository.findOne(orgId);
+      const session = await this.stripe.billingPortal.sessions.create({
+        customer: org.stripeCustomerId,
+        return_url: `${this.configService.get('FRONTEND_URL')}/settings/billing`,
+      });
+      
+      return { url: session.url };
+    }
+    ```
+  </Step>
+
+  <Step title="Configure Stripe billing portal settings">
+    Via Stripe Dashboard → Settings → Billing:
+    
+    - Enable **Invoice history**
+    - Enable **Update payment method**
+    - Enable **Cancel subscription** (schedule at period end)
+    - Disable **Update subscription** (handled via app's change-plan flow)
+  </Step>
+
+  <Step title="Add webhook handler for customer.updated">
+    Sync payment method changes:
+    
+    ```typescript
+    case 'customer.updated':
+      const customer = event.data.object as Stripe.Customer;
+      const paymentMethod = customer.invoice_settings.default_payment_method;
+      
+      await this.organizationRepository.update(
+        { stripeCustomerId: customer.id },
+        { defaultPaymentMethod: paymentMethod as string }
+      );
+      break;
+    ```
+  </Step>
+</Steps>
+
+## Phase 9: Seat Consolidation (Manager+Agent → Single Seat)
+
+<Warning>
+**Forward dependency**: Phase 5.4 requires `getSeatCount(orgId)` built in this phase. Execute Phase 9 BEFORE landing Phase 5.4's per-seat allowance calculation.
+</Warning>
+
+<Steps>
+  <Step title="Backfill agentSeatsTotal = managerSeats + agentSeats">
+    Migration `2026-XX-consolidate-seats.ts`:
+    
+    ```typescript
+    export class ConsolidateSeats implements Migration {
+      async up(db: MongoClient): Promise<void> {
+        await db.collection('subscription_usage').updateMany(
+          {},
+          [{
+            $set: {
+              agentSeatsTotal: { $add: ['$managerSeatsTotal', '$agentSeatsTotal'] },
+              agentSeatsUsed: { $add: ['$managerSeatsUsed', '$agentSeatsUsed'] },
+              managerSeatsTotal: 0,
+              managerSeatsUsed: 0,
+            }
+          }]
+        );
+      }
+    }
+    ```
+    
+    <Info>
+    Current code: `countSeatsByType` runs cross-module raw SQL on `user_org_roles`. This backfill collapses to a single seat counter without multiplying the module-boundary violation.
+    </Info>
+  </Step>
+
+  <Step title="Replace dual Stripe line items with single seat SKU">
+    For existing subscriptions (test/staging only per `stripe-ids.json` empty live block):
+    
+    ```typescript
+    async migrateStripeSeatItems(orgId: string): Promise<void> {
+      const sub = await this.getCurrentSubscription(orgId);
+      const stripeSubscription = await this.stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+      
+      const managerItem = stripeSubscription.items.data.find(i => i.price.id === 'price_manager');
+      const agentItem = stripeSubscription.items.data.find(i => i.price.id === 'price_agent');
+      const totalSeats = (managerItem?.quantity || 0) + (agentItem?.quantity || 0);
+      
+      // Replace with single seat item
+      await this.stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        items: [
+          { id: managerItem?.id, deleted: true },
+          { id: agentItem?.id, deleted: true },
+          { price: this.getSingleSeatPriceId(sub.tier), quantity: totalSeats },
+        ],
+      });
+    }
+    ```
+  </Step>
+
+  <Step title="Implement getSeatCount(orgId)">
+    New method in `SubscriptionService`:
+    
+    ```typescript
+    async getSeatCount(orgId: string): Promise<number> {
+      const usage = await this.subscriptionUsageRepository.findOne({ organizationId: orgId });
+      return usage?.agentSeatsTotal || 1; // default to 1 for Free orgs
+    }
+    ```
+    
+    <Check>
+    This replaces the cross-module `countSeatsByType` raw SQL pattern, keeping seat count consolidated within the subscription module.
+    </Check>
+  </Step>
+
+  <Step title="Update SubscriptionDto to expose single seat count">
+    ```typescript
+    export class SubscriptionDto {
+      @ApiProperty()
+      totalSeats: number; // replaces managerSeats/agentSeats split
+      
+      @ApiProperty()
+      seatsUsed: number;
+    }
+    ```
+  </Step>
+
+  <Step title="Update POST /subscription/add-seats endpoint">
+    Simplify to single quantity parameter:
+    
+    ```typescript
+    @Post('add-seats')
+    @UseGuards(SystemOwnerGuard)
+    async addSeats(@Body() dto: { quantity: number }, @OrgId() orgId: string): Promise<void> {
+      const sub = await this.getCurrentSubscription(orgId);
+      const currentSeats = await this.getSeatCount(orgId);
+      
+      await this.stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        items: [{ id: sub.stripeItemId, quantity: currentSeats + dto.quantity }],
+        proration_behavior: 'always_invoice',
+      });
+    }
+    ```
+  </Step>
+</Steps>
 
 ## Phase 10: Frontend Integration
 
-<Steps>
-<Step title="Consolidate billing routes">
-Merge `/settings/billing` and `/settings/plan-billing` into single route:
-
-```tsx
-// /settings/billing - Single source of truth
-<Route path="/settings/billing" element={<BillingPage />} />
-
-// Components to include:
-// - OrganizationPlanBillingSection (summary)  
-// - Credit balance & usage
-// - Plan comparison & upgrades
-// - Seat management
-// - Trial countdown/banner
-// - Payment method management
-```
-</Step>
-
-<Step title="Trial UX components">
-```tsx
-// Trial countdown banner
-const TrialBanner = ({ trialEndsAt }: { trialEndsAt: Date }) => {
-  const daysLeft = differenceInDays(trialEndsAt, new Date());
-  
-  return (
-    <Banner variant="warning">
-      {daysLeft} days left in your trial. 
-      <Link to="/settings/billing">Upgrade now</Link>
-    </Banner>
-  );
-};
-```
-</Step>
-
-<Step title="Credit wallet display">
-```tsx
-// My AI Credits tab under /settings/account
-const CreditWallet = () => {
-  const { balance, isLoading } = useCreditBalance();
-  
-  return (
-    <div>
-      <h3>AI Credits</h3>
-      <div className="balance">
-        {balance.available} / {balance.total} credits remaining
-      </div>
-      <Button onClick={() => navigate('/settings/billing')}>
-        Top Up Credits
-      </Button>
-    </div>
-  );
-};
-```
-</Step>
-
-<Step title="Plan limit notifications">
-```tsx
-// Entity cap warnings
-const CompanyLimitWarning = ({ count, limit }: LimitProps) => (
-  <Warning>
-    You're using {count} of {limit} companies allowed on the Free plan.
-    <Link to="/settings/billing">Upgrade to add more</Link>
-  </Warning>
-);
-```
-</Step>
-</Steps>
-
 <Info>
-Frontend builds on existing trial UX components (trialEndsAt DTO field, "Trial" badge, pack-remaining display).
+**Current state**: Trial UX + credit wallet are PARTIAL, not greenfield. The `trialEndsAt` DTO field + static "Trial" badge + pack-remaining display already exist; only countdown/banner/top-up flows are new.
 </Info>
+
+<Steps>
+  <Step title="Consolidate billing routes to single /settings/billing">
+    **Current state**: TWO billing pages exist:
+    - `/settings/billing` (billing/page.tsx): full functionality in STANDALONE "Billing & Plans" layout (not in settings secondary-sidebar shell)
+    - `/settings/plan-billing` (plan-billing/page.tsx, Figma 77769:77508): newer Figma-designed summary (`OrganizationPlanBillingSection`) INSIDE `SecondarySidebarLayout`, but only deep-links back to the full page
+    
+    **Decision**: collapse to ONE `/settings/billing` that:
+    - Adopts `plan-billing`'s secondary-sidebar shell + design
+    - Keeps `OrganizationPlanBillingSection` summary as top block
+    - Is ENRICHED with full billing functionality (seats, credits, plan comparison, checkout/change/cancel/downgrade/billing-portal, trial UX)
+    - Retired `/settings/plan-billing` → redirect to `/settings/billing`
+    - Point settings nav at the single route
+    - Gate to `system.owner` (replacing plan-billing's current `SYSTEM_ADMIN` `CombinedAccessGuard`)
+    
+    ```tsx
+    // app/(authenticated)/settings/billing/page.tsx
+    export default function BillingPage() {
+      return (
+        <SecondarySidebarLayout> {/* from plan-billing */}
+          <OrganizationPlanBillingSection /> {/* Figma summary block */}
+          <SubscriptionManagementSection /> {/* full functionality */}
+          <CreditWalletSection />
+          <StorageManagementSection />
+        </SecondarySidebarLayout>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Build trial countdown banner (owner-only)">
+    In consolidated `/settings/billing`:
+    
+    ```tsx
+    function TrialCountdownBanner({ subscription }: { subscription: SubscriptionDto }) {
+      if (subscription.status !== 'TRIALING') return null;
+      
+      const daysRemaining = differenceInDays(new Date(subscription.trialEndsAt), new Date());
+      
+      return (
+        <Alert variant="info">
+          <Clock className="h-4 w-4" />
+          <AlertTitle>Trial Active</AlertTitle>
+          <AlertDescription>
+            Your {subscription.tier} trial ends in {daysRemaining} days. 
+            You'll be charged {formatCurrency(subscription.monthlyPrice)} on {formatDate(subscription.trialEndsAt)}.
+          </AlertDescription>
+        </Alert>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Build plan comparison matrix component">
+    Reusable component for /settings/billing + upgrade CTAs:
+    
+    ```tsx
+    function PlanComparisonMatrix({ currentTier }: { currentTier: PlanTier }) {
+      return (
+        <CardGroup cols={3}>
+          {['FREE', 'PROFESSIONAL', 'BUSINESS'].map(tier => (
+            <Card key={tier}>
+              <h3>{PLAN_NAMES[tier]}</h3>
+              <p className="text-3xl">{formatPrice(PLAN_PRICES[tier])}</p>
+              <ul>
+                <li>{PLAN_FEATURES[tier].companies} companies</li>
+                <li>{PLAN_FEATURES[tier].storage}GB storage</li>
+                <li>{formatNumber(PLAN_FEATURES[tier].credits)} AI credits/seat</li>
+              </ul>
+              {tier !== currentTier && (
+                <Button onClick={() => handleUpgrade(tier)}>
+                  {isUpgrade(currentTier, tier) ? 'Upgrade' : 'Downgrade'}
+                </Button>
+              )}
+            </Card>
+          ))}
+        </CardGroup>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Build credit wallet tracker (all users)">
+    Tab under consolidated `/settings/billing` (for owner) + separate read-only view for regular users:
+    
+    ```tsx
+    function CreditWalletSection() {
+      const { data: balance } = useSWR('/api/me/credits', fetcher, { refreshInterval: 30000 });
+      
+      return (
+        <Card>
+          <h3>AI Credits</h3>
+          <div className="flex justify-between">
+            <div>
+              <p className="text-2xl">{formatNumber(balance.available)}</p>
+              <p className="text-sm text-muted">Available</p>
+            </div>
+            <div>
+              <p>{formatNumber(balance.used)} used this period</p>
+              {balance.limit && <p>Your limit: {formatNumber(balance.limit)}</p>}
+            </div>
+          </div>
+          
+          {/* Personal credits callout */}
+          {balance.personalCredits > 0 && (
+            <Alert>
+              <Info className="h-4 w-4" />
+              <p>{formatNumber(balance.personalCredits)} personal credits available</p>
+            </Alert>
+          )}
+          
+          {/* Top-up CTA (owner-only) */}
+          {isOwner && (
+            <Button onClick={handleBuyCreditPack}>Buy More Credits</Button>
+          )}
+        </Card>
+      );
+    }
+    ```
+    
+    <Note>
+    The "My AI Credits" route is a tab under `/settings/billing` (owner) or a dedicated `/settings/account` tab (regular users) — single source of truth.
+    </Note>
+  </Step>
+
+  <Step title="Integrate streaming exhaustion handling">
+    In `AssistantChatInterface`:
+    
+    ```tsx
+    async function handleStreamChunk(chunk: StreamChunk) {
+      if (chunk.type === 'exhausted') {
+        setShowInsufficientCreditsModal(true);
+        toast.error('Insufficient credits to continue', {
+          action: {
+            label: 'Buy More',
+            onClick: () => router.push('/settings/billing?tab=credits'),
+          },
+        });
+        return;
+      }
+      
+      appendMessage(chunk);
+    }
+    ```
+  </Step>
+
+  <Step title="Add credit cost tooltip to assistant input">
+    Display estimated cost per message:
+    
+    ```tsx
+    function AssistantInput({ model }: { model: string }) {
+      const { data: balance } = useSWR('/api/me/credits', fetcher);
+      const estimatedCost = estimateMessageCost(model, balance.costMap);
+      
+      return (
+        <div className="relative">
+          <Textarea placeholder="Ask PropWise..." />
+          <Tooltip>
+            <TooltipTrigger>
+              <Info className="h-4 w-4 text-muted" />
+            </TooltipTrigger>
+            <TooltipContent>
+              ~{estimatedCost} credits per message (based on {model})
+            </TooltipContent>
+          </Tooltip>
+        </div>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Build entity cap exceeded modals">
+    For Free tier users hitting company/unit limits:
+    
+    ```tsx
+    function EntityCapExceededModal({ entity }: { entity: 'company' | 'unit' }) {
+      return (
+        <Dialog open={showCapModal}>
+          <DialogHeader>
+            <DialogTitle>
+              {entity === 'company' ? 'Company' : 'Unit'} Limit Reached
+            </DialogTitle>
+          </DialogHeader>
+          <DialogContent>
+            <p>
+              Your Free plan allows up to {entity === 'company' ? '10 companies' : '25 units'}. 
+              Upgrade to Pro for unlimited {entity === 'company' ? 'companies' : 'units'}.
+            </p>
+            <PlanComparisonMatrix currentTier="FREE" />
+          </DialogContent>
+          <DialogFooter>
+            <Button onClick={handleUpgrade}>Upgrade to Pro</Button>
+          </DialogFooter>
+        </Dialog>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Add storage quota indicator to file upload">
+    ```tsx
+    function FileUploadWidget({ orgId }: { orgId: string }) {
+      const { data: subscription } = useSWR(`/api/organizations/${orgId}/subscription`, fetcher);
+      const usagePercent = (subscription.storageUsedGB / subscription.storageLimitGB) * 100;
+      
+      return (
+        <div>
+          <Progress value={usagePercent} />
+          <p className="text-sm">
+            {subscription.storageUsedGB.toFixed(2)}GB / {subscription.storageLimitGB}GB used
+          </p>
+          {usagePercent > 90 && (
+            <Alert variant="warning">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription>
+                Storage almost full. <Link href="/settings/billing?tab=storage">Buy more</Link>
+              </AlertDescription>
+            </Alert>
+          )}
+        </div>
+      );
+    }
+    ```
+  </Step>
+
+  <Step title="Build checkout flow for plan changes">
+    Reusable component for upgrades, seat additions, credit packs:
+    
+    ```tsx
+    async function handleCheckout(type: 'plan' | 'seats' | 'credits', params: any) {
+      const { sessionId } = await fetch('/api/subscription/checkout', {
+        method: 'POST',
+        body: JSON.stringify({ type, ...params }),
+      }).then(r => r.json());
+      
+      const stripe = await loadStripe(process.env.NEXT_PUBLIC_STRIPE_KEY);
+      await stripe.redirectToCheckout({ sessionId });
+    }
+    ```
+  </Step>
+
+  <Step title="Add per-user credit ceiling admin UI (admin-level)">
+    In `/settings/team` (admin-gated):
+    
+    ```tsx
+    function UserCreditAllocation({ user }: { user: User }) {
+      const [limit, setLimit] = useState(user.creditLimit);
+      
+      async function handleUpdateLimit() {
+        await fetch(`/api/users/${user.id}/credit-limit`, {
+          method: 'PUT',
+          body: JSON.stringify({ limit }),
+        });
+        toast.success('Credit limit updated');
+      }
+      
+      return (
+        <div>
+          <Label>AI Credit Limit (per month)</Label>
+          <Input 
+            type="number" 
+            value={limit || ''} 
+            onChange={e => setLimit(Number(e.target.value))}
+            placeholder="Unlimited"
+          />
+          <Button onClick={handleUpdateLimit}>Save</Button>
+        </div>
+      );
+    }
+    ```
+  </Step>
+</Steps>
 
 ## Phase 11: Documentation Updates
 
 <Steps>
-<Step title="Update module specifications">
-Add credit exhaustion contracts to:
-- `AI_ASSISTANT_MODULE_SPECIFICATION.md` (streaming chat surface)
-- `AI_MODULE_SPECIFICATION.md` (cost mapping)  
-- `SUBSCRIPTION_MODULE_SPECIFICATION.md` (billing integration)
-</Step>
+  <Step title="Update SUBSCRIPTION_MODULE_SPECIFICATION.md">
+    Add new sections:
+    
+    ```markdown
+    ## Credit Metering Architecture
+    
+    - **CreditMeteringService**: facade over CreditService + UserCreditAllocation
+    - **Budget model**: shared org pool with per-user ceilings (not carve-outs)
+    - **Consumption order**: org pool → personal credits
+    - **OpenAI-only billable traffic**: per-org project key, telemetry via Stripe usage records
+    
+    ## Entity Cap Enforcement (Free Tier)
+    
+    - **Count predicate**: non-imported AND isDeleted = false (archived still counts)
+    - **Write enforcement**: hard-block user creates (403), soft-degrade inbound auto-creates
+    - **Source-of-record**: Lead.leadSource, Contact/Deal/Company.isImported
+    
+    ## Seat Consolidation
+    
+    - Single per-agent seat SKU (manager/agent collapsed)
+    - Per-seat credit allowance: `aiCreditsPerMonth × getSeatCount(orgId)`
+    ```
+  </Step>
 
-<Step title="API documentation">
-Document new endpoints:
-- `GET /api/credits/balance` - Current actor balance
-- `POST /api/credits/purchase` - Buy credit packs
-- `GET /api/subscription/limits` - Plan limits and usage
-</Step>
-</Steps>
-
-## Execution Sequence
-
-<Warning>
-**Critical dependency**: Phase 5 depends on Phase 9's seat count consolidation. Execute Phase 9 before Phase 5.4.
-</Warning>
-
-Suggested order:
-1. **Phase 0** - Foundation (remove Starter, update definitions)
-2. **Phase 1** - Webhook infrastructure  
-3. **Phase 2** - Trial system
-4. **Phase 3** - Credit metering service
-5. **Phase 4** - Entity caps
-6. **Phase 9** - Seat count consolidation ⚠️ **Execute before Phase 5**
-7. **Phase 5** - AI budget integration (after Phase 9)
-8. **Phase 6** - Credit thresholds & cost mapping
-9. **Phase 7** - Storage limits
-10. **Phase 8** - Checkout & billing
-11. **Phase 10** - Frontend integration
-12. **Phase 11** - Documentation
-
-<Tabs>
-<Tab title="Backend-First">
-Phases 0-9 can be completed as pure backend implementation, allowing frontend work to begin in parallel after Phase 9.
-</Tab>
-
-<Tab title="Full-Stack">
-Phases 10-11 require coordinated frontend/backend deployment for user-facing features.
-</Tab>
-</Tabs>
-
-## Risk Mitigation
-
-<AccordionGroup>
-<Accordion title="Budget replacement risks">
-Phase 5 replaces existing budget gates with behavior-equivalent credit gates. Verify that `AiUsageGuardService.assertCanCallModel` and agent-side guards maintain identical blocking behavior.
-</Accordion>
-
-<Accordion title="Seat model transition">
-The single-seat collapse requires careful backfill of existing dual-seat data and Stripe subscription line items to avoid billing disruption.
-</Accordion>
-
-<Accordion title="Trial activation paths">
-Both webhook and direct checkout paths must derive trial status from shared `buildActivationParamsFromCheckoutMetadata` to prevent divergence.
-</Accordion>
-
-<Accordion title="Entity cap enforcement">  
-Hard-block user-initiated creates but soft-degrade inbound WhatsApp auto-create to avoid dropping live demand.
-</Accordion>
-</AccordionGroup>
+  <Step title="Update AI_MODULE_SPECIFICATION.md">
+    Document OpenAI routing + cost map:
+    
+    ```markdown
+    ## OpenAI Cost Map (USD → Credits)
+    
+    | Model | Input (per 1k tokens) | Output (per 1k tokens) |
+    |-------|----------------------|------------------------|
+    | gpt-4

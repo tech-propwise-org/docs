@@ -1,574 +1,1171 @@
 ---
 title: "Distribution Module Specification v2"
-description: "Comprehensive specification for the CRM distribution module including architecture, entities, distribution engine, and API endpoints"
+description: "Active implementation specification for the Distribution Module including entity definitions, engine logic, job configuration, and team-level distribution paths"
 ---
 
-The Distribution Module automates lead assignment within organizations. When a new lead is created, the system evaluates org-defined rules to automatically assign the lead to the most appropriate agent — based on lead attributes, agent availability, language compatibility, and capacity.
+## Overview
 
-<Info>
-**Module Status:** Active — fully implemented  
-**Module Path:** `src/modules/crm/distribution/`
-</Info>
+The Distribution Module automates lead assignment within organizations. When a new lead is created, the system evaluates org-defined rules to automatically assign the lead to the most appropriate agent — based on lead attributes, UserStatus online/away state, working-hours eligibility, language compatibility, and capacity.
 
-## Design Principles
+### Design Principles
 
-The Distribution Module follows these core design principles:
+<AccordionGroup>
+  <Accordion title="Async distribution">
+    `createLead()` emits `LEAD_CREATED` after commit; a pg-boss worker handles distribution. Listener / emit failures are logged only — HTTP lead creation still returns success; manual assignment or backfill may be needed if enqueue never ran. Bulk lead import sets `skipEmitLeadCreated` per row and calls `DistributionJobHandler.enqueueBatch()` once after the import loop.
+  </Accordion>
+
+  <Accordion title="Stakeholder system reuse">
+    Distribution creates `EntityStakeholder` records via `EntityStakeholderService`, not a new paradigm
+  </Accordion>
+
+  <Accordion title="First-match-wins rules">
+    Rules are evaluated top-to-bottom by priority; the first matching rule wins
+  </Accordion>
+
+  <Accordion title="Idempotency">
+    Distribution engine checks for existing stakeholders or pending offers before running
+  </Accordion>
+
+  <Accordion title="No retroactive distribution">
+    Existing leads are unaffected when rules are created; only new leads trigger distribution
+  </Accordion>
+
+  <Accordion title="Default routing control">
+    Organizations can disable default routing via `defaultRoutingEnabled` setting; when disabled, only explicit rule matches trigger distribution
+  </Accordion>
+
+  <Accordion title="pg-boss scheduling">
+    Distribution queue uses pg-boss for reliability and retry guarantees
+  </Accordion>
+
+  <Accordion title="RLS compliance">
+    All entities carry `organization_id` for row-level security
+  </Accordion>
+</AccordionGroup>
+
+### Distribution Paths
+
+The engine supports two execution paths:
 
 <CardGroup cols={2}>
-  <Card title="Async Distribution" icon="clock">
-    `createLead()` emits `LEAD_CREATED`; a pg-boss worker handles distribution — lead creation is never blocked
+  <Card title="Path A — Org-level distribution" icon="building">
+    Triggered when a lead enters the org with no team context. Evaluates org-scoped rules, applies the org default method, and can bridge to Path B if a rule or default method routes to a team that has `distributionEnabled = true`.
   </Card>
-  <Card title="Stakeholder System Reuse" icon="users">
-    Distribution creates `EntityStakeholder` records via `EntityStakeholderService`, not a new paradigm
-  </Card>
-  <Card title="First-Match-Wins Rules" icon="trophy">
-    Rules are evaluated top-to-bottom by priority; the first matching rule wins
-  </Card>
-  <Card title="Idempotency" icon="shield-check">
-    Distribution engine checks for existing stakeholders or pending offers before running
+
+  <Card title="Path B — Team-level distribution" icon="users">
+    Triggered directly when:
+    - A lead is created with a `teamId` in the event payload (team pool assignment)
+    - A bulk-imported lead has a team-only assignment
+    - Path A determines the lead belongs to an auto-distributing team
+    - Idempotency check finds a single team-only stakeholder with auto-distribute enabled
   </Card>
 </CardGroup>
 
 <Note>
-**No Retroactive Distribution:** Existing leads are unaffected when rules are created; only new leads trigger distribution.
+Path B consults active distribution rules via the rule service when `defaultRoutingEnabled` is disabled, ensuring team-level distribution respects rule-based routing controls. Path B evaluates team-scoped rules, uses team settings (with org fallback for capacity), and logs the team FK on the resulting `DistributionLog` record.
 </Note>
-
-## Distribution Paths
-
-The engine supports two execution paths:
-
-<Tabs>
-  <Tab title="Path A - Org-Level">
-    **Path A — Org-level distribution** (`runDistribution`): triggered when a lead enters the org with no team context. Evaluates org-scoped rules, applies the org default method, and can bridge to Path B if a rule or default method routes to a team that has `distributionEnabled = true`.
-  </Tab>
-  <Tab title="Path B - Team-Level">
-    **Path B — Team-level distribution** (`runTeamDistribution`): triggered directly when:
-    - A lead is created with a `teamId` in the event payload (team pool assignment)
-    - Path A determines the lead belongs to an auto-distributing team
-    - Idempotency check finds a single team-only stakeholder with auto-distribute enabled
-  </Tab>
-</Tabs>
 
 ## Architecture
 
-### High-Level Diagram
+### High-level diagram
 
 ```mermaid
 graph TB
-    A[API Layer Controllers] --> B[Distribution Engine]
-    B --> C[Shared Services]
-    C --> D[Data Layer]
-    
-    subgraph API [API Layer]
-        A1[DistributionSettingsCtrl]
-        A2[DistributionRulesCtrl]
-        A3[TeamDistCtrl]
-        A4[DistributionAnalyticsCtrl]
-    end
-    
-    subgraph Engine [Distribution Engine]
-        B1[RuleEvaluator]
-        B2[LanguageMatcher]
-        B3[AgentSelector]
-        B4[Path A - Org Level]
-        B5[Path B - Team Level]
-    end
-    
-    subgraph Services [Shared Services]
-        C1[EntityStakeholderService]
-        C2[UserStatusService]
-        C3[DistributionCapacityService]
-        C4[pg-boss Queue]
-    end
-    
-    subgraph Data [Data Layer]
-        D1[distribution_settings]
-        D2[team_distribution_settings]
-        D3[distribution_rule]
-        D4[distribution_log]
-    end
+    API[API Layer - Controllers] --> Engine[Distribution Engine]
+    Engine --> RuleEval[RuleEvaluator]
+    Engine --> PathA[Path A - org-level]
+    Engine --> PathB[Path B - team-level]
+    Engine --> Services[Shared Services]
+    Services --> Data[Data Layer - PostgreSQL]
 ```
 
-### Component Responsibilities
+### Component responsibilities
 
-| Component | Responsibility |
-|-----------|----------------|
-| **DistributionEngine** | Orchestrator: receives a lead, evaluates rules, selects agent, creates assignment. Supports Path A (org) and Path B (team). |
-| **RuleEvaluator** | Evaluates rule conditions against lead data; returns first matching rule |
-| **LanguageMatcher** | Filters and ranks agents by language compatibility with the lead's person |
-| **AgentSelector** | Applies the distribution method (round-robin, weighted, weighted-round-robin, direct) to the filtered agent pool |
-| **DistributionCapacityService** | Two-phase capacity enforcement: Phase 1 `filterByCapacity()` (lead counts vs limits); Phase 2 `confirmCapacityAndAssign()` (advisory locks + atomic stakeholder creation). |
-| **UserStatusService** | Pre-filters candidate agents to ONLINE status; filters by per-user working hours |
-| **DistributionListener** | Listens for `LEAD_CREATED` events and enqueues pg-boss jobs |
-| **DistributionJobHandler** | pg-boss worker that processes distribution jobs |
+<AccordionGroup>
+  <Accordion title="DistributionEngine">
+    Orchestrator: receives a lead, evaluates rules, selects agent, creates assignment. Supports Path A (org) and Path B (team).
+  </Accordion>
+
+  <Accordion title="RuleEvaluator">
+    Evaluates rule conditions against lead data; returns first matching rule
+  </Accordion>
+
+  <Accordion title="LanguageMatcher">
+    Filters and ranks agents by language compatibility with the lead's person
+  </Accordion>
+
+  <Accordion title="AgentSelector">
+    Applies the distribution method (round-robin, weighted, weighted-round-robin, direct) to the filtered agent pool
+  </Accordion>
+
+  <Accordion title="DistributionCapacityService">
+    Two-phase capacity enforcement: Phase 1 `filterByCapacity()` (lead counts vs limits); Phase 2 `confirmCapacityAndAssign()` (advisory locks + atomic stakeholder creation). No entity of its own — queries `entity_stakeholder`.
+  </Accordion>
+
+  <Accordion title="UserStatusService">
+    Pre-filters candidate agents to ONLINE status; filters by per-user working hours (`filterByWorkingHours`); provides `isWithinWorkingHours()` for org-level business hours check.
+  </Accordion>
+
+  <Accordion title="DistributionListener">
+    Listens for `LEAD_CREATED` events and enqueues pg-boss jobs. The handler is fault-isolated (try/catch): settings lookup and enqueue errors are logged and do not fail `POST /v1/leads`.
+  </Accordion>
+
+  <Accordion title="DistributionJobHandler">
+    pg-boss worker that processes distribution jobs
+  </Accordion>
+</AccordionGroup>
 
 ## Entity Specifications
 
 ### DistributionSettings (1 per org)
 
-Org-level configuration for the distribution engine. Auto-created with defaults on first access via `getOrgSettingsRaw()`.
+Org-level configuration for the distribution engine. Auto-created with defaults on first access via `getOrgSettingsRaw()`. Unique constraint on `organization_id`.
 
-<AccordionGroup>
-  <Accordion title="Database Schema">
-    | Column | Type | Notes |
-    |--------|------|-------|
-    | id | uuid PK | |
-    | organization_id | uuid FK UNIQUE | RLS |
-    | distribution_enabled | bool | default `false`. Master on/off switch |
-    | max_active_leads_per_agent | int | default 50 |
-    | max_new_leads_per_day | int | default 15 |
-    | capacity_enforcement_enabled | bool | default `false` |
-    | respect_business_hours | bool | default `true` |
-    | outside_hours_action | enum | `QUEUE`, `POOL`, `DUTY_AGENT` |
-    | duty_agent_id | uuid FK nullable | used when `outside_hours_action = DUTY_AGENT` |
-    | default_method | enum | `ROUND_ROBIN`, `POOL`, `SPECIFIC_TEAM` |
-    | default_team_id | uuid FK nullable | used when `default_method = SPECIFIC_TEAM` |
-    | default_language_matching_mode | enum | `STRICT`, `PREFERRED` |
-    | default_balancing_factors | jsonb nullable | Optional balancing configuration |
-    | pool_alert_enabled | bool | Whether to send pool-overload alerts |
-    | pool_alert_threshold | int | Lead count that triggers an alert |
-    | pool_alert_window_minutes | int | Rolling window for counting unassigned leads |
-    | updated_by | uuid FK nullable | |
-    | created_at, updated_at | timestamp | |
-  </Accordion>
-</AccordionGroup>
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid PK | Primary key |
+| `organization_id` | uuid FK UNIQUE | RLS constraint |
+| `enabled` | boolean | Default: `true` |
+| `default_distribution_method` | enum | `ROUND_ROBIN`, `WEIGHTED`, `WEIGHTED_ROUND_ROBIN`, `DIRECT`. Default: `ROUND_ROBIN` |
+| `respect_working_hours` | boolean | Default: `false` |
+| `working_hours` | jsonb | Format: `{ "timezone": "America/New_York", "schedule": { "monday": [{ "start": "09:00", "end": "17:00" }], ... } }` |
+| `max_leads_per_agent` | int | Default: `null` (unlimited) |
+| `capacity_window_hours` | int | Default: `24` |
+| `language_matching_required` | boolean | Default: `false` |
+| `default_routing_enabled` | boolean | Default: `true`. When `false`, only explicit rule matches trigger distribution |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+<Info>
+Business hours gating only occurs in Path A when `respectWorkingHours = true`. The system checks `isWithinWorkingHours(orgSettings.workingHours)` before proceeding.
+</Info>
+
+### TeamDistributionSettings (1 per team)
+
+Team-level distribution configuration. Auto-created on first access.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid PK | |
+| `team_id` | uuid FK UNIQUE | |
+| `organization_id` | uuid FK | RLS |
+| `distribution_enabled` | boolean | Default: `false` |
+| `distribution_method` | enum | `ROUND_ROBIN`, `WEIGHTED`, `WEIGHTED_ROUND_ROBIN`. Default: `null` (inherits org) |
+| `max_leads_per_agent` | int | Default: `null` (inherits org) |
+| `capacity_window_hours` | int | Default: `null` (inherits org) |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
 
 <Warning>
-**Master Toggle Behavior:**
-- `distributionEnabled = false` (new-org default): Engine is off. No pg-boss jobs created.
-- `distributionEnabled = true`: Engine is active. When toggled from `false` → `true`, if `defaultMethod` is still `POOL` it is auto-upgraded to `ROUND_ROBIN`.
+`distributionEnabled` must be explicitly set to `true` to enable team-level distribution. When enabled, Path B can be triggered for leads routed to this team.
 </Warning>
-
-### TeamDistributionSettings (1 per org+team)
-
-Per-team distribution configuration. One record per `(organization, team)` pair.
-
-<AccordionGroup>
-  <Accordion title="Database Schema">
-    | Column | Type | Notes |
-    |--------|------|-------|
-    | id | uuid PK | |
-    | organization_id | uuid FK | RLS |
-    | team_id | uuid FK | (required, not nullable) |
-    | distribution_enabled | bool | default `false` |
-    | distribution_method | enum | default `ROUND_ROBIN` |
-    | agent_weights | jsonb nullable | `{ [userId]: weight }` |
-    | language_matching_enabled | bool | default `false` |
-    | language_matching_mode | enum nullable | Language matching mode override |
-    | capacity_enforcement_enabled | bool | default `false` |
-    | max_active_leads_per_agent | int nullable | `null` = inherit from org |
-    | max_new_leads_per_day | int nullable | `null` = inherit from org |
-    | respect_business_hours | bool | default `false` |
-    | last_assigned_index | int | default 0. Round-robin cursor |
-    | default_balancing_factors | jsonb nullable | |
-    | updated_by | uuid FK nullable | |
-    | created_at, updated_at | timestamp | |
-  </Accordion>
-</AccordionGroup>
 
 ### DistributionRule
 
-Rules are evaluated in ascending `priority` order (lower number = higher priority). First match wins.
+Rule-based routing configuration. Evaluated in priority order (ascending). Supports both org-level and team-level rules.
 
-<AccordionGroup>
-  <Accordion title="Database Schema">
-    | Column | Type | Notes |
-    |--------|------|-------|
-    | id | uuid PK | |
-    | organization_id | uuid FK | RLS |
-    | name | varchar | |
-    | priority | int | lower = higher priority |
-    | is_active | bool | default true |
-    | scope | enum | `ORGANIZATION`, `TEAM` |
-    | team_id | uuid FK nullable | for team-scoped rules |
-    | condition_groups | jsonb | `[{conditions:[{field,operator,value}]}]` |
-    | method | enum | `ROUND_ROBIN`, `WEIGHTED`, `WEIGHTED_ROUND_ROBIN`, `DIRECT` |
-    | recipients | jsonb | `{agentIds?, teamId?, poolId?, weights?}` |
-    | language_matching_enabled | bool | default true |
-    | language_matching_mode | enum | `STRICT`, `PREFERRED` |
-    | balancing_factors | jsonb nullable | Optional balancing configuration |
-    | last_assigned_index | int | round-robin cursor |
-    | created_by | uuid FK | |
-    | created_at, updated_at | timestamp | |
-    | is_deleted | bool | soft delete |
-  </Accordion>
-  <Accordion title="Supported Rule Conditions">
-    | Field | Operator(s) | Example Value |
-    |-------|-------------|---------------|
-    | `leadSource` | `eq`, `in` | `'WEBSITE'`, `['WEBSITE', 'REFERRAL']` |
-    | `temperature` | `eq`, `in` | `'HOT'` |
-    | `language` | `eq` | `'ar'` (matched against `person.preferredLanguage`) |
-    | `budget` | `gte`, `lte`, `between` | `500000` |
-    | `tags` | `contains` | `['vip']` |
-    | `sourceChannel` | `eq`, `in` | `'WHATSAPP'` |
-    | `intent` | `eq` | `'BUY'` |
-    | `area` | `eq`, `in`, `contains` | `'Dubai Marina'`, `['JBR', 'Downtown Dubai']` |
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid PK | |
+| `organization_id` | uuid FK | RLS |
+| `team_id` | uuid FK | Optional; when set, rule applies only in Path B for this team |
+| `name` | text | |
+| `description` | text | Optional |
+| `priority` | int | Lower = higher priority; default: 100 |
+| `is_active` | boolean | Default: `true` |
+| `conditions` | jsonb | Rule logic (see Type Definitions) |
+| `distribution_method` | enum | Method override for this rule |
+| `target_team_id` | uuid FK | Optional; routes to team if provided |
+| `target_user_id` | uuid FK | Optional; direct assignment |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
 
-    <Note>
-    All string-based condition fields use **case-insensitive matching**.
-    </Note>
-  </Accordion>
-</AccordionGroup>
+<Check>
+Unique constraint: `UNIQUE(organization_id, priority, team_id)` ensures no priority conflicts within the same scope.
+</Check>
+
+### DistributionLog
+
+Audit trail for all distribution attempts and outcomes.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid PK | |
+| `organization_id` | uuid FK | RLS |
+| `lead_id` | uuid FK | |
+| `team_id` | uuid FK | Optional; set for Path B |
+| `assigned_user_id` | uuid FK | Optional; `null` if failed |
+| `distribution_method` | enum | Method used |
+| `matched_rule_id` | uuid FK | Optional; which rule matched |
+| `status` | enum | `SUCCESS`, `NO_ELIGIBLE_AGENTS`, `OUTSIDE_BUSINESS_HOURS`, `CAPACITY_EXCEEDED`, `ERROR` |
+| `error_details` | jsonb | Optional; error context |
+| `metadata` | jsonb | Execution context (agent pool, weights, etc.) |
+| `created_at` | timestamptz | |
+
+## Type Definitions
+
+### Distribution method enum
+
+```typescript
+export enum DistributionMethod {
+  ROUND_ROBIN = 'ROUND_ROBIN',
+  WEIGHTED = 'WEIGHTED',
+  WEIGHTED_ROUND_ROBIN = 'WEIGHTED_ROUND_ROBIN',
+  DIRECT = 'DIRECT',
+}
+```
+
+<Tabs>
+  <Tab title="ROUND_ROBIN">
+    Agents selected sequentially from the eligible pool. State tracked via `DistributionStateService` using Redis.
+  </Tab>
+  <Tab title="WEIGHTED">
+    Agents selected based on relative weights. Higher weight = higher selection probability.
+  </Tab>
+  <Tab title="WEIGHTED_ROUND_ROBIN">
+    Hybrid approach: maintains rotation while respecting agent weights.
+  </Tab>
+  <Tab title="DIRECT">
+    Assigns to a specific user. Requires `targetUserId` in rule or settings.
+  </Tab>
+</Tabs>
+
+### Rule condition schema
+
+```typescript
+interface RuleConditions {
+  leadSource?: string[];
+  channel?: string[];
+  budget?: {
+    min?: number;
+    max?: number;
+  };
+  priority?: string[];
+  customFields?: {
+    [key: string]: any;
+  };
+  tagIds?: string[];
+}
+```
+
+<CodeGroup>
+```json Example Rule
+{
+  "leadSource": ["website", "referral"],
+  "budget": {
+    "min": 10000,
+    "max": 50000
+  },
+  "priority": ["high", "urgent"],
+  "tagIds": ["enterprise", "healthcare"]
+}
+```
+
+```json Complex Rule
+{
+  "channel": ["email"],
+  "customFields": {
+    "industry": "technology",
+    "region": "EMEA"
+  },
+  "budget": {
+    "min": 25000
+  }
+}
+```
+</CodeGroup>
+
+### Distribution status enum
+
+```typescript
+export enum DistributionStatus {
+  SUCCESS = 'SUCCESS',
+  NO_ELIGIBLE_AGENTS = 'NO_ELIGIBLE_AGENTS',
+  OUTSIDE_BUSINESS_HOURS = 'OUTSIDE_BUSINESS_HOURS',
+  CAPACITY_EXCEEDED = 'CAPACITY_EXCEEDED',
+  ERROR = 'ERROR',
+}
+```
 
 ## Distribution Engine
 
-### Core Engine Flow
+### Core flow
 
 <Steps>
-  <Step title="Event Reception">
-    Engine receives `LEAD_CREATED` event via pg-boss job queue
+  <Step title="Idempotency check">
+    Check if lead already has stakeholders or pending distribution. Exit early if found.
   </Step>
-  <Step title="Idempotency Check">
-    Verify lead doesn't already have stakeholders or pending offers
+
+  <Step title="Path determination">
+    - If `teamId` in payload → Path B
+    - If single team-only stakeholder with auto-distribute → Path B
+    - Otherwise → Path A
   </Step>
-  <Step title="Path Selection">
-    Determine whether to use Path A (org-level) or Path B (team-level) distribution
+
+  <Step title="Rule evaluation">
+    Load active rules for scope (org or team), evaluate in priority order, return first match.
   </Step>
-  <Step title="Rule Evaluation">
-    Evaluate rules in priority order until first match is found
+
+  <Step title="Business hours gating (Path A only)">
+    If `respectWorkingHours = true`, check org working hours. Exit if outside hours.
   </Step>
-  <Step title="Agent Selection">
-    Apply distribution method to filtered agent pool
+
+  <Step title="Agent pool filtering">
+    - Filter by ONLINE status
+    - Filter by working hours (per-user)
+    - Filter by language compatibility (if required)
+    - Filter by capacity limits (Phase 1)
   </Step>
-  <Step title="Capacity Validation">
-    Confirm agent has capacity using advisory locks
+
+  <Step title="Agent selection">
+    Apply distribution method to filtered pool.
   </Step>
-  <Step title="Assignment Creation">
-    Create EntityStakeholder record and log distribution
+
+  <Step title="Assignment confirmation">
+    Phase 2 capacity check with advisory locks + atomic stakeholder creation.
+  </Step>
+
+  <Step title="Logging">
+    Create `DistributionLog` record with outcome.
   </Step>
 </Steps>
 
-### Distribution Methods
+### Path A: Org-level distribution
 
-<Tabs>
-  <Tab title="Round Robin">
-    Cycles through agents in order. Uses `last_assigned_index` to track position.
+```typescript
+async runDistribution(
+  lead: Lead,
+  orgSettings: DistributionSettings,
+): Promise<DistributionResult>
+```
+
+<Accordion title="View implementation details">
+1. Check idempotency (existing stakeholders)
+2. Evaluate org-scoped rules (`teamId = null`)
+3. If rule matches and has `targetTeamId`:
+   - Check if team has `distributionEnabled = true`
+   - If yes, bridge to Path B
+   - If no, assign to team (no user assignment)
+4. If no rule match and `defaultRoutingEnabled = true`:
+   - Apply org default method
+5. If no rule match and `defaultRoutingEnabled = false`:
+   - Log `NO_ELIGIBLE_AGENTS` and exit
+6. Create assignment and log result
+</Accordion>
+
+### Path B: Team-level distribution
+
+```typescript
+async runTeamDistribution(
+  lead: Lead,
+  team: Team,
+  teamSettings: TeamDistributionSettings,
+  orgSettings: DistributionSettings,
+): Promise<DistributionResult>
+```
+
+<Accordion title="View implementation details">
+1. Check idempotency (existing stakeholders for this team)
+2. Evaluate team-scoped rules (`teamId = team.id`)
+3. If no rule match:
+   - Check `defaultRoutingEnabled` (org setting)
+   - If disabled, log `NO_ELIGIBLE_AGENTS` and exit
+   - If enabled, apply team's distribution method (or org fallback)
+4. Filter agents by team membership
+5. Apply capacity limits (team settings with org fallback)
+6. Create assignment with `teamId` in stakeholder record
+7. Log result with `teamId` in `DistributionLog`
+</Accordion>
+
+<Warning>
+Path B does NOT perform business hours gating at the org level. Only per-user working hours are checked during agent filtering.
+</Warning>
+
+## pg-boss Job Configuration
+
+### Job queue setup
+
+<CodeGroup>
+```typescript Queue Definition
+{
+  name: 'crm.distribution.process',
+  options: {
+    retryLimit: 3,
+    retryDelay: 60,
+    retryBackoff: true,
+    expireInHours: 24,
+  }
+}
+```
+
+```typescript Job Payload
+interface DistributionJobPayload {
+  leadId: string;
+  organizationId: string;
+  teamId?: string;
+  metadata?: {
+    source?: string;
+    batchId?: string;
+  };
+}
+```
+</CodeGroup>
+
+### Job handler
+
+```typescript
+@Processor('crm.distribution.process')
+export class DistributionJobHandler {
+  async process(job: Job<DistributionJobPayload>): Promise<void> {
+    const { leadId, organizationId, teamId } = job.data;
     
-    ```typescript
-    const nextIndex = (lastAssignedIndex + 1) % eligibleAgents.length;
-    const selectedAgent = eligibleAgents[nextIndex];
-    ```
-  </Tab>
-  <Tab title="Weighted">
-    Selects agents based on configured weights. Higher weight = higher probability.
+    // Load entities
+    const lead = await this.loadLead(leadId);
+    const orgSettings = await this.loadOrgSettings(organizationId);
     
-    ```typescript
-    const totalWeight = Object.values(weights).reduce((sum, w) => sum + w, 0);
-    const randomValue = Math.random() * totalWeight;
-    // Select agent based on cumulative weight thresholds
-    ```
-  </Tab>
-  <Tab title="Weighted Round Robin">
-    Combines round-robin fairness with weighted preferences.
-  </Tab>
-  <Tab title="Direct">
-    Assigns to specific agent(s) defined in rule recipients.
-  </Tab>
-</Tabs>
+    // Determine path
+    if (teamId) {
+      const team = await this.loadTeam(teamId);
+      const teamSettings = await this.loadTeamSettings(teamId);
+      await this.engine.runTeamDistribution(lead, team, teamSettings, orgSettings);
+    } else {
+      await this.engine.runDistribution(lead, orgSettings);
+    }
+  }
+}
+```
+
+### Batch enqueue
+
+Used by bulk lead import to efficiently enqueue multiple jobs.
+
+```typescript
+async enqueueBatch(
+  jobs: DistributionJobPayload[],
+): Promise<void> {
+  await this.pgBoss.insert('crm.distribution.process', jobs);
+}
+```
 
 ## API Endpoints
 
-### Distribution Settings
-
-<CodeGroup>
-
-```typescript GET /api/distribution/settings
-// Get organization distribution settings
-GET /api/distribution/settings
-Authorization: Bearer <token>
-
-Response: {
-  id: string;
-  organizationId: string;
-  distributionEnabled: boolean;
-  maxActiveLeadsPerAgent: number;
-  maxNewLeadsPerDay: number;
-  capacityEnforcementEnabled: boolean;
-  respectBusinessHours: boolean;
-  outsideHoursAction: 'QUEUE' | 'POOL' | 'DUTY_AGENT';
-  dutyAgentId?: string;
-  defaultMethod: 'ROUND_ROBIN' | 'POOL' | 'SPECIFIC_TEAM';
-  defaultTeamId?: string;
-  // ... other fields
-}
-```
-
-```typescript PATCH /api/distribution/settings
-// Update organization distribution settings
-PATCH /api/distribution/settings
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "distributionEnabled": true,
-  "maxActiveLeadsPerAgent": 75,
-  "capacityEnforcementEnabled": true,
-  "defaultMethod": "ROUND_ROBIN"
-}
-
-Response: DistributionSettings
-```
-
-</CodeGroup>
-
-### Distribution Rules
-
-<CodeGroup>
-
-```typescript GET /api/distribution/rules
-// List distribution rules
-GET /api/distribution/rules?scope=ORGANIZATION&teamId=uuid
-Authorization: Bearer <token>
-
-Response: {
-  data: DistributionRule[];
-  total: number;
-}
-```
-
-```typescript POST /api/distribution/rules
-// Create distribution rule
-POST /api/distribution/rules
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "name": "VIP Arabic Leads",
-  "priority": 10,
-  "scope": "ORGANIZATION",
-  "conditionGroups": [
-    {
-      "conditions": [
-        { "field": "tags", "operator": "contains", "value": ["vip"] },
-        { "field": "language", "operator": "eq", "value": "ar" }
-      ]
-    }
-  ],
-  "method": "WEIGHTED",
-  "recipients": {
-    "agentIds": ["agent1-uuid", "agent2-uuid"],
-    "weights": { "agent1-uuid": 70, "agent2-uuid": 30 }
-  },
-  "languageMatchingEnabled": true,
-  "languageMatchingMode": "STRICT"
-}
-
-Response: DistributionRule
-```
-
-</CodeGroup>
-
-### Team Distribution Settings
-
-<CodeGroup>
-
-```typescript GET /api/distribution/teams/:teamId/settings
-// Get team distribution settings
-GET /api/distribution/teams/uuid/settings
-Authorization: Bearer <token>
-
-Response: TeamDistributionSettings
-```
-
-```typescript PATCH /api/distribution/teams/:teamId/settings
-// Update team distribution settings
-PATCH /api/distribution/teams/uuid/settings
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "distributionEnabled": true,
-  "distributionMethod": "WEIGHTED",
-  "agentWeights": {
-    "agent1-uuid": 60,
-    "agent2-uuid": 40
-  },
-  "capacityEnforcementEnabled": true,
-  "maxActiveLeadsPerAgent": 50
-}
-
-Response: TeamDistributionSettings
-```
-
-</CodeGroup>
-
-### Analytics & Metrics
-
-<CodeGroup>
-
-```typescript GET /api/distribution/analytics/performance
-// Get distribution performance metrics
-GET /api/distribution/analytics/performance?startDate=2024-01-01&endDate=2024-01-31&teamId=uuid
-Authorization: Bearer <token>
-
-Response: {
-  totalDistributions: number;
-  successfulDistributions: number;
-  failedDistributions: number;
-  averageDistributionTime: number;
-  agentWorkload: Array<{
-    agentId: string;
-    agentName: string;
-    leadsAssigned: number;
-    activeLeads: number;
-    capacityUtilization: number;
-  }>;
-  ruleEffectiveness: Array<{
-    ruleId: string;
-    ruleName: string;
-    matches: number;
-    successRate: number;
-  }>;
-}
-```
-
-```typescript GET /api/distribution/analytics/capacity
-// Get capacity utilization metrics
-GET /api/distribution/analytics/capacity?teamId=uuid
-Authorization: Bearer <token>
-
-Response: {
-  organizationCapacity: {
-    totalAgents: number;
-    activeAgents: number;
-    averageUtilization: number;
-    atCapacityCount: number;
-  };
-  teamCapacities?: Array<{
-    teamId: string;
-    teamName: string;
-    totalAgents: number;
-    activeAgents: number;
-    averageUtilization: number;
-    atCapacityCount: number;
-  }>;
-  agentCapacities: Array<{
-    agentId: string;
-    agentName: string;
-    activeLeads: number;
-    maxActiveLeads: number;
-    utilizationPercentage: number;
-    dailyLeads: number;
-    maxDailyLeads: number;
-  }>;
-}
-```
-
-</CodeGroup>
-
-## Security & Permissions
-
-### Row Level Security (RLS)
-
-All distribution entities implement RLS policies based on `organization_id`:
-
-<CodeGroup>
-
-```sql RLS Policies
--- Distribution Settings
-CREATE POLICY distribution_settings_org_access ON distribution_settings
-  USING (organization_id = auth.current_org_id());
-
--- Team Distribution Settings  
-CREATE POLICY team_distribution_settings_org_access ON team_distribution_settings
-  USING (organization_id = auth.current_org_id());
-
--- Distribution Rules
-CREATE POLICY distribution_rules_org_access ON distribution_rule
-  USING (organization_id = auth.current_org_id());
-
--- Distribution Logs
-CREATE POLICY distribution_log_org_access ON distribution_log
-  USING (organization_id = auth.current_org_id());
-```
-
-</CodeGroup>
-
-### Permission Requirements
-
-| Action | Required Permission |
-|--------|-------------------|
-| View distribution settings | `DISTRIBUTION_READ` |
-| Modify distribution settings | `DISTRIBUTION_WRITE` |
-| Create/edit distribution rules | `DISTRIBUTION_RULES_WRITE` |
-| View distribution analytics | `DISTRIBUTION_ANALYTICS_READ` |
-| Manage team distribution | `TEAM_DISTRIBUTION_WRITE` |
-
-## Performance & Scaling
-
-### Optimization Strategies
-
-<CardGroup cols={2}>
-  <Card title="Advisory Locks" icon="lock">
-    Two-phase capacity checking with PostgreSQL advisory locks prevents race conditions during assignment
-  </Card>
-  <Card title="Job Queue" icon="queue-list">
-    pg-boss provides reliable job processing with retry logic and dead letter handling
-  </Card>
-  <Card title="Index Strategy" icon="magnifying-glass">
-    Strategic indexes on frequently queried fields like `organization_id`, `team_id`, and `priority`
-  </Card>
-  <Card title="Capacity Caching" icon="bolt">
-    In-memory caching of capacity calculations with cache invalidation on assignment changes
-  </Card>
-</CardGroup>
-
-### Monitoring & Observability
+### Distribution settings
 
 <Tabs>
-  <Tab title="Metrics">
-    - Distribution job success/failure rates
-    - Average assignment time per lead
-    - Agent capacity utilization
-    - Rule match effectiveness
-    - Queue depth and processing times
+  <Tab title="GET /v1/distribution/settings">
+    Retrieve org-level distribution settings.
+    
+    **Response:**
+    ```json
+    {
+      "id": "uuid",
+      "organizationId": "uuid",
+      "enabled": true,
+      "defaultDistributionMethod": "ROUND_ROBIN",
+      "respectWorkingHours": false,
+      "maxLeadsPerAgent": null,
+      "capacityWindowHours": 24,
+      "languageMatchingRequired": false,
+      "defaultRoutingEnabled": true
+    }
+    ```
   </Tab>
-  <Tab title="Logging">
-    - All distributions logged to `distribution_log` table
-    - Structured logging for debugging failed distributions
-    - Performance timing logs for slow operations
-  </Tab>
-  <Tab title="Alerts">
-    - Pool overload alerts when unassigned leads exceed threshold
-    - Capacity alerts when agents reach limits
-    - Failed distribution alerts for system issues
+
+  <Tab title="PUT /v1/distribution/settings">
+    Update org-level distribution settings.
+    
+    **Request:**
+    ```json
+    {
+      "enabled": true,
+      "defaultDistributionMethod": "WEIGHTED",
+      "respectWorkingHours": true,
+      "workingHours": {
+        "timezone": "America/New_York",
+        "schedule": {
+          "monday": [{"start": "09:00", "end": "17:00"}]
+        }
+      },
+      "maxLeadsPerAgent": 50,
+      "defaultRoutingEnabled": false
+    }
+    ```
   </Tab>
 </Tabs>
 
-## Integration Points
+### Team distribution settings
 
-### Event System
+<Tabs>
+  <Tab title="GET /v1/teams/:teamId/distribution/settings">
+    Retrieve team-level distribution settings.
+  </Tab>
 
-The distribution module integrates with the event system:
+  <Tab title="PUT /v1/teams/:teamId/distribution/settings">
+    Update team-level distribution settings.
+    
+    **Request:**
+    ```json
+    {
+      "distributionEnabled": true,
+      "distributionMethod": "ROUND_ROBIN",
+      "maxLeadsPerAgent": 25,
+      "capacityWindowHours": 12
+    }
+    ```
+  </Tab>
+</Tabs>
 
-```typescript
-// Listens for
-LEAD_CREATED -> triggers distribution job
-USER_STATUS_CHANGED -> invalidates agent availability cache
+### Distribution rules
 
-// Emits  
-LEAD_ASSIGNED -> when successful assignment occurs
-DISTRIBUTION_FAILED -> when assignment fails
-POOL_OVERLOAD -> when unassigned leads exceed threshold
-```
+<Tabs>
+  <Tab title="GET /v1/distribution/rules">
+    List all org-level distribution rules.
+    
+    **Query params:**
+    - `teamId` (optional): filter by team scope
+    - `isActive` (optional): filter by active status
+  </Tab>
 
-### External Dependencies
+  <Tab title="POST /v1/distribution/rules">
+    Create a new distribution rule.
+    
+    **Request:**
+    ```json
+    {
+      "name": "Enterprise Leads",
+      "priority": 10,
+      "teamId": "uuid",
+      "conditions": {
+        "budget": {"min": 50000},
+        "tagIds": ["enterprise"]
+      },
+      "distributionMethod": "WEIGHTED",
+      "targetTeamId": "uuid"
+    }
+    ```
+  </Tab>
+
+  <Tab title="PUT /v1/distribution/rules/:ruleId">
+    Update an existing distribution rule.
+  </Tab>
+
+  <Tab title="DELETE /v1/distribution/rules/:ruleId">
+    Delete a distribution rule.
+  </Tab>
+</Tabs>
+
+### Distribution analytics
+
+<Tabs>
+  <Tab title="GET /v1/distribution/analytics">
+    Retrieve distribution performance metrics.
+    
+    **Query params:**
+    - `startDate` (ISO 8601)
+    - `endDate` (ISO 8601)
+    - `teamId` (optional)
+    - `userId` (optional)
+    
+    **Response:**
+    ```json
+    {
+      "totalDistributions": 1500,
+      "successRate": 0.95,
+      "averageTimeToAssign": "2.3s",
+      "distributionsByMethod": {
+        "ROUND_ROBIN": 800,
+        "WEIGHTED": 700
+      },
+      "failuresByReason": {
+        "NO_ELIGIBLE_AGENTS": 50,
+        "CAPACITY_EXCEEDED": 25
+      }
+    }
+    ```
+  </Tab>
+
+  <Tab title="GET /v1/distribution/logs">
+    Query distribution logs with filtering.
+    
+    **Query params:**
+    - `leadId` (optional)
+    - `userId` (optional)
+    - `status` (optional)
+    - `startDate` (optional)
+    - `endDate` (optional)
+    - `page`, `limit`
+  </Tab>
+</Tabs>
+
+## Security & Permissions
+
+### Required permissions
 
 <CardGroup cols={2}>
-  <Card title="EntityStakeholderService" icon="users">
-    Creates assignment relationships between leads and agents
+  <Card title="distribution:settings:read" icon="eye">
+    View org and team distribution settings
   </Card>
-  <Card title="UserService" icon="user">
-    Validates agent availability and working hours
+
+  <Card title="distribution:settings:write" icon="pen">
+    Modify distribution settings
   </Card>
-  <Card title="TeamService" icon="people-group">
-    Retrieves team membership and hierarchy information
+
+  <Card title="distribution:rules:read" icon="book">
+    View distribution rules
   </Card>
-  <Card title="NotificationService" icon="bell">
-    Sends alerts for pool overload and capacity issues
+
+  <Card title="distribution:rules:write" icon="pencil">
+    Create, update, delete rules
+  </Card>
+
+  <Card title="distribution:analytics:read" icon="chart-line">
+    Access distribution analytics and logs
+  </Card>
+
+  <Card title="distribution:manual-assign" icon="hand">
+    Manually trigger distribution for a lead
   </Card>
 </CardGroup>
 
+### Row-level security
+
+All distribution entities enforce RLS via `organization_id`:
+
+```sql
+CREATE POLICY distribution_settings_isolation ON distribution_settings
+  USING (organization_id = current_setting('app.current_organization_id')::uuid);
+
+CREATE POLICY distribution_rules_isolation ON distribution_rule
+  USING (organization_id = current_setting('app.current_organization_id')::uuid);
+
+CREATE POLICY distribution_logs_isolation ON distribution_log
+  USING (organization_id = current_setting('app.current_organization_id')::uuid);
+```
+
+<Warning>
+The distribution engine MUST set `app.current_organization_id` before querying any distribution entities to ensure proper RLS enforcement.
+</Warning>
+
+## Observability & Audit
+
+### Logging strategy
+
+<Tabs>
+  <Tab title="Distribution attempts">
+    Every distribution attempt creates a `DistributionLog` record with:
+    - Outcome status
+    - Selected method
+    - Matched rule (if any)
+    - Agent pool metadata
+    - Error details (if failed)
+  </Tab>
+
+  <Tab title="Application logs">
+    Structured logs emitted for:
+    - Job enqueue/dequeue events
+    - Rule evaluation results
+    - Capacity check outcomes
+    - Path A→B transitions
+    - Fallback activations
+  </Tab>
+
+  <Tab title="Metrics">
+    OpenTelemetry metrics tracked:
+    - `distribution.attempts.total`
+    - `distribution.success.rate`
+    - `distribution.duration.ms`
+    - `distribution.agent_pool_size`
+    - `distribution.capacity_rejections`
+  </Tab>
+</Tabs>
+
+### Audit trail
+
+<Steps>
+  <Step title="Settings changes">
+    Tracked via `updated_at` timestamp and optional audit log integration
+  </Step>
+
+  <Step title="Rule changes">
+    All CRUD operations on rules logged with user context
+  </Step>
+
+  <Step title="Distribution outcomes">
+    Complete history maintained in `distribution_log` table
+  </Step>
+
+  <Step title="Manual assignments">
+    Stakeholder records include `assigned_by_user_id` and `assigned_at`
+  </Step>
+</Steps>
+
+## Analytics & Metrics
+
+### Key performance indicators
+
+<CardGroup cols={2}>
+  <Card title="Distribution success rate" icon="circle-check">
+    Percentage of leads successfully assigned vs. total distribution attempts
+  </Card>
+
+  <Card title="Time to assignment" icon="clock">
+    Average duration from lead creation to stakeholder assignment
+  </Card>
+
+  <Card title="Agent utilization" icon="chart-pie">
+    Lead distribution across agents (balance metric)
+  </Card>
+
+  <Card title="Rule effectiveness" icon="bullseye">
+    Match rate and outcome success per rule
+  </Card>
+
+  <Card title="Capacity saturation" icon="gauge-high">
+    Agents at or near capacity limits
+  </Card>
+
+  <Card title="Business hours coverage" icon="calendar">
+    Distribution attempts outside working hours (when gating enabled)
+  </Card>
+</CardGroup>
+
+### Analytics queries
+
+<CodeGroup>
+```sql Success Rate by Team
+SELECT
+  t.name AS team_name,
+  COUNT(*) FILTER (WHERE dl.status = 'SUCCESS') AS successful,
+  COUNT(*) AS total,
+  ROUND(
+    COUNT(*) FILTER (WHERE dl.status = 'SUCCESS')::numeric / COUNT(*)::numeric * 100,
+    2
+  ) AS success_rate_pct
+FROM distribution_log dl
+JOIN team t ON dl.team_id = t.id
+WHERE dl.created_at >= NOW() - INTERVAL '30 days'
+GROUP BY t.id, t.name
+ORDER BY success_rate_pct DESC;
+```
+
+```sql Agent Load Distribution
+SELECT
+  u.email,
+  COUNT(*) AS leads_assigned,
+  AVG(EXTRACT(EPOCH FROM (dl.created_at - l.created_at))) AS avg_time_to_assign_sec
+FROM distribution_log dl
+JOIN "user" u ON dl.assigned_user_id = u.id
+JOIN lead l ON dl.lead_id = l.id
+WHERE dl.status = 'SUCCESS'
+  AND dl.created_at >= NOW() - INTERVAL '7 days'
+GROUP BY u.id, u.email
+ORDER BY leads_assigned DESC;
+```
+
+```sql Rule Performance
+SELECT
+  dr.name AS rule_name,
+  dr.priority,
+  COUNT(*) AS match_count,
+  COUNT(*) FILTER (WHERE dl.status = 'SUCCESS') AS successful_assignments,
+  ROUND(
+    COUNT(*) FILTER (WHERE dl.status = 'SUCCESS')::numeric / COUNT(*)::numeric * 100,
+    2
+  ) AS success_rate_pct
+FROM distribution_log dl
+JOIN distribution_rule dr ON dl.matched_rule_id = dr.id
+WHERE dl.created_at >= NOW() - INTERVAL '30 days'
+GROUP BY dr.id, dr.name, dr.priority
+ORDER BY match_count DESC;
+```
+</CodeGroup>
+
+## Edge Case Handling
+
+### No eligible agents
+
+<Tabs>
+  <Tab title="Scenario">
+    All agents are offline, at capacity, or filtered out by language/working hours requirements.
+  </Tab>
+
+  <Tab title="Handling">
+    - Log `NO_ELIGIBLE_AGENTS` status
+    - Lead remains unassigned
+    - Org admins receive notification (if configured)
+    - Manual assignment required
+  </Tab>
+
+  <Tab title="Prevention">
+    - Configure fallback rules with broader criteria
+    - Set reasonable capacity limits
+    - Monitor agent availability metrics
+  </Tab>
+</Tabs>
+
+### Outside business hours
+
+<Tabs>
+  <Tab title="Scenario">
+    Distribution attempt occurs outside org working hours when `respectWorkingHours = true`.
+  </Tab>
+
+  <Tab title="Handling">
+    - Log `OUTSIDE_BUSINESS_HOURS` status
+    - Lead remains unassigned
+    - Distribution can be manually triggered later
+  </Tab>
+
+  <Tab title="Alternative">
+    Disable `respectWorkingHours` for 24/7 operations or configure per-user working hours only
+  </Tab>
+</Tabs>
+
+### Capacity exceeded
+
+<Tabs>
+  <Tab title="Scenario">
+    Selected agent reaches `maxLeadsPerAgent` limit during Phase 2 capacity check.
+  </Tab>
+
+  <Tab title="Handling">
+    - Log `CAPACITY_EXCEEDED` status
+    - Retry with next eligible agent if available
+    - If no agents available, log `NO_ELIGIBLE_AGENTS`
+  </Tab>
+
+  <Tab title="Monitoring">
+    Track `distribution.capacity_rejections` metric to identify capacity bottlenecks
+  </Tab>
+</Tabs>
+
+### Rule conflict resolution
+
+<Info>
+First-match-wins: rules are evaluated in priority order (ascending). Only the first matching rule is applied. If multiple rules have the same priority, evaluation order is undefined — ensure unique priorities.
+</Info>
+
+### Concurrent distribution attempts
+
 <Check>
-The Distribution Module is fully implemented and operational, providing automated lead assignment with comprehensive rule-based routing, capacity management, and performance analytics.
+Phase 2 capacity check uses PostgreSQL advisory locks to prevent race conditions during agent selection and stakeholder creation.
+</Check>
+
+### Team routing edge cases
+
+<Steps>
+  <Step title="Rule routes to team with distributionEnabled = false">
+    Lead assigned to team (stakeholder created) but no user assignment occurs. Manual assignment required.
+  </Step>
+
+  <Step title="Rule routes to team but no team members exist">
+    Logged as `NO_ELIGIBLE_AGENTS`. Lead assigned to team without user.
+  </Step>
+
+  <Step title="Path A→B bridge fails">
+    Error logged with context. Lead may remain unassigned or fall back to org-level assignment.
+  </Step>
+</Steps>
+
+## Performance & Scaling
+
+### Optimization strategies
+
+<CardGroup cols={2}>
+  <Card title="Batch job enqueue" icon="layer-group">
+    Bulk imports use `enqueueBatch()` to reduce pg-boss overhead
+  </Card>
+
+  <Card title="Redis state caching" icon="bolt">
+    Round-robin state cached in Redis to avoid database queries
+  </Card>
+
+  <Card title="Agent pool pre-filtering" icon="filter">
+    UserStatus and working hours checks happen before rule evaluation
+  </Card>
+
+  <Card title="Advisory locks scope" icon="lock">
+    Phase 2 locks are per-agent, allowing concurrent assignments to different agents
+  </Card>
+</CardGroup>
+
+### Database indexes
+
+```sql
+-- Rule evaluation
+CREATE INDEX idx_distribution_rule_org_active 
+  ON distribution_rule(organization_id, is_active, priority);
+
+CREATE INDEX idx_distribution_rule_team_active 
+  ON distribution_rule(team_id, is_active, priority) 
+  WHERE team_id IS NOT NULL;
+
+-- Capacity queries
+CREATE INDEX idx_entity_stakeholder_user_created 
+  ON entity_stakeholder(user_id, created_at) 
+  WHERE entity_type = 'LEAD';
+
+-- Analytics
+CREATE INDEX idx_distribution_log_org_created 
+  ON distribution_log(organization_id, created_at DESC);
+
+CREATE INDEX idx_distribution_log_team_status 
+  ON distribution_log(team_id, status, created_at DESC) 
+  WHERE team_id IS NOT NULL;
+```
+
+### Scaling considerations
+
+<AccordionGroup>
+  <Accordion title="High-volume lead ingestion">
+    - pg-boss worker concurrency can be increased via `teamSize` config
+    - Consider partitioning `distribution_log` by month for large orgs
+    - Use read replicas for analytics queries
+  </Accordion>
+
+  <Accordion title="Large agent pools">
+    - Language matching and capacity filtering reduce pool size before method application
+    - Weighted methods pre-compute normalized weights to avoid repeated calculations
+    - Consider agent segmentation via teams for better performance
+  </Accordion>
+
+  <Accordion title="Rule evaluation overhead">
+    - Limit rules to <50 per org for optimal performance
+    - Complex `customFields` conditions may require query optimization
+    - Monitor rule evaluation duration via `distribution.rule_eval.duration.ms` metric
+  </Accordion>
+</AccordionGroup>
+
+## RLS Policies
+
+### Policy definitions
+
+<CodeGroup>
+```sql distribution_settings
+CREATE POLICY distribution_settings_isolation ON distribution_settings
+  FOR ALL
+  USING (organization_id = current_setting('app.current_organization_id')::uuid)
+  WITH CHECK (organization_id = current_setting('app.current_organization_id')::uuid);
+
+CREATE POLICY distribution_settings_select ON distribution_settings
+  FOR SELECT
+  USING (organization_id = current_setting('app.current_organization_id')::uuid);
+```
+
+```sql team_distribution_settings
+CREATE POLICY team_distribution_settings_isolation ON team_distribution_settings
+  FOR ALL
+  USING (organization_id = current_setting('app.current_organization_id')::uuid)
+  WITH CHECK (organization_id = current_setting('app.current_organization_id')::uuid);
+
+-- Additional policy for team members
+CREATE POLICY team_distribution_settings_member_read ON team_distribution_settings
+  FOR SELECT
+  USING (
+    team_id IN (
+      SELECT team_id FROM team_member 
+      WHERE user_id = current_setting('app.current_user_id')::uuid
+    )
+  );
+```
+
+```sql distribution_rule
+CREATE POLICY distribution_rule_isolation ON distribution_rule
+  FOR ALL
+  USING (organization_id = current_setting('app.current_organization_id')::uuid)
+  WITH CHECK (organization_id = current_setting('app.current_organization_id')::uuid);
+
+CREATE POLICY distribution_rule_team_scope ON distribution_rule
+  FOR SELECT
+  USING (
+    team_id IS NULL 
+    OR team_id IN (
+      SELECT team_id FROM team_member 
+      WHERE user_id = current_setting('app.current_user_id')::uuid
+    )
+  );
+```
+
+```sql distribution_log
+CREATE POLICY distribution_log_isolation ON distribution_log
+  FOR ALL
+  USING (organization_id = current_setting('app.current_organization_id')::uuid);
+
+CREATE POLICY distribution_log_assigned_user ON distribution_log
+  FOR SELECT
+  USING (
+    assigned_user_id = current_setting('app.current_user_id')::uuid
+    OR has_permission('distribution:analytics:read')
+  );
+```
+</CodeGroup>
+
+<Warning>
+RLS policies are enforced at the database level. Application code MUST set `app.current_organization_id` and `app.current_user_id` session variables before executing queries.
+</Warning>
+
+## Module Structure
+
+```
+src/modules/crm/distribution/
+├── controllers/
+│   ├── distribution-settings.controller.ts
+│   ├── distribution-rules.controller.ts
+│   ├── team-distribution-settings.controller.ts
+│   └── distribution-analytics.controller.ts
+├── services/
+│   ├── distribution-engine.service.ts
+│   ├── distribution-rule.service.ts
+│   ├── distribution-settings.service.ts
+│   ├── team-distribution-settings.service.ts
+│   ├── distribution-capacity.service.ts
+│   ├── distribution-state.service.ts      # Redis-backed RR state
+│   ├── rule-evaluator.service.ts
+│   ├── language-matcher.service.ts
+│   └── agent-selector.service.ts
+├── entities/
+│   ├── distribution-settings.entity.ts
+│   ├── team-distribution-settings.entity.ts
+│   ├── distribution-rule.entity.ts
+│   └── distribution-log.entity.ts
+├── listeners/
+│   └── distribution.listener.ts           # LEAD_CREATED event handler
+├── jobs/
+│   └── distribution-job.handler.ts        # pg-boss worker
+├── dto/
+│   ├── update-distribution-settings.dto.ts
+│   ├── create-distribution-rule.dto.ts
+│   └── distribution-analytics-query.dto.ts
+├── types/
+│   ├── distribution-method.enum.ts
+│   ├── distribution-status.enum.ts
+│   └── distribution-result.interface.ts
+└── distribution.module.ts
+```
+
+## Integration Points
+
+### External module dependencies
+
+<CardGroup cols={2}>
+  <Card title="EntityStakeholderService" icon="link">
+    Creates stakeholder records for lead assignments
+  </Card>
+
+  <Card title="UserStatusService" icon="signal">
+    Filters agents by ONLINE status and working hours
+  </Card>
+
+  <Card title="TeamService" icon="users">
+    Loads team membership and settings
+  </Card>
+
+  <Card title="UserService" icon="user">
+    Loads agent profiles and language preferences
+  </Card>
+
+  <Card title="PersonService" icon="address-card">
+    Loads lead person data for language matching
+  </Card>
+
+  <Card title="EventEmitter2" icon="bell">
+    Emits and listens for LEAD_CREATED events
+  </Card>
+
+  <Card title="pg-boss" icon="briefcase">
+    Manages distribution job queue
+  </Card>
+
+  <Card title="Redis" icon="database">
+    Caches round-robin state
+  </Card>
+</CardGroup>
+
+### Event flow
+
+```mermaid
+sequenceDiagram
+    participant API as Lead API
+    participant EM as EventEmitter
+    participant PGB as pg-boss
+    participant DJH as DistributionJobHandler
+    participant DE as DistributionEngine
+    participant ESS as EntityStakeholderService
+
+    API->>EM: emit('LEAD_CREATED', { leadId, orgId, teamId? })
+    EM->>PGB: enqueue(distribution job)
+    PGB->>DJH: process(job)
+    DJH->>DE: runDistribution() or runTeamDistribution()
+    DE->>ESS: createStakeholder(leadId, userId, teamId?)
+    ESS-->>DE: stakeholder created
+    DE-->>DJH: result
+    DJH->>PGB: complete job
+```
+
+## Environment Configuration
+
+### Required environment variables
+
+```bash
+# pg-boss
+PGBOSS_DB_CONNECTION_STRING=postgresql://user:pass@host:5432/db
+PGBOSS_ARCHIVE_COMPLETED_AFTER_SECONDS=86400  # 24 hours
+
+# Redis (for RR state)
+REDIS_URL=redis://localhost:6379
+REDIS_DISTRIBUTION_STATE_TTL=86400  # 24 hours
+
+# Distribution defaults (optional overrides)
+DEFAULT_DISTRIBUTION_METHOD=ROUND_ROBIN
+DEFAULT_CAPACITY_WINDOW_HOURS=24
+DEFAULT_RESPECT_WORKING_HOURS=false
+```
+
+<Note>
+These are module-level defaults. Org-specific settings override these values.
+</Note>
+
+### Feature flags
+
+```typescript
+{
+  "distribution.enabled": true,
+  "distribution.team_level_enabled": true,
+  "distribution.default_routing_control": true,  // enables defaultRoutingEnabled setting
+  "distribution.language_matching": true,
+  "distribution.capacity_limits": true,
+  "distribution.business_hours_gating": true
+}
+```
+
+## Migration Notes
+
+<Steps>
+  <Step title="Initial deployment">
+    Run migrations to create all distribution tables with RLS policies enabled
+  </Step>
+
+  <Step title="Seed org settings">
+    Auto-creation via `getOrgSettingsRaw()` on first access ensures all orgs have default settings
+  </Step>
+
+  <Step title="Enable distribution">
+    Set `enabled = true` in org settings to activate distribution
+  </Step>
+
+  <Step title="Create rules">
+    Define distribution rules via API or admin UI
+  </Step>
+
+  <Step title="Enable team distribution (optional)">
+    Set `distributionEnabled = true` on specific teams to activate Path B
+  </Step>
+
+  <Step title="Monitor and tune">
+    Use analytics endpoints and logs to optimize rules and capacity limits
+  </Step>
+</Steps>
+
+<Check>
+No retroactive distribution: existing leads are unaffected. Only new leads created after distribution is enabled will be auto-assigned.
 </Check>
