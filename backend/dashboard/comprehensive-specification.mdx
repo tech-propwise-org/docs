@@ -1,0 +1,444 @@
+---
+title: "Dashboard Module Specification"
+description: "Complete specification for the role-aware dashboard module including scope resolution, widgets, and data aggregation"
+---
+
+<Info>
+**Last Updated:** 2026-06-05  
+**Status:** ACTIVE ✅  
+**Location:** `src/modules/crm/dashboard/`
+</Info>
+
+## Purpose
+
+A **role-aware** dashboard at `/dashboard` where every authenticated org member sees a personal view, with each persona progressively seeing more data. The base controller uses **AuthGuard-only** protection — only the two sensitive widgets carry a `@CheckAccess` gate.
+
+<Warning>
+**The Bug This Fixes**
+
+The old `/dashboard` called `GET /analytics/permissions`, gated by `@CheckAccess(ANALYTICS_VIEW)`, so zero-permission users got a `403` and a blank dashboard. The dashboard module is un-gated at the base, so a BASIC user now gets a non-empty self-scoped dashboard.
+</Warning>
+
+## Scope Model
+
+### Server-Side Resolution ("Broadest Wins")
+
+`DashboardScopeService.resolveScopes(userId, orgId)` returns a per-domain resolved scope computed from **team-membership-level** data via ONE consolidated load of:
+- `UserOrgRole → role → permissions`
+- `TeamMembership → teamRoles → role → permissions`
+
+<Note>
+**CRITICAL (Gap #1):** The service does NOT use the flattened `PermissionService.getUserEffectivePermissions` set — that collapses all team permissions across all teams and loses which team granted `team_crm.view`. 
+
+A user who leads Team A (`team_crm.view`) and is a plain member of Team B (no team perms) resolves `crm.defaultTeamIds === [A]` only.
+</Note>
+
+### Domain Scope Contract
+
+Per-domain capability (`DomainScope`):
+
+- **`hasOrg`**: org-permission present (or `system.admin` / `system.owner`, which grant org on every domain)
+- **`defaultTeamIds`**: the membership teams whose roles grant that domain's team key — the default `team`-level aggregate
+- **`availableTeams`**: the dropdown/validation set = membership teams (+ all org teams when the user is org-capable, so org users can drill into any team)
+
+| Domain | Org When | Team Key | Self Floor | Hidden When |
+|--------|----------|----------|------------|-------------|
+| CRM (leads) | `crm.view`/`crm.manage`/admin/owner | `team_crm.view` | always | never |
+| Sales (deals) | `sales.view`/`sales.manage`/admin/owner | `team_sales.view` | always | never |
+| Finance (money) | `finance.view`/`finance.manage`/admin/owner | — (no team) | always | never |
+| Real Estate (listings) | `real_estate.view`/`real_estate.manage`/admin/owner | — | — | no real_estate access |
+| Analytics (team perf) | `analytics.view`/admin/owner | `team_analytics.view` OR team leader | — | no analytics access |
+
+### ResolvedScope Contract
+
+```typescript
+type DashboardScopeLevel = 'org' | 'team' | 'self';
+
+interface ResolvedScope {
+  level: DashboardScopeLevel;
+  userId: string;
+  orgId: string;
+  teamIds: string[];
+}
+```
+
+<Info>
+Defined in `src/common/scope/resolved-scope.ts` (neutral location so domain services can depend on it without a cycle back into the dashboard module). Passed to **every** composable.
+</Info>
+
+## Scope Switcher & Clamping
+
+### Global Switcher
+
+The UI exposes one global **My/Team/Org** switcher plus a **team picker** that appears only when `scope === 'team'`. 
+
+<Steps>
+<Step title="Team Selection">
+The picker lists the union of `availableTeams` across CRM, Sales, and Analytics (deduped by id). The chosen `teamId` is sent on every `/dashboard/*` widget request.
+</Step>
+
+<Step title="Single Team Display">
+When the user has exactly one eligible team, the UI shows a read-only team label instead of a dropdown.
+</Step>
+
+<Step title="Server-Side Clamping">
+The requested level is clamped per widget to its domain max using the `clampDomain` function (server-authoritative).
+</Step>
+</Steps>
+
+### Domain Clamping Rules
+
+<Tabs>
+<Tab title="CRM/Sales (Self Floor)">
+- **`org`** → org else team else self
+- **`team`** → team else org else self
+- **`my`** → self
+</Tab>
+
+<Tab title="Finance (No Team)">
+- **`my`** → self
+- **`team`/`org`** → org if `finance.view` else **self** (Gap A)
+</Tab>
+
+<Tab title="Real Estate (No Team, No Self)">
+- Always org if `real_estate.view`, else hidden
+</Tab>
+
+<Tab title="Analytics (No Self)">
+- **`org`** → org else team else hidden
+- **`team`/`my`** → team else org else hidden
+</Tab>
+</Tabs>
+
+### Team ID Handling
+
+<Note>
+A passed `teamId` is re-validated against the domain's `availableTeams` and narrows `teamIds` to `[teamId]`. An out-of-domain `teamId` is **ignored** (never trusted), falling back to `defaultTeamIds`.
+
+When `team` resolves with no `teamId`, it aggregates across ALL eligible teams via `es.team_id IN (?)` (Knex expands the bound id array) — there is NO "must select a team" dead-end.
+</Note>
+
+### Team Attribution
+
+<Tip>
+**Aligned with CRM lead/deal list "Team" tab:** Dashboard `team` scope counts leads/deals where `entity_stakeholder.team_id` matches the eligible team id(s) — the same rule as `LeadService.applyTeamLeadsFilter`.
+
+This **includes unclaimed team-pool rows** (`es.user_id IS NULL` with `es.team_id` set). It does **not** join `team_membership` on the assignee's user id (the old path silently dropped pool leads and produced counts that disagreed with the lead list).
+</Tip>
+
+### Frontend Implementation
+
+**Files:** `dashboard-view.tsx` + `dashboard-controls.tsx`
+
+- `mergeGlobalAvailableTeams()` builds the global picker list
+- `resolveTeamScopeSelection()` keeps a valid default when the user switches to Team scope
+- `buildDashboardParams()` includes `teamId` only while Team scope is active
+
+### Monetary Rule (Gap A)
+
+<Warning>
+ALL monetary aggregates (Total Revenue, Revenue Forecast, pipeline VALUE totals) resolve their amount via the **Finance** scope, even though the deal SET/counts resolve via the **Sales** scope.
+
+A `sales.view`-without-`finance.view` user therefore sees team/org deal **counts** but **self-scoped money**.
+</Warning>
+
+## Dashboard Endpoints
+
+All endpoints at `/dashboard/*` accept common query parameters: `?scope&teamId&dateFrom&dateTo`
+
+### Date Range Validation
+
+`DashboardQueryDto` validates `dateTo` when both bounds are present:
+
+<CodeGroup>
+```typescript Validation Rules
+// dateTo >= dateFrom (inclusive)
+// Span ≤ DASHBOARD_MAX_RANGE_DAYS (366 days — one calendar year, incl. leap day)
+
+// Invalid ranges return HTTP 400 with:
+// "dateTo must be on or after dateFrom and within 366 days"
+```
+</CodeGroup>
+
+### Frontend Normalization (Custom Preset)
+
+Before widgets call `/dashboard/*`, the CRM app normalizes user picks in `dashboard.utils.ts` → `rangeToDates()`:
+
+<Steps>
+<Step title="Order Inverted Endpoints">
+Swap when `from` is after `to`
+</Step>
+
+<Step title="Cap Future Dates">
+Cap `dateTo` at `now` (future end dates are rejected server-side)
+</Step>
+
+<Step title="Handle Inversion">
+If the window is still inverted after capping, collapse `dateFrom` to `startOfDay(dateTo)`
+</Step>
+
+<Step title="Clamp Range">
+Clamp `dateFrom` to the most recent `DASHBOARD_MAX_RANGE_DAYS` window when the preset/custom span would exceed one calendar year
+
+**Note:** `This Year` is **not** silently shortened to 90 days
+</Step>
+</Steps>
+
+<Info>
+Custom date pickers also disable future calendar days (`maxDate={today}`). Empty windows (valid range, zero rows) return **200** with empty series — widgets show the empty state, not the error shell.
+</Info>
+
+### Endpoint Reference
+
+<AccordionGroup>
+<Accordion title="GET /config">
+**Guard:** AuthGuard  
+**Scope:** —  
+**Source:** `DashboardScopeService`
+
+Returns configuration including scopes, available scopes, available teams, and visible widgets.
+
+```typescript Response Shape
+{
+  scopes: {
+    crm:        { level: 'org'|'team'|'self',  teamIds: string[] },
+    sales:      { level: 'org'|'team'|'self',  teamIds: string[] },
+    finance:    { level: 'org'|'self',          teamIds: [] },
+    realEstate: { level: 'org'|'none',          teamIds: [] },
+    analytics:  { level: 'org'|'team'|'none',   teamIds: string[] },
+  },
+  availableScopes: ('my'|'team'|'org')[],   // union, most-permissive wins
+  availableTeams: { crm: [...], sales: [...], analytics: [...] },  // domain-keyed (gap #2)
+  visibleWidgets: string[],
+}
+```
+</Accordion>
+
+<Accordion title="GET /kpis">
+**Guard:** AuthGuard  
+**Scope:** CRM + Sales + Finance  
+**Source:** `AnalyticsService.getAnalyticsForScopeInTransaction` ×2 + `DealService.sumWonDealValueInTransaction`
+
+Returns key performance indicators including total leads, win-rate, and revenue.
+</Accordion>
+
+<Accordion title="GET /revenue-forecast">
+**Guard:** AuthGuard  
+**Scope:** Finance  
+**Source:** `DealService.getRevenueForecastInTransaction`
+
+Returns revenue forecast data based on finance scope.
+</Accordion>
+
+<Accordion title="GET /pipeline-summary">
+**Guard:** AuthGuard  
+**Scope:** CRM + Sales + Finance  
+**Source:** `LeadService.getLeadPipelineSummaryInTransaction` + `DealService.getDealStageCounts/Values`
+
+Returns pipeline summary with terminal **DONE** lead stage split into **Won** / **Lost** virtual buckets by `lead.isWon`, keyed `${stageId}:won`/`:lost`, green/red.
+</Accordion>
+
+<Accordion title="GET /lead-volume">
+**Guard:** AuthGuard  
+**Scope:** CRM  
+**Source:** `LeadService.getLeadVolumeSeriesInTransaction`
+
+Returns lead volume time series data.
+</Accordion>
+
+<Accordion title="GET /lead-source">
+**Guard:** AuthGuard  
+**Scope:** CRM  
+**Source:** `AnalyticsService.getAnalyticsForScopeInTransaction` (leads)
+
+Returns lead source analytics.
+</Accordion>
+
+<Accordion title="GET /activity-feed">
+**Guard:** AuthGuard  
+**Scope:** CRM/Sales (performer-based)  
+**Source:** `UnifiedTimelineService.getActivityFeedInTransaction`
+
+Returns cursor-paginated activity feed including audit lifecycle events + logged activities.
+
+See [Activity Feed Performer Scope](#activity-feed-performer-scope) for details.
+</Accordion>
+
+<Accordion title="GET /tasks">
+**Guard:** AuthGuard  
+**Scope:** Self only  
+**Source:** `TaskService.getUpcomingTasksInTransaction`
+
+Returns upcoming tasks for the authenticated user.
+</Accordion>
+
+<Accordion title="GET /team-performance">
+**Guard:** `@CheckAccess(ANALYTICS_VIEW)` OR teamCheck `TEAM_ANALYTICS_VIEW`  
+**Scope:** Analytics  
+**Source:** `EntityStakeholderService.getTeamPerformanceInTransaction`
+
+Returns team performance metrics including active leads, deals, win rate, and stalled leads.
+</Accordion>
+
+<Accordion title="GET /listings">
+**Guard:** `@CheckAccess(REAL_ESTATE_VIEW)`  
+**Scope:** Real Estate (org)  
+**Source:** `InventoryUnitService` + `SharedListingService` summaries (gap H)
+
+Returns real estate listings summary.
+</Accordion>
+</AccordionGroup>
+
+### Multi-Domain Widgets (Gap B)
+
+<Note>
+KPIs (Total Leads = CRM; Win-rate = Sales; Revenue = Sales set + Finance money) and Pipeline Summary (lead pipeline = CRM; deal pipeline = Sales; value = Finance) apply EACH sub-metric's own domain `ResolvedScope` — the single requested level is clamped per domain.
+</Note>
+
+### Activity Feed Performer Scope (Gap C)
+
+**Performer-based scope resolution:**
+
+- **`self`** = `[userId]`
+- **`team`** = `[userId] ∪ members of eligible CRM/Sales teams`
+- **`org`** = `null` (no performer filter)
+
+Member ids resolved via `TeamMembershipService.getMemberUserIdsInTransaction`.
+
+<Info>
+**Cursor Pagination:** Uses base64url `{ createdAt, id }` keyset — infinite scroll, no "view full log" link.
+</Info>
+
+#### Unified Timeline Source
+
+The feed is backed by `UnifiedTimelineService.getActivityFeedInTransaction(em, orgId, { actorUserIds, cursor, limit })`, **not** raw `activity` rows.
+
+It merges:
+- **Audit lifecycle events** (lead created, stage changed, assigned, transfer, deal won/lost, …; curated audit tables resolved into human messages by `AuditTimelineResolver`)
+- **Logged activities** (note/call/email/meeting/…)
+
+All attributed to the resolved performers (`null` = org).
+
+```typescript DashboardActivityItemDto
+{
+  source: 'audit' | 'activity',
+  activityType: TimelineEventType | ActivityType,  // row `kind`
+  summary: string,  // pre-resolved message
+  accentColor?: string,
+  targetEntityType?: string,
+  targetEntityId?: string,
+}
+```
+
+<Tip>
+The frontend widget keys its icon/tint off `activityType`. See `Docs/TIMELINE_MODULE_SPECIFICATION.md` → *Org-Wide Actor Activity Feed*.
+</Tip>
+
+### Tasks vs Events (Gap G)
+
+<Warning>
+Self-only scope (Decision F).
+</Warning>
+
+- **Events** = tasks with `taskType IN (MEETING, SITE_VISIT)` AND `hasDueTime = true`
+- **Tasks** = the rest
+
+Both come from `TaskService`.
+
+### Team Performance Agent Clamp (Gap #5)
+
+<CardGroup cols={2}>
+<Card title="Team Level" icon="users">
+Agents clamped to `team_membership` of the eligible `teamIds`
+</Card>
+
+<Card title="Org Level" icon="building">
+All org team members (a team leader never sees every org agent)
+</Card>
+</CardGroup>
+
+**Per-agent rows include:**
+- Active leads
+- Deals (total/won/open)
+- Win rate
+- **Stalled** leads (active leads with no activity in the last `DASHBOARD_STALLED_LEAD_DAYS` days)
+
+## Module-Boundary Compliance
+
+<Check>
+The dashboard module never raw-SQLs another module's tables. Composable `*InTransaction(em, ...)` methods were added to the owning services.
+</Check>
+
+### Service Methods
+
+| Service | Method |
+|---------|--------|
+| `AnalyticsService` | `getAnalyticsForScopeInTransaction`, `applyScopeFilter` |
+| `LeadService` | `getLeadVolumeSeriesInTransaction`, `getLeadPipelineSummaryInTransaction` |
+| `DealService` | `sumWonDealValueInTransaction`, `getDealStageCountsInTransaction`, `getDealStageValuesInTransaction`, `getRevenueForecastInTransaction` |
+| `UnifiedTimelineService` | `getActivityFeedInTransaction` (cursor, actor-based; merges audit lifecycle events + logged activities) |
+| `TaskService` | `getUpcomingTasksInTransaction` |
+| `EntityStakeholderService` | `getTeamPerformanceInTransaction` (CRM-internal lead/deal/activity join — documented exception, see `QUERY_OPTIMIZATION_PATTERNS.md §1.5`) |
+| `TeamMembershipService` | `getMemberUserIdsInTransaction` |
+| `InventoryUnitService` | `getListingsSummaryInTransaction` |
+| `SharedListingService` | `getListingsSummaryInTransaction` (gap H) |
+
+## Constants
+
+**File:** `dashboard.constants.ts`
+
+<Tabs>
+<Tab title="Widget Keys">
+Enumeration of all dashboard widget identifiers
+</Tab>
+
+<Tab title="Scope Request">
+Scope request enum values (`my`, `team`, `org`)
+</Tab>
+
+<Tab title="Date Ranges">
+- **Default range:** 30 days
+- **Max range:** 366 days (one calendar year including leap day)
+- **Lead volume default:** 14 days
+</Tab>
+</Tabs>
+
+## Implementation Notes
+
+<CardGroup cols={2}>
+<Card title="Scope Resolution" icon="filter">
+Server-authoritative with "broadest wins" policy across all team memberships
+</Card>
+
+<Card title="Team Attribution" icon="users-gear">
+Aligned with CRM lead/deal list "Team" tab behavior including unclaimed pool items
+</Card>
+
+<Card title="Monetary Scope" icon="dollar-sign">
+Finance scope governs all monetary values regardless of the underlying entity scope
+</Card>
+
+<Card title="Activity Feed" icon="timeline">
+Unified timeline combining audit events and logged activities with cursor pagination
+</Card>
+</CardGroup>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+<Card title="Timeline Module" icon="book" href="/backend/timeline-module">
+Unified timeline specification for audit events and activity feed
+</Card>
+
+<Card title="Query Optimization" icon="gauge-high" href="/backend/query-optimization">
+Performance patterns including EntityStakeholder join exception
+</Card>
+
+<Card title="Scope Resolution" icon="shield-halved" href="/backend/scope-resolution">
+Common scope resolution contracts and utilities
+</Card>
+
+<Card title="Permission System" icon="lock" href="/backend/permissions">
+Role-based access control and permission inheritance
+</Card>
+</CardGroup>
