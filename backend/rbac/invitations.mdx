@@ -30,7 +30,7 @@ The RBAC system is built on five core principles that ensure scalability, securi
 **Flexible role management** with global and organization-specific roles:
 - System roles: `organization = NULL` (global/seeded)
 - Custom roles: `organization = specific org ID`
-- System roles: Owner, Admin, Basic, Team Leader, Agent, AI Service
+- System roles: Owner, Admin, Basic, Team Leader, Agent, AI Service, System Service
 - Custom roles defined per organization for specific needs
 </Tab>
 
@@ -132,7 +132,7 @@ User
 │   ├── reset_password_code?: string
 │   └── reset_password_code_expires?: timestamp
 ├── Relationships:
-│   ├── organizations → Organization[] (via organization_users; each membership has public_id + avatar colors)
+│   ├── organizations → Organization[] (via organization_users; each membership has public_id + avatar colors, e.g. USER-ADNS-001)
 │   ├── orgRoles → UserOrgRole[] (roles in orgs)
 │   └── teamMemberships → TeamMembership[]
 └── Timestamps: created_at, updated_at
@@ -349,6 +349,30 @@ Indexes:
 └── (organization_id)
 ```
 
+### TeamAvailablePermission
+
+**Purpose**: Controls which permissions are available for assignment within teams.
+
+```typescript
+TeamAvailablePermission
+├── id: uuid
+├── team_id: uuid → Team
+├── permission_id: uuid → Permission
+├── organization_id: uuid → Organization (required for RLS)
+├── added_by_id: uuid → User
+├── Relationships:
+│   ├── team → Team (ManyToOne)
+│   ├── permission → Permission (ManyToOne)
+│   ├── organization → Organization (ManyToOne)
+│   └── addedBy → User (ManyToOne)
+└── Timestamps: created_at, updated_at
+
+Indexes:
+├── (team_id, permission_id) [unique]
+├── (team_id)
+└── (permission_id)
+```
+
 ## Permission resolution
 
 The permission resolution engine determines user access through a comprehensive inheritance and aggregation system:
@@ -423,6 +447,47 @@ await this.cacheService.set(
 ```
 </Step>
 </Steps>
+
+### Permission resolution algorithm
+
+The complete resolution flow follows this algorithm:
+
+```typescript
+async function resolveUserPermissions(
+  userId: string, 
+  organizationId: string,
+  teamId?: string
+): Promise<Set<string>> {
+  const permissions = new Set<string>();
+  
+  // Step 1: Resolve organization-level permissions
+  const orgRoles = await getOrgRoles(userId, organizationId);
+  orgRoles.forEach(role => {
+    role.permissions.forEach(p => permissions.add(p.key));
+  });
+  
+  // Step 2: Resolve team-level permissions (if team context)
+  if (teamId) {
+    const teamRoles = await getTeamRoles(userId, teamId);
+    teamRoles.forEach(role => {
+      role.permissions.forEach(p => {
+        // Team roles can have both TEAM and ORG scoped permissions
+        if (p.scope === 'TEAM' || p.scope === 'ORG') {
+          permissions.add(p.key);
+        }
+      });
+    });
+  } else {
+    // If no team context, aggregate from all teams
+    const allTeamRoles = await getAllTeamRoles(userId, organizationId);
+    allTeamRoles.forEach(role => {
+      role.permissions.forEach(p => permissions.add(p.key));
+    });
+  }
+  
+  return permissions;
+}
+```
 
 ## System roles
 
@@ -539,6 +604,20 @@ const aiServicePermissions = [
   'deals:read', 'deals:update',
   'activities:create', 'ai:analyze', 'ai:suggest'
 ];
+```
+</Accordion>
+
+<Accordion title="System Service role">
+**System automation actor** for internal operations:
+- `organization_id`: NULL (system role)
+- `scope`: ORG
+- **Assignment**: Only for System service users (`is_system_service_user = true`)
+- **Exclusion**: Cannot be assigned via invitations
+- **Special**: Has no RBAC role assignment — operates with elevated privileges outside RBAC
+
+```typescript
+// System Service has no permissions via RBAC
+// It operates with direct database access for system tasks
 ```
 </Accordion>
 </AccordionGroup>
@@ -696,6 +775,15 @@ await this.validateRoleAssignments(
   dto.orgRoleAssignments, 
   dto.teamRoleAssignments
 );
+
+// Ensure Owner role is not assigned via invitation
+const ownerRole = await this.em.findOne(Role, { 
+  name: 'Owner', 
+  organization: null 
+});
+if (dto.orgRoleAssignments.some(r => r.roleId === ownerRole.id)) {
+  throw new BadRequestException('Cannot assign Owner role via invitation');
+}
 ```
 </Step>
 
@@ -864,6 +952,35 @@ await this.tenantContext.executeWithBypass(async (bypassEm) => {
 });
 ```
 
+### Invitation token validation
+
+Comprehensive validation flow for invitation tokens:
+
+```typescript
+private async validateInvitationToken(token: string): Promise<Invitation> {
+  const invitation = await this.em.findOne(Invitation, 
+    { token },
+    { populate: ['organization', 'invitedBy'] }
+  );
+  
+  if (!invitation) {
+    throw new NotFoundException('Invitation not found');
+  }
+  
+  if (invitation.status !== InvitationStatus.PENDING) {
+    throw new BadRequestException(`Invitation is ${invitation.status}`);
+  }
+  
+  if (invitation.expiresAt && new Date() > invitation.expiresAt) {
+    invitation.status = InvitationStatus.EXPIRED;
+    await this.em.persistAndFlush(invitation);
+    throw new BadRequestException('Invitation has expired');
+  }
+  
+  return invitation;
+}
+```
+
 ## Query patterns
 
 Common query patterns for RBAC operations with optimized performance:
@@ -954,6 +1071,20 @@ async getAssignableRoles(organizationId: string, scope?: RoleScope) {
 }
 ```
 </Accordion>
+
+<Accordion title="Pending invitations for organization">
+```typescript
+async getPendingInvitations(organizationId: string) {
+  return this.em.find(Invitation, {
+    organization: organizationId,
+    status: InvitationStatus.PENDING
+  }, {
+    populate: ['invitedBy'],
+    orderBy: { created_at: 'DESC' }
+  });
+}
+```
+</Accordion>
 </AccordionGroup>
 
 ## Business rules
@@ -1017,6 +1148,26 @@ return hasOrgPermission || hasTeamPermission;
 ```
 </Accordion>
 
+<Accordion title="Invitation constraints">
+**Invitation creation and acceptance rules**:
+- No duplicate pending invitations for same email + organization
+- Owner role cannot be assigned via invitation
+- Service account roles (AI Service, System Service) cannot be assigned via invitation
+- Expired invitations cannot be accepted
+
+```typescript
+// Prevent Owner role assignment via invitation
+const ownerRole = await this.em.findOne(Role, { 
+  name: 'Owner', 
+  organization: null 
+});
+
+if (dto.orgRoleAssignments.some(r => r.roleId === ownerRole.id)) {
+  throw new BadRequestException('Cannot assign Owner role via invitation');
+}
+```
+</Accordion>
+
 <Accordion title="Remove user from organization">
 **Complete removal workflow** with proper cleanup:
 
@@ -1074,6 +1225,18 @@ await this.em.nativeDelete(OrganizationUser, {
   user: userId,
   organization: organizationId
 });
+```
+</Step>
+
+<Step title="Handle selected organization">
+If removed organization was selected, switch to another:
+
+```typescript
+if (user.selectedOrganizationId === organizationId) {
+  const remainingOrgs = await this.getUserOrganizations(userId);
+  user.selectedOrganizationId = remainingOrgs[0]?.id || null;
+  await this.em.persistAndFlush(user);
+}
 ```
 </Step>
 </Steps>
@@ -1196,6 +1359,112 @@ export class InvitationService {
     
     return invitation;
   }
+  
+  async resendInvitation(invitationId: string, resentBy: string): Promise<Invitation> {
+    const invitation = await this.em.findOneOrFail(Invitation, { id: invitationId });
+    
+    if (invitation.status !== InvitationStatus.PENDING) {
+      throw new BadRequestException('Can only resend pending invitations');
+    }
+    
+    invitation.resentBy = { id: resentBy } as User;
+    invitation.resentAt = new Date();
+    invitation.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    
+    await this.em.persistAndFlush(invitation);
+    await this.emailService.sendInvitationEmail(invitation);
+    
+    return invitation;
+  }
+  
+  async cancelInvitation(invitationId: string, cancelledBy: string): Promise<Invitation> {
+    const invitation = await this.em.findOneOrFail(Invitation, { id: invitationId });
+    
+    if (invitation.status !== InvitationStatus.PENDING) {
+      throw new BadRequestException('Can only cancel pending invitations');
+    }
+    
+    invitation.status = InvitationStatus.CANCELLED;
+    invitation.cancelledBy = { id: cancelledBy } as User;
+    invitation.cancelledAt = new Date();
+    
+    await this.em.persistAndFlush(invitation);
+    
+    return invitation;
+  }
+}
+```
+</Tab>
+
+<Tab title="PermissionResolutionService">
+**Permission resolution service** with caching:
+
+```typescript
+@Injectable()
+export class PermissionResolutionService {
+  async resolvePermissions(
+    userId: string,
+    organizationId: string
+  ): Promise<Set<string>> {
+    // Check cache first
+    const cached = await this.cacheService.get(
+      `permissions:${userId}:${organizationId}`
+    );
+    if (cached) {
+      return new Set(cached);
+    }
+    
+    // Resolve from database
+    const permissions = await this.resolveFromDatabase(userId, organizationId);
+    
+    // Cache for 5 minutes
+    await this.cacheService.set(
+      `permissions:${userId}:${organizationId}`,
+      Array.from(permissions),
+      300
+    );
+    
+    return permissions;
+  }
+  
+  private async resolveFromDatabase(
+    userId: string,
+    organizationId: string
+  ): Promise<Set<string>> {
+    const permissions = new Set<string>();
+    
+    // Get org roles
+    const orgRoles = await this.em.find(UserOrgRole, {
+      user: userId,
+      organization: organizationId
+    }, {
+      populate: ['role', 'role.permissions']
+    });
+    
+    orgRoles.forEach(uor => {
+      uor.role.permissions.forEach(p => permissions.add(p.key));
+    });
+    
+    // Get team roles
+    const teamRoles = await this.em.createQueryBuilder(TeamMembershipRole, 'tmr')
+      .innerJoin('tmr.teamMembership', 'tm')
+      .innerJoin('tmr.role', 'r')
+      .leftJoinAndSelect('r.permissions', 'p')
+      .where('tm.user = ?', [userId])
+      .andWhere('tm.organization = ?', [organizationId])
+      .andWhere('tm.is_active = true')
+      .getResultList();
+    
+    teamRoles.forEach(tmr => {
+      tmr.role.permissions.forEach(p => permissions.add(p.key));
+    });
+    
+    return permissions;
+  }
+  
+  async invalidateCache(userId: string, organizationId: string): Promise<void> {
+    await this.cacheService.del(`permissions:${userId}:${organizationId}`);
+  }
 }
 ```
 </Tab>
@@ -1282,6 +1551,7 @@ src/rbac/
 │   ├── user-org-role.entity.ts
 │   ├── team-membership.entity.ts
 │   ├── team-membership-role.entity.ts
+│   ├── team-available-permission.entity.ts
 │   └── invitation.entity.ts
 ├── services/
 │   ├── rbac.service.ts

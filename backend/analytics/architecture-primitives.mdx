@@ -1,0 +1,751 @@
+---
+title: "Architecture & Primitives"
+description: "How the analytics machine is built: capture sources, guardrails, backend primitives, bucketing, and operational setup"
+---
+
+How product analytics works at Propwise, end to end. This is the **how the machine is built** doc.
+
+<Info>
+**Related documentation:**
+- For the list of every event see [Analytics Event Catalog](/backend/analytics/event-catalog)
+- For how to *add* tracking to a new flow see [Analytics Agent Guide](/backend/analytics/agent-guide)
+</Info>
+
+<Note>
+**Scope:** Behavioral product analytics (adoption, retention, funnels, intent, drop-off).
+
+**Not included:** AI cost/credits (`ai_usage_event` / `ai_credit_ledger`), error tracking (Sentry), or session replay (Sentry).
+</Note>
+
+## Two capture sources, one funnel
+
+Events come from two clients, stitched by `distinctId = userId` and the `organization` group so backend truth and browser intent join into a single funnel.
+
+| Source | Owns | Where |
+|--------|------|-------|
+| **Backend** (`posthog-node`) | Source of truth — lifecycle outcomes, server-authoritative facts (counts, status, tokens). Never trust the client for these. | `ProductAnalyticsService` (+ per-domain services), `PosthogService` |
+| **Frontend** (`posthog-js`) | Intent / engagement / drop-off — only the browser knows a user gave up, switched effort, copied, abandoned a wizard. | `src/lib/analytics/capture.ts` (`captureEvent`), engagement islands |
+
+```mermaid
+graph LR
+    A[Browser] -->|posthog-js| B[/ingest reverse-proxy]
+    B --> C[PostHog EU Cloud]
+    D[NestJS ProductAnalyticsService] -->|posthog-node| C
+    E[NestJS billing listener] -->|posthog-node groupIdentify| C
+```
+
+<CodeGroup>
+
+```typescript Backend Flow
+// ProductAnalyticsService captures server-authoritative events
+await this.productAnalytics.track(
+  POSTHOG_FEATURE.DEALS,
+  DEAL_EVENTS.DEAL_WON,
+  { deal_id: deal.id, value_bucket: bucketValue(deal.value) }
+);
+```
+
+```typescript Frontend Flow
+// captureEvent captures user intent and engagement
+captureEvent(
+  FEATURE.DEALS,
+  DEAL_EVENTS.DEAL_DETAIL_VIEWED,
+  { deal_id: dealId }
+);
+```
+
+</CodeGroup>
+
+## Guardrails (non-negotiable)
+
+<Warning>
+These constraints are **mandatory** and cannot be bypassed. Violations compromise data residency, privacy, or system reliability.
+</Warning>
+
+<AccordionGroup>
+
+<Accordion title="EU host (data residency)">
+**Required:** `eu.i.posthog.com`
+
+All analytics data must remain in the EU for GDPR compliance. The CRM contains lead PII that must not cross into non-EU regions.
+</Accordion>
+
+<Accordion title="Session replay OFF">
+**Config:** `disable_session_recording: true`
+
+Sentry owns session replay. PostHog session recording is permanently disabled to avoid duplicate tooling and data storage.
+</Accordion>
+
+<Accordion title="/ingest reverse proxy (ad-blocker resistant)">
+**Implementation:** `next.config.ts` rewrites
+
+```typescript
+// next.config.ts
+rewrites: [
+  { source: '/ingest/:path*', destination: 'https://eu.i.posthog.com/:path*' },
+  { source: '/ingest/static/:path*', destination: 'https://eu-assets.i.posthog.com/:path*' }
+]
+```
+
+Prevents ad-blockers from dropping analytics events by proxying through the application domain.
+</Accordion>
+
+<Accordion title="Dimensions only (no PII)">
+**NEVER send:**
+- Names, emails, phones, addresses
+- Notes, message text, record contents
+- Raw money amounts, credentials
+- Raw error messages
+
+**Allowed:**
+- Opaque IDs (`conversation_id`, `deal_id`, `entity_id`) as join keys
+- Magnitudes through **buckets** only (see Buckets section)
+- Field **names** in change tracking (never values)
+</Accordion>
+
+<Accordion title="Best-effort (never block mutations)">
+Every capture is fire-and-forget and swallows errors. Analytics can **never** break or slow a mutation.
+
+```typescript
+try {
+  await this.productAnalytics.track(feature, event, properties);
+} catch (error) {
+  // Swallowed — analytics failure never propagates
+}
+```
+</Accordion>
+
+</AccordionGroup>
+
+## Decoupled + inline + post-commit
+
+The shared pattern for every backend domain:
+
+<Steps>
+
+<Step title="Fire inline from the service">
+Never ride a notification / search-index / sync event bus — analytics is its own decoupled concern.
+</Step>
+
+<Step title="Capture after transaction commits">
+Fire **after** the org transaction commits (capture the data into an outer `let` inside the txn, emit once it returns). Never on a rollback path.
+
+```typescript
+async createDeal(data: CreateDealDto) {
+  let createdDeal;
+  
+  await this.db.transaction(async (tx) => {
+    createdDeal = await tx.deal.create({ data });
+    // ... other operations
+  });
+  
+  // Fire analytics AFTER commit succeeds
+  await this.dealAnalytics?.dealCreated(createdDeal);
+  
+  return createdDeal;
+}
+```
+</Step>
+
+<Step title="Wrap in try/catch">
+Every capture is wrapped so a thrown capture is swallowed and never breaks the primary operation.
+</Step>
+
+<Step title="Use per-domain analytics service">
+Centralized **per-domain analytics service** owns enum mapping + bucketing + PII exclusion, so call sites stay one-liners.
+
+```typescript
+// Clean call site
+this.dealAnalytics?.dealWon(deal);
+
+// vs. inline capture logic everywhere ❌
+```
+</Step>
+
+</Steps>
+
+## Backend primitives
+
+`PosthogModule` (`src/modules/posthog/`) is `@Global()` — inject anywhere without re-importing.
+
+<CardGroup cols={2}>
+
+<Card title="PosthogService" icon="server">
+Wraps `posthog-node`. No-op client when disabled (local/dev or no key).
+
+**Methods:**
+- `capture()` — requires a typed `feature` arg
+- `groupIdentify()` — for group traits
+- Both swallow errors
+
+**Lifecycle:** `onModuleDestroy()` flushes via `shutdown()` raced against `POSTHOG_SHUTDOWN_TIMEOUT_MS`
+</Card>
+
+<Card title="ProductAnalyticsService" icon="chart-line">
+The ONE reusable primitive.
+
+**Methods:**
+- `track(feature, event, properties?, opts?)` — user-driven actions
+- `trackForOrg(feature, event, organizationId, properties?)` — no-request contexts
+</Card>
+
+</CardGroup>
+
+### ProductAnalyticsService methods
+
+<Tabs>
+<Tab title="track() - User context">
+
+Resolves `distinctId = userId` + `organizationId` from the **CLS** ambient request context (populated by `AuthGuard`). Skips if neither is known.
+
+**Use for:** User-driven actions
+
+```typescript
+await this.productAnalytics.track(
+  POSTHOG_FEATURE.DEALS,
+  DEAL_EVENTS.DEAL_CREATED,
+  {
+    deal_id: deal.id,
+    value_bucket: bucketValue(deal.value),
+    stage: deal.stage
+  }
+);
+```
+
+</Tab>
+
+<Tab title="trackForOrg() - No request">
+
+Stable `distinctId = org-{id}`, no user.
+
+**Use for:** No-request contexts: webhooks, cron, queue workers
+
+```typescript
+await this.productAnalytics.trackForOrg(
+  POSTHOG_FEATURE.WEBHOOKS,
+  WEBHOOK_EVENTS.WEBHOOK_RECEIVED,
+  organizationId,
+  {
+    webhook_type: 'stripe',
+    event_type: payload.type
+  }
+);
+```
+
+</Tab>
+</Tabs>
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `posthog.constants.ts` | `POSTHOG_FEATURE` (feature tags), flush/shutdown tuning, `POSTHOG_ORGANIZATION_GROUP_TYPE` |
+| `posthog-events.constants.ts` | Backend event-name registry (one `*_EVENTS` const per domain) |
+| `src/config/app.config.ts` | `app.posthog` config: `apiKey`, `host`, `enabled` |
+
+### Configuration
+
+<CodeGroup>
+
+```typescript app.config.ts
+posthog: {
+  apiKey: process.env.POSTHOG_API_KEY,
+  host: process.env.POSTHOG_HOST || 'eu.i.posthog.com',
+  enabled: (isStaging || isProduction) && !!process.env.POSTHOG_API_KEY
+}
+```
+
+```bash Environment variables
+POSTHOG_API_KEY=phc_...
+POSTHOG_HOST=eu.i.posthog.com
+```
+
+</CodeGroup>
+
+<Check>
+PostHog is only enabled in **staging/production** AND when `POSTHOG_API_KEY` is present. Local/dev environments use a no-op client.
+</Check>
+
+## Buckets (privacy + low cardinality)
+
+Magnitudes are never sent raw. Located in `src/modules/posthog/analytics-buckets.ts`:
+
+<Tabs>
+
+<Tab title="bucketValue()">
+
+**Money amounts**
+
+```typescript
+function bucketValue(amount: number): string
+```
+
+**Buckets:**
+- `0`
+- `<10k`
+- `10k-50k`
+- `50k-250k`
+- `250k-1m`
+- `1m+`
+
+```typescript
+bucketValue(0)        // "0"
+bucketValue(5000)     // "<10k"
+bucketValue(75000)    // "50k-250k"
+bucketValue(2000000)  // "1m+"
+```
+
+</Tab>
+
+<Tab title="bucketDays()">
+
+**Duration between dates**
+
+```typescript
+function bucketDays(from: Date, to: Date): string
+```
+
+**Buckets:**
+- `same_day`
+- `1-3d`
+- `4-7d`
+- `8-30d`
+- `30d+`
+
+```typescript
+bucketDays(startDate, endDate)
+// Returns duration bucket based on day difference
+```
+
+</Tab>
+
+<Tab title="bucketCount()">
+
+**Magnitude/quantity**
+
+```typescript
+function bucketCount(n: number): string
+```
+
+**Buckets:**
+- `0`
+- `1`
+- `2-5`
+- `6-20`
+- `21-100`
+- `100+`
+
+```typescript
+bucketCount(0)   // "0"
+bucketCount(1)   // "1"
+bucketCount(12)  // "6-20"
+bucketCount(500) // "100+"
+```
+
+</Tab>
+
+</Tabs>
+
+<Tip>
+Always use buckets for any numeric magnitude. This prevents high cardinality and protects sensitive financial data.
+</Tip>
+
+## Attribution & the organization group
+
+<Info>
+Every event attaches the `organization` group, so **funnels aggregate by org, never per-person** — a multi-seat org converts once.
+</Info>
+
+### Funnel aggregation patterns
+
+<Tabs>
+
+<Tab title="Organization funnels">
+
+Standard product funnels aggregate by organization:
+
+```javascript
+// Funnel query configuration
+{
+  aggregation_group_type_index: 0  // organization group
+}
+```
+
+A multi-seat org converts **once** regardless of how many users complete the funnel steps.
+
+</Tab>
+
+<Tab title="Deal-correlated funnels">
+
+Deal funnels aggregate by deal ID using HogQL:
+
+```javascript
+// Deal funnel aggregation
+{
+  aggregation_group_type_index: null,
+  funnel_aggregate_by_hogql: "coalesce(properties.entity_id, properties.deal_id)"
+}
+```
+
+The conversion unit is the **deal**, not the org or user.
+
+</Tab>
+
+</Tabs>
+
+### Group traits (server-authoritative)
+
+<Warning>
+**Authoritative group traits are set server-side.** Never trust the client for group properties.
+</Warning>
+
+`PosthogBillingListener` reacts to the neutral billing bus and calls:
+
+```typescript
+groupIdentify('organization', {
+  plan_tier: 'pro',
+  plan_name: 'Professional',
+  status: 'active',
+  billing_cycle: 'monthly',
+  seats_total: 10,
+  seats_used: 7
+})
+```
+
+The frontend `group('organization', orgId)` only **associates** the key — never sets traits.
+
+### Identity lifecycle
+
+Located in `src/lib/analytics/identity.ts`:
+
+<Steps>
+
+<Step title="Login / Refresh">
+`identify(userId, traits)` — sets person properties
+</Step>
+
+<Step title="Organization select">
+`group('organization', orgId)` — associates user with org group
+</Step>
+
+<Step title="Organization deselect">
+`resetGroups()` — clears group association
+</Step>
+
+<Step title="Logout">
+`reset()` — clears all identity data
+</Step>
+
+</Steps>
+
+### Person vs. group traits
+
+<Tabs>
+
+<Tab title="Person traits">
+
+Drive **marketing segmentation**:
+
+- `email`
+- `full_name`
+- `role`
+- `language`
+- `signup_date`
+- `first_use`
+
+</Tab>
+
+<Tab title="Group traits (organization)">
+
+Drive **product metrics**:
+
+- `plan_tier` ⭐
+- `plan_name`
+- `status`
+- `billing_cycle`
+- `seats_total`
+- `seats_used`
+
+</Tab>
+
+</Tabs>
+
+<Check>
+**Plan tier stays a group property, not a person trait** — so any metric is sliceable by role/tenure/language × plan/seats.
+</Check>
+
+## Feature tagging
+
+Every event carries a `feature` property so events group by product area. It is an event **property**, not a PostHog group (groups stay reserved for `organization`).
+
+<CodeGroup>
+
+```typescript Backend (posthog.constants.ts)
+export const POSTHOG_FEATURE = {
+  DEALS: 'deals',
+  CONTACTS: 'contacts',
+  CONVERSATIONS: 'conversations',
+  AI: 'ai',
+  WEBHOOKS: 'webhooks',
+  // ...
+} as const;
+```
+
+```typescript Frontend (features.ts)
+export const FEATURE = {
+  DEALS: 'deals',
+  CONTACTS: 'contacts',
+  CONVERSATIONS: 'conversations',
+  AI: 'ai',
+  WEBHOOKS: 'webhooks',
+  // ...
+} as const;
+```
+
+</CodeGroup>
+
+<Warning>
+Keep backend (`POSTHOG_FEATURE`) and frontend (`FEATURE`) in sync. Drift causes funnel breaks.
+</Warning>
+
+## Frontend primitives
+
+### captureEvent()
+
+Located in `src/lib/analytics/capture.ts` — the **only sanctioned way** to fire client-side events.
+
+```typescript
+captureEvent(
+  feature: Feature,
+  event: AnalyticsEventName,
+  properties?: Record<string, any>
+): void
+```
+
+<Check>
+- `event` is typed to `AnalyticsEventName` — typos and FE↔BE drift fail to compile
+- No-ops when PostHog is disabled
+- Swallows errors (never throws)
+</Check>
+
+```typescript
+import { captureEvent } from '@/lib/analytics/capture';
+import { FEATURE } from '@/lib/analytics/features';
+import { DEAL_EVENTS } from '@/lib/analytics/events';
+
+captureEvent(
+  FEATURE.DEALS,
+  DEAL_EVENTS.DEAL_DETAIL_VIEWED,
+  {
+    deal_id: dealId,
+    view_source: 'list'
+  }
+);
+```
+
+### Typed event registry
+
+Located in `src/lib/analytics/events.ts` — one `*_EVENTS` const + `*EventName` type per feature, unioned into `AnalyticsEventName`.
+
+```typescript
+// Per-feature events
+export const DEAL_EVENTS = {
+  DEAL_CREATED: 'deal_created',
+  DEAL_DETAIL_VIEWED: 'deal_detail_viewed',
+  DEAL_WON: 'deal_won',
+  // ...
+} as const;
+
+export type DealEventName = typeof DEAL_EVENTS[keyof typeof DEAL_EVENTS];
+
+// Union of all event types
+export type AnalyticsEventName = 
+  | DealEventName
+  | ContactEventName
+  | ConversationEventName
+  // ...
+```
+
+<Info>
+The raw `posthog` client is import-restricted to `src/lib/analytics/**` only. All other code must use `captureEvent()`.
+</Info>
+
+### Engagement islands
+
+Tiny mount-once components (`src/components/analytics/*`) that fire a `*_viewed` event via a `useRef` guard:
+
+```typescript
+export function DealDetailAnalytics({ dealId }: { dealId: string }) {
+  const captured = useRef(false);
+  
+  useEffect(() => {
+    if (!captured.current) {
+      captureEvent(
+        FEATURE.DEALS,
+        DEAL_EVENTS.DEAL_DETAIL_VIEWED,
+        { deal_id: dealId }
+      );
+      captured.current = true;
+    }
+  }, [dealId]);
+  
+  return null;
+}
+```
+
+Mount in the component tree where the view actually happens:
+
+```tsx
+<DealDetailView dealId={dealId}>
+  <DealDetailAnalytics dealId={dealId} />
+  {/* ... rest of component */}
+</DealDetailView>
+```
+
+### Super properties
+
+<Warning>
+Register **sparingly** for ambient context that should slice every event (e.g. Propilot `ai_tier`/`ai_mode`).
+
+Scope nullable super properties carefully or denominators break.
+</Warning>
+
+```typescript
+posthog.register({
+  ai_tier: 'advanced',
+  ai_mode: 'research'
+});
+```
+
+## Operational (PostHog EU)
+
+<Info>
+- **Region:** EU (`eu.posthog.com`)
+- **Projects:** 
+  - **`209036`** Propwise (production)
+  - `208982` Sandbox
+</Info>
+
+### Authentication
+
+Personal API key stored in environment:
+
+```bash ~/.zshrc
+export POSTHOG_EU_API_KEY=phx_...
+```
+
+**Permissions:** Dashboard/insight read+write
+
+### Tools
+
+<Tabs>
+
+<Tab title="MCP Server">
+
+Use `posthog-eu` (HTTP) when connected via MCP for interactive queries and dashboard management.
+
+</Tab>
+
+<Tab title="Reproducible scripts">
+
+When MCP is unavailable, use backend scripts:
+
+```bash
+# Seed PostHog with event definitions
+pnpm seed:posthog
+
+# Create/update dashboards
+pnpm dashboard:posthog -- --project=209036
+
+# Provision cross-domain funnels (idempotent)
+pnpm funnels:posthog -- --project=209036
+```
+
+</Tab>
+
+</Tabs>
+
+<Note>
+Dashboards and funnels are built in the PostHog UI or via scripts — **not** in application code. Keep analytics configuration separate from application logic.
+</Note>
+
+## What lives where
+
+Quick reference for finding analytics code:
+
+<AccordionGroup>
+
+<Accordion title="Event names">
+
+| Language | Location |
+|----------|----------|
+| Backend | `src/modules/posthog/posthog-events.constants.ts` |
+| Frontend | `src/lib/analytics/events.ts` |
+
+</Accordion>
+
+<Accordion title="Feature tags">
+
+| Language | Location |
+|----------|----------|
+| Backend | `posthog.constants.ts` |
+| Frontend | `features.ts` |
+
+</Accordion>
+
+<Accordion title="Buckets">
+
+`analytics-buckets.ts` — all bucketing functions
+
+</Accordion>
+
+<Accordion title="Capture primitives">
+
+| Layer | Location |
+|-------|----------|
+| Backend | `ProductAnalyticsService` |
+| Frontend | `captureEvent` in `capture.ts` |
+
+</Accordion>
+
+<Accordion title="Per-domain shaping">
+
+Backend: `*-analytics.service.ts` files
+
+Example: `src/modules/deals/services/deal-analytics.service.ts`
+
+</Accordion>
+
+<Accordion title="Group traits & identity">
+
+| Layer | Location |
+|-------|----------|
+| Backend | `PosthogBillingListener` |
+| Frontend | `identity.ts` |
+
+</Accordion>
+
+<Accordion title="Related documentation">
+
+| Document | Purpose |
+|----------|---------|
+| `ANALYTICS_EVENT_CATALOG.md` | The event contract (every event documented) |
+| `ANALYTICS_AGENT_GUIDE.md` | How to add tracking to a new flow |
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+<CardGroup cols={2}>
+
+<Card title="Event Catalog" icon="list" href="/backend/analytics/event-catalog">
+Complete list of every analytics event
+</Card>
+
+<Card title="Agent Guide" icon="code" href="/backend/analytics/agent-guide">
+How to add tracking to a new feature
+</Card>
+
+</CardGroup>

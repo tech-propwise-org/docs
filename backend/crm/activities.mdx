@@ -224,6 +224,433 @@ sms_log
 </Tab>
 </Tabs>
 
+## Activity service methods
+
+The `ActivityService` provides core methods for activity creation, retrieval, and timeline management:
+
+### Core service methods
+
+<AccordionGroup>
+<Accordion title="createActivityInTransaction">
+Creates an activity record within a database transaction, ensuring atomic creation with channel content:
+
+```typescript
+async createActivityInTransaction(
+  tx: EntityManager,
+  input: CreateActivityInput
+): Promise<Activity> {
+  // 1. Validate target entity exists and is accessible
+  await this.validateTargetEntity(tx, input.targetEntityType, input.targetEntityId);
+  
+  // 2. Resolve contact_id using bubble-up logic
+  const contactId = await this.resolveContactIdForActivity(
+    tx,
+    input.targetEntityType,
+    input.targetEntityId,
+    input.activityType,
+    input.selectedContactId
+  );
+  
+  // 3. Create activity record
+  const activity = tx.create(Activity, {
+    targetEntityType: input.targetEntityType,
+    targetEntityId: input.targetEntityId,
+    contactId,
+    activityType: input.activityType,
+    referenceId: input.referenceId,
+    summary: input.summary,
+    isPinned: input.isPinned ?? false,
+    isImportant: input.isImportant ?? false,
+    performedById: input.performedById,
+    createdById: input.createdById,
+    organizationId: input.organizationId
+  });
+  
+  await tx.persistAndFlush(activity);
+  
+  // 4. Invalidate timeline cache
+  await this.invalidateTimelineCache(input.targetEntityType, input.targetEntityId);
+  
+  return activity;
+}
+```
+</Accordion>
+
+<Accordion title="getActivityTimeline">
+Retrieves paginated activity timeline for an entity with optional type filtering:
+
+```typescript
+async getActivityTimeline(
+  entityType: EntityType,
+  entityId: string,
+  options: {
+    page?: number;
+    limit?: number;
+    activityTypes?: ActivityType[];
+    includeChannelContent?: boolean;
+  }
+): Promise<PaginatedActivities> {
+  const qb = this.activityRepository.createQueryBuilder('a');
+  
+  qb.where({
+    targetEntityType: entityType,
+    targetEntityId: entityId,
+    isDeleted: false
+  });
+  
+  if (options.activityTypes?.length) {
+    qb.andWhere({ activityType: { $in: options.activityTypes } });
+  }
+  
+  qb.orderBy({ isPinned: 'DESC', createdAt: 'DESC' });
+  qb.limit(options.limit ?? 50);
+  qb.offset(((options.page ?? 1) - 1) * (options.limit ?? 50));
+  
+  const [activities, total] = await qb.getResultAndCount();
+  
+  // Optionally load channel content
+  if (options.includeChannelContent) {
+    await this.enrichActivitiesWithChannelContent(activities);
+  }
+  
+  return {
+    items: activities,
+    total,
+    page: options.page ?? 1,
+    limit: options.limit ?? 50
+  };
+}
+```
+</Accordion>
+
+<Accordion title="getContactBubbleUpTimeline">
+Retrieves all activities surfaced to a contact from related leads and deals:
+
+```typescript
+async getContactBubbleUpTimeline(
+  contactId: string,
+  options: TimelineOptions
+): Promise<PaginatedActivities> {
+  const qb = this.activityRepository.createQueryBuilder('a')
+    .where({
+      contactId,
+      isDeleted: false
+    })
+    .leftJoinAndSelect('a.lead', 'l')
+    .leftJoinAndSelect('a.deal', 'd')
+    .orderBy({ isPinned: 'DESC', createdAt: 'DESC' });
+  
+  const [activities, total] = await qb.getResultAndCount();
+  
+  // Enrich with source entity context
+  const enriched = activities.map(activity => ({
+    ...activity,
+    sourceType: activity.targetEntityType,
+    sourceId: activity.targetEntityId,
+    sourceTitle: activity.targetEntityType === 'lead' 
+      ? activity.lead?.title 
+      : activity.deal?.title
+  }));
+  
+  return { items: enriched, total };
+}
+```
+</Accordion>
+
+<Accordion title="enrichActivitiesWithChannelContent">
+Batch-loads channel content for activities to avoid N+1 queries:
+
+```typescript
+async enrichActivitiesWithChannelContent(
+  activities: Activity[]
+): Promise<void> {
+  const byType = this.groupActivitiesByType(activities);
+  
+  // Batch load each channel type
+  if (byType.call?.length) {
+    const callIds = byType.call.map(a => a.referenceId);
+    const calls = await this.callLogRepository.find({ id: { $in: callIds } });
+    const callMap = new Map(calls.map(c => [c.id, c]));
+    byType.call.forEach(a => a.channelContent = callMap.get(a.referenceId));
+  }
+  
+  if (byType.email?.length) {
+    const emailIds = byType.email.map(a => a.referenceId);
+    const emails = await this.emailLogRepository.find({ id: { $in: emailIds } });
+    const emailMap = new Map(emails.map(e => [e.id, e]));
+    byType.email.forEach(a => a.channelContent = emailMap.get(a.referenceId));
+  }
+  
+  // Similar batch loading for other channel types...
+}
+```
+</Accordion>
+</AccordionGroup>
+
+### Query performance patterns
+
+<Tip>
+**Timeline query optimization**: Always query the `activity` table first for timeline ordering, then batch-load channel content only for visible items. This prevents expensive joins on large channel tables and enables efficient pagination.
+</Tip>
+
+<CodeGroup>
+```typescript Efficient timeline loading
+// ✅ GOOD: Query activity index, then load channel content on-demand
+const activities = await activityRepo.find(
+  { targetEntityType: 'lead', targetEntityId: leadId },
+  { orderBy: { isPinned: 'DESC', createdAt: 'DESC' }, limit: 50 }
+);
+
+// Batch load channel content for visible activities only
+await activityService.enrichActivitiesWithChannelContent(activities);
+```
+
+```typescript Inefficient join pattern
+// ❌ BAD: Joining all channel tables upfront
+const activities = await activityRepo.find(
+  { targetEntityType: 'lead', targetEntityId: leadId },
+  { 
+    populate: ['callLog', 'emailLog', 'whatsapp', 'note', 'task'],
+    orderBy: { createdAt: 'DESC' }
+  }
+);
+// This creates expensive LEFT JOINs on all channel tables
+```
+</CodeGroup>
+
+## Activity type registry
+
+The `ActivityTypeRegistry` provides centralized configuration for activity types and their channel mappings:
+
+```typescript
+// Activity type definitions
+export const ACTIVITY_TYPE_CONFIG = {
+  call: {
+    channelTable: 'call_log',
+    requiresReference: true,
+    isCommunication: true,
+    summaryTemplate: (data: CallLog) => 
+      `Called ${data.phoneNumber} • ${data.durationSeconds}s • ${data.outcome}`
+  },
+  email: {
+    channelTable: 'email_log',
+    requiresReference: true,
+    isCommunication: true,
+    summaryTemplate: (data: EmailLog) => 
+      `Email: ${data.subject}`
+  },
+  whatsapp: {
+    channelTable: 'whatsapp',
+    requiresReference: true,
+    isCommunication: true,
+    summaryTemplate: (data: Whatsapp) => 
+      `WhatsApp: ${data.messageType === 'text' ? data.textBody : data.messageType}`
+  },
+  note: {
+    channelTable: 'note',
+    requiresReference: true,
+    isCommunication: false,
+    summaryTemplate: (data: Note) => 
+      data.title || data.body.substring(0, 100)
+  },
+  task: {
+    channelTable: 'task',
+    requiresReference: true,
+    isCommunication: false,
+    summaryTemplate: (data: Task) => 
+      `${data.title}${data.dueDate ? ` • Due ${data.dueDate}` : ''}`
+  }
+};
+
+// Helper functions
+export function isCommunicationActivity(type: ActivityType): boolean {
+  return ACTIVITY_TYPE_CONFIG[type]?.isCommunication ?? false;
+}
+
+export function getChannelTableForType(type: ActivityType): string {
+  return ACTIVITY_TYPE_CONFIG[type]?.channelTable;
+}
+
+export function generateActivitySummary(
+  type: ActivityType, 
+  channelData: any
+): string {
+  const template = ACTIVITY_TYPE_CONFIG[type]?.summaryTemplate;
+  return template ? template(channelData) : '';
+}
+```
+
+## AI activity integration
+
+The activity system integrates with the AI module for automated conversation handling and intelligent workflow triggers:
+
+### AI-generated activities
+
+<Tabs>
+<Tab title="Conversation logging">
+AI agents automatically create activity records for all messaging interactions:
+
+```typescript
+// AI module creates activities through ActivityService
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'whatsapp',
+  referenceId: whatsappMessage.id,
+  summary: `AI: ${aiAgent.name} responded`,
+  performedById: null, // AI-generated
+  createdById: systemUserId,
+  organizationId: lead.organizationId
+});
+```
+
+Activities from AI agents are distinguished by `performed_by_id = null` with system-generated summaries.
+</Tab>
+
+<Tab title="Lead source tracking">
+Leads captured through AI conversations maintain source attribution:
+
+```typescript
+// Lead includes conversation reference
+const lead = await leadService.createLeadInTransaction(tx, {
+  // ... lead data
+  sourceConversation: {
+    conversationId: conversation.id,
+    aiAgentId: aiAgent.id,
+    channel: 'whatsapp',
+    capturedAt: new Date()
+  }
+});
+
+// Activity links to originating conversation
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'whatsapp',
+  referenceId: firstMessage.id,
+  summary: 'Lead captured from AI conversation',
+  metadata: {
+    conversationId: conversation.id,
+    aiAgentId: aiAgent.id
+  }
+});
+```
+</Tab>
+
+<Tab title="Workflow triggers">
+AI agents can trigger workflows through the `trigger_workflow` action, creating activity records for audit:
+
+```typescript
+// AI agent triggers workflow
+const workflowRun = await workflowService.triggerFromAI({
+  workflowId: workflow.id,
+  triggerData: {
+    leadId: lead.id,
+    aiContext: conversation.context
+  },
+  triggeredBy: {
+    type: 'ai_agent',
+    aiAgentId: aiAgent.id,
+    conversationId: conversation.id
+  }
+});
+
+// Activity logs workflow trigger
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'other',
+  referenceId: null,
+  summary: `AI triggered workflow: ${workflow.name}`,
+  metadata: {
+    workflowId: workflow.id,
+    workflowRunId: workflowRun.id,
+    aiAgentId: aiAgent.id
+  }
+});
+```
+</Tab>
+
+<Tab title="Human handoff">
+When AI agents transfer to human agents, activities track the handoff:
+
+```typescript
+// AI performs handoff action
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'other',
+  referenceId: null,
+  summary: `AI handed off to ${user.name}`,
+  metadata: {
+    handoffReason: 'customer_request',
+    aiAgentId: aiAgent.id,
+    handedOffToUserId: user.id,
+    conversationId: conversation.id
+  }
+});
+
+// Subsequent messages are user-generated activities
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'whatsapp',
+  referenceId: humanMessage.id,
+  summary: `${user.name}: ${messagePreview}`,
+  performedById: user.id
+});
+```
+</Tab>
+</Tabs>
+
+<Note>
+The AI module owns agent configuration, runtime execution, queueing, LLM integration, security controls, and activity logging. The CRM module owns business entities, lifecycle rules, and validation logic. This separation of concerns enables flexible automation while maintaining data integrity.
+</Note>
+
+### Activity DTO enrichment
+
+Activity DTOs are enriched with AI context for UI display and analytics:
+
+```typescript
+interface ActivityDTO {
+  id: string;
+  targetEntityType: EntityType;
+  targetEntityId: string;
+  activityType: ActivityType;
+  summary: string;
+  createdAt: Date;
+  
+  // User context
+  performedBy?: {
+    id: string;
+    name: string;
+    isActiveOrgMember: boolean; // Organization membership status
+  };
+  
+  // AI context (when AI-generated)
+  aiContext?: {
+    agentId: string;
+    agentName: string;
+    conversationId?: string;
+    handoffStatus?: 'ai_handled' | 'handed_off' | 'escalated';
+  };
+  
+  // Channel content (loaded on-demand)
+  channelContent?: CallLog | EmailLog | Whatsapp | Note | Task;
+  
+  // Source context (for bubble-up)
+  sourceEntity?: {
+    type: 'lead' | 'deal';
+    id: string;
+    title: string;
+  };
+}
+```
+
+<Info>
+**Organization membership display**: CRM DTOs batch-resolve organization membership status for user references, showing removed org members with `isActiveOrgMember: false` badges while preserving historical assignment data.
+</Info>
+
 ## Notes system
 
 Notes are activities with `type='note'` that store internal team information within the polymorphic activity framework.
@@ -346,6 +773,131 @@ stateDiagram-v2
 <Warning>
 **Task assignment**: Tasks must be assigned to users who have access to the parent entity. The system validates that `assigned_to_id` is an active organization member with appropriate permissions.
 </Warning>
+
+## Stage history and analytics
+
+The activity system supports stage transition tracking and engagement analytics across the CRM lifecycle:
+
+### Stage transition logging
+
+```typescript
+// Lead stage changes create activity records
+await activityService.createActivityInTransaction(tx, {
+  targetEntityType: 'lead',
+  targetEntityId: lead.id,
+  activityType: 'other',
+  referenceId: null,
+  summary: `Stage changed: ${oldStage} → ${newStage}`,
+  metadata: {
+    eventType: 'stage_change',
+    oldStage,
+    newStage,
+    changedById: user.id,
+    reason: changeReason
+  }
+});
+
+// Deal stage changes with stage history table
+const stageHistory = await stageHistoryService.recordStageChange(tx, {
+  dealId: deal.id,
+  fromStage: oldStage,
+  toStage: newStage,
+  changedById: user.id,
+  changedAt: new Date(),
+  timeInStage: calculateTimeInStage(deal.stageEnteredAt)
+});
+```
+
+### Engagement scoring
+
+Activities contribute to entity engagement scores for prioritization and analytics:
+
+```typescript
+// Activity weights for engagement scoring
+const ENGAGEMENT_WEIGHTS = {
+  call: 5,
+  email: 3,
+  whatsapp: 2,
+  meeting: 10,
+  site_visit: 15,
+  note: 1,
+  task: 2
+};
+
+// Calculate entity engagement score
+async function calculateEngagementScore(
+  entityType: EntityType,
+  entityId: string,
+  timeWindow: number = 30 // days
+): Promise<number> {
+  const activities = await activityRepo.find({
+    targetEntityType: entityType,
+    targetEntityId: entityId,
+    createdAt: { $gte: new Date(Date.now() - timeWindow * 86400000) }
+  });
+  
+  return activities.reduce((score, activity) => {
+    return score + (ENGAGEMENT_WEIGHTS[activity.activityType] || 1);
+  }, 0);
+}
+```
+
+### Activity analytics
+
+<Tabs>
+<Tab title="Activity volume trends">
+```sql
+-- Daily activity volume by type
+SELECT 
+  DATE(created_at) as date,
+  activity_type,
+  COUNT(*) as count
+FROM activity
+WHERE organization_id = :orgId
+  AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+  AND is_deleted = false
+GROUP BY DATE(created_at), activity_type
+ORDER BY date DESC, count DESC;
+```
+</Tab>
+
+<Tab title="User activity metrics">
+```sql
+-- User activity performance metrics
+SELECT 
+  u.id, u.name,
+  COUNT(DISTINCT a.id) as total_activities,
+  COUNT(DISTINCT CASE WHEN a.activity_type = 'call' THEN a.id END) as calls,
+  COUNT(DISTINCT CASE WHEN a.activity_type = 'email' THEN a.id END) as emails,
+  COUNT(DISTINCT CASE WHEN t.status = 'completed' THEN t.id END) as tasks_completed
+FROM users u
+LEFT JOIN activity a ON a.created_by_id = u.id 
+  AND a.created_at >= CURRENT_DATE - INTERVAL '30 days'
+LEFT JOIN task t ON a.activity_type = 'task' AND a.reference_id = t.id
+WHERE u.organization_id = :orgId
+GROUP BY u.id, u.name
+ORDER BY total_activities DESC;
+```
+</Tab>
+
+<Tab title="Response time analysis">
+```sql
+-- Average response times for communication activities
+SELECT 
+  a1.target_entity_type,
+  AVG(EXTRACT(EPOCH FROM (a2.created_at - a1.created_at))) / 3600 as avg_response_hours
+FROM activity a1
+JOIN activity a2 ON 
+  a2.target_entity_type = a1.target_entity_type 
+  AND a2.target_entity_id = a1.target_entity_id
+  AND a2.created_at > a1.created_at
+WHERE a1.activity_type IN ('call', 'email', 'whatsapp')
+  AND a2.activity_type IN ('call', 'email', 'whatsapp')
+  AND a1.created_at >= CURRENT_DATE - INTERVAL '30 days'
+GROUP BY a1.target_entity_type;
+```
+</Tab>
+</Tabs>
 
 ## Query patterns
 
@@ -712,44 +1264,6 @@ if (!tasks) {
 ```
 </Tab>
 </Tabs>
-
-## AI module integration
-
-The CRM activity system integrates with the AI module for automated conversation handling and workflow triggers:
-
-<Tabs>
-<Tab title="Conversation automation">
-- **AI agents** can respond to messaging conversations through WhatsApp, Instagram, and other channels
-- **CRM context** is provided to AI agents for personalized responses based on lead/contact history
-- **Activity logging**: All AI interactions create activity records for audit trails
-- **Human handoff**: AI agents can transfer conversations to users or teams through configured actions
-</Tab>
-
-<Tab title="Lead source tracking">
-- **sourceConversation**: Leads include reference to originating messaging conversation
-- **Context resolution**: CRM workflows can trace back to the original conversation context
-- **Attribution**: AI-captured leads properly attribute to conversation source
-- **Automation triggers**: Downstream workflows access conversation context for personalized follow-up
-</Tab>
-
-<Tab title="CRM tool execution">
-- **Data search**: AI actions can query CRM entities through the tool catalog
-- **Field updates**: Contact fields can be updated through AI tool execution
-- **Stage changes**: Lead lifecycle stages can be progressed through AI actions
-- **Service integration**: AI tools invoke CRM services with proper validation and permissions
-</Tab>
-
-<Tab title="Workflow integration">
-- **AI_AGENT steps**: Workflows can enable AI handling at specific stages
-- **Trigger workflows**: AI agents can deliberately start child workflows through the `trigger_workflow` action
-- **Bidirectional flow**: Seamless handoff between automated AI handling and workflow-driven processes
-- **Context preservation**: Workflow state and AI conversation state remain synchronized
-</Tab>
-</Tabs>
-
-<Note>
-The AI module owns agent configuration, runtime execution, queueing, LLM integration, security controls, and activity logging. The CRM module owns business entities, lifecycle rules, and validation logic. This separation of concerns enables flexible automation while maintaining data integrity.
-</Note>
 
 ## Real estate integration
 

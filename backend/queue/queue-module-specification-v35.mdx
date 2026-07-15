@@ -1,0 +1,389 @@
+---
+title: "Queue Module Specification v35"
+description: "Comprehensive specification for the Queue module using PostgreSQL-based job processing via pg-boss"
+---
+
+## Overview
+
+The Queue module provides a centralized job queue system for PropWise CRM using PostgreSQL-based job processing via the pg-boss library. This module enables asynchronous processing of background tasks such as notifications, data processing, and other long-running operations that should be decoupled from HTTP request/response cycles.
+
+The module implements a queue service abstraction that allows other modules to enqueue jobs for background processing while providing features like job retries, priorities, batching, and worker management.
+
+<Info>
+**Last Updated:** 2026-06-02  
+**Status:** Active
+</Info>
+
+## Architecture
+
+### Design Decisions
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL-based queuing" icon="database">
+    Uses pg-boss library for reliability and ACID compliance
+  </Card>
+  <Card title="Interface-driven design" icon="code">
+    Implements `IQueueService` interface for potential future queue provider swapping
+  </Card>
+  <Card title="Global module" icon="globe">
+    Available throughout the application without explicit imports
+  </Card>
+  <Card title="Worker abstraction" icon="gears">
+    Provides flexible worker registration with configurable options
+  </Card>
+</CardGroup>
+
+The module properly handles lifecycle management for startup and shutdown of queue connections.
+
+### Queue Provider Selection
+
+The module uses pg-boss as the underlying queue implementation because:
+
+- Leverages existing PostgreSQL infrastructure
+- Provides ACID guarantees for job persistence
+- Supports advanced features like job scheduling, retries, and priorities
+- No additional infrastructure dependencies
+
+## Interfaces
+
+### QueueJob
+
+Represents a job in the queue system.
+
+```typescript
+interface QueueJob<T> {
+  id: string;           // Unique job identifier
+  data: T;              // Job payload data
+  retryCount: number;   // Current retry attempt count
+  retryLimit: number;   // Maximum retry attempts allowed
+}
+```
+
+### QueueJobOptions
+
+Configuration options for job enqueueing.
+
+```typescript
+interface QueueJobOptions {
+  retryLimit?: number;        // Max retry attempts (default: 3)
+  retryDelay?: number;        // Delay between retries in seconds
+  retryBackoff?: boolean;     // Use exponential backoff for retries
+  expireInSeconds?: number;   // Job expiration time
+  singletonKey?: string;      // Ensure only one job with this key exists
+  priority?: number;          // Job priority (higher = more priority)
+}
+```
+
+### QueuePolicy
+
+Controls how `singletonKey` deduplication is enforced at the database level via pg-boss policy-specific unique indexes.
+
+```typescript
+type QueuePolicy =
+  | 'standard'          // No dedup — singletonKey stored but no unique constraint
+  | 'short'             // ≤ 1 job per singletonKey in `created` state
+  | 'singleton'         // ≤ 1 job per singletonKey in `active` state
+  | 'stately'           // ≤ 1 job per singletonKey in created | retry | active
+  | 'exclusive'         // Same uniqueness as stately, different fetch semantics
+  | 'key_strict_fifo';
+```
+
+<Warning>
+**Critical:** The default `'standard'` policy applies **no unique index** on `singleton_key`. Any queue that uses `singletonKey` for deduplication **must** be created with `policy: 'stately'` (or `'exclusive'`), otherwise `ON CONFLICT DO NOTHING` never fires and every insert creates a new row regardless of how many pending jobs already exist for the same key.
+</Warning>
+
+### WorkerOptions
+
+Configuration for single-job workers.
+
+```typescript
+interface WorkerOptions {
+  concurrency?: number;              // Independent worker invocations (default: 1)
+  pollingIntervalSeconds?: number;   // How often to poll for new jobs
+  policy?: QueuePolicy;              // Queue policy — REQUIRED for singletonKey dedup
+}
+```
+
+### BatchWorkerOptions
+
+Configuration for batch workers.
+
+```typescript
+interface BatchWorkerOptions {
+  batchSize?: number;                // Jobs per handler invocation (default: 1)
+  pollingIntervalSeconds?: number;   // How often to poll for new jobs
+  policy?: QueuePolicy;              // Queue policy — REQUIRED for singletonKey dedup
+}
+```
+
+<Note>
+`policy` is enforced by `ensureQueue` inside **both** `registerWorker` and `registerBatchWorker`. Use `'stately'` whenever jobs are submitted with `singletonKey` and you need "at most one pending/active job per key". 
+
+pg-boss caches each queue's policy per process for `queueCacheIntervalSeconds` (default 60s), so an existing queue's policy change is eventually-consistent within that window after a deploy.
+</Note>
+
+<Tip>
+The single-job `messaging-outbox-poll` queue is the canonical `registerWorker` + `policy: 'stately'` consumer: its self-enqueuing poll trigger uses `singletonKey: 'outbox-poll'`, which only dedups under `stately`. Under the previous default `standard` policy the trigger accumulated across restarts and fired continuously.
+</Tip>
+
+### IQueueService Interface
+
+Core queue service contract with the following methods:
+
+| Method | Description |
+|--------|-------------|
+| `enqueue<T>(queueName, data, options?)` | Add single job to queue |
+| `enqueueBatch<T>(queueName, data[], options?)` | Add multiple jobs to queue |
+| `registerWorker<T>(queueName, handler, options?)` | Register job processor (accepts `policy`) |
+| `schedule(queueName, cron, data?)` | Register recurring cron (pg-boss `schedule`) |
+| `unschedule(queueName, key?)` | Remove recurring schedule (pg-boss `unschedule`) |
+| `purgeQueuedJobs(queueName)` | Delete pending jobs (`created` + `retry`); leaves `active` (pg-boss `deleteQueuedJobs`) |
+| `checkHealth(timeoutMs?)` | Active liveness probe (see below) |
+| `start()` | Start queue processing |
+| `stop()` | Stop queue processing |
+
+#### checkHealth(timeoutMs?) — Active Liveness Probe
+
+Returns `Promise<QueueHealthResult>` (`{ healthy, reason?, latencyMs? }`) and never throws. Consumed by `PgBossHealthIndicator` for the `/health/ready` probe.
+
+The `isStarted` boolean is **not** a sufficient health signal: it is set once after `boss.start()` resolves and only flips back on `stop()`, so a backend that loses its connection or whose supervisor loop stalls after startup keeps `isStarted === true` and would report healthy forever.
+
+<Steps>
+  <Step title="Active health check">
+    `checkHealth()` round-trips `SELECT 1` through pg-boss's **own** connection (`boss.getDb().executeSql(...)`), bounded by `QUEUE_HEALTH_PROBE_TIMEOUT_MS` (`queue.constants.ts`, default 2000ms)
+  </Step>
+  
+  <Step title="Health scenarios">
+    - Not started → `{ healthy: false, reason: 'boss.start() has not completed' }` (no query issued)
+    - Query rejects → `{ healthy: false, reason: <driver error> }`
+    - Query exceeds the timeout → `{ healthy: false, reason: 'queue health probe timed out after <n>ms' }`
+    - Otherwise → `{ healthy: true, latencyMs }`
+  </Step>
+</Steps>
+
+<Info>
+Because the probe uses pg-boss's connection (superuser `DATABASE_URL` pool), it covers a gap the readiness endpoint's ORM-based `database` ping (`RUNTIME_DATABASE_URL` pool) does not — the two checks hit different pools. See `Docs/HEALTH_MODULE_SPECIFICATION.md` → PgBossHealthIndicator.
+</Info>
+
+### Knowledge Base Indexing Queue
+
+The `knowledge-base-indexing` queue (`KNOWLEDGE_BASE_INDEXING_QUEUE` constant) handles asynchronous crawling and embedding of PAGE (website) knowledge base sources.
+
+**Configuration:**
+- Jobs are enqueued with `singletonKey: 'kb-index:<id>'` and `retryLimit: 0` (deliberate — no retry loops on crash)
+- The worker (`KnowledgeBaseIndexingWorker`) is registered with `policy: 'stately'` and `concurrency: 2`
+- A re-trigger while crawling is pending/active is dropped at the DB level rather than double-crawling
+
+**Job payload:**
+
+```typescript
+{
+  knowledgeBaseId: string,
+  orgId: string
+}
+```
+
+<Steps>
+  <Step title="Claim source">
+    Claims the source as INDEXING (short txn)
+  </Step>
+  
+  <Step title="Map and scrape">
+    Maps the host + scrapes each page (no txn, isolated per-page failures)
+  </Step>
+  
+  <Step title="Persist pages">
+    Persists `KnowledgeBasePage` rows (short txn)
+  </Step>
+  
+  <Step title="Generate embeddings">
+    Embeds outside any txn (slow OpenAI call)
+  </Step>
+  
+  <Step title="Finalize">
+    Persists chunks + final status (short txn)
+  </Step>
+</Steps>
+
+<Note>
+A 10-minute recovery cron (`sweepStaleIngestion`) flips sources stuck INDEXING/PENDING beyond their stale thresholds to FAILED so users can reindex.
+</Note>
+
+## Service Implementation
+
+### PgBossQueueService
+
+The main service implementation using pg-boss:
+
+```typescript
+@Injectable()
+export class PgBossQueueService 
+  implements IQueueService, OnModuleInit, OnModuleDestroy
+```
+
+#### Key Features
+
+<AccordionGroup>
+  <Accordion title="Automatic queue tracking">
+    Automatic queue creation tracking via `createdQueues` Set
+  </Accordion>
+  
+  <Accordion title="Database connection">
+    Database connection configured via `ConfigService` from centralized `app.database.*` config (`app.database.url`, `app.database.ssl`). TLS options are resolved by the shared `resolveDatabaseSsl()` helper (`src/common/utils/database-ssl.util.ts`), which validates the server certificate against Node's trust store for managed/Neon databases — applied to both the pg-boss connection and the `rawPool` used for queue-policy enforcement.
+  </Accordion>
+  
+  <Accordion title="Lifecycle hooks">
+    Lifecycle hooks for proper startup/shutdown. `src/main.ts` must call `app.enableShutdownHooks()` so SIGTERM/SIGINT trigger `onModuleDestroy()` and allow pg-boss to stop gracefully.
+  </Accordion>
+  
+  <Accordion title="Worker registration">
+    Worker registration with type-safe job handlers
+  </Accordion>
+  
+  <Accordion title="Parallel per-job processing">
+    **Parallel per-job processing via `localConcurrency`**: When `batchSize` is specified in `WorkerOptions`, it is mapped to pg-boss's `localConcurrency` option (with `batchSize: 1` at the pg-boss level). This spawns N independent workers that each process one job at a time. pg-boss auto-completes on resolve or auto-fails on reject per handler invocation, avoiding the batch auto-completion pitfall where pg-boss `batchSize > 1` would complete/fail the entire batch as a unit.
+  </Accordion>
+  
+  <Accordion title="Test-only utilities">
+    **Test-only `__test__offWork(queueName)`** (throws unless `NODE_ENV=test`): wraps pg-boss `offWork()`, detaching all workers subscribed to that queue so jobs remain queued without being fetched. Used by distribution E2E tests together with `DistributionJobHandler.__test__resumeDistributionWorker()` to build a backlog and verify priority ordering before restoring the production worker (`batchSize: 10`).
+  </Accordion>
+</AccordionGroup>
+
+## Business Rules
+
+### Job Processing Rules
+
+<Tabs>
+  <Tab title="Retry Logic">
+    Jobs can be configured with retry limits and backoff strategies
+  </Tab>
+  
+  <Tab title="Job Uniqueness">
+    `singletonKey` deduplication is only enforced when the queue is created with `policy: 'stately'` (or `'exclusive'`). With the default `'standard'` policy the key is stored but no DB constraint prevents duplicate inserts.
+  </Tab>
+  
+  <Tab title="Priority Processing">
+    Higher priority jobs are processed first
+  </Tab>
+  
+  <Tab title="Expiration">
+    Jobs can expire if not processed within specified time
+  </Tab>
+  
+  <Tab title="Batch Processing">
+    Workers can process multiple jobs simultaneously
+  </Tab>
+</Tabs>
+
+#### Current Authorization for User-Initiated Jobs
+
+<Warning>
+Queue payloads should carry stable identifiers, not trusted authorization snapshots. Workers that perform user-initiated writes must reload current organization membership and RBAC permissions before execution, then fail the domain job if the actor was removed, deactivated, or lost the permission needed for that queued operation.
+</Warning>
+
+<Tip>
+The `import-job` worker uses this pattern for lead/contact imports.
+</Tip>
+
+### Queue Management
+
+<Steps>
+  <Step title="Queue creation">
+    Queues are created automatically when first used
+  </Step>
+  
+  <Step title="Worker registration">
+    Each queue can have multiple workers with different configurations
+  </Step>
+  
+  <Step title="Connection management">
+    Single pg-boss instance per service lifetime
+  </Step>
+</Steps>
+
+## Examples
+
+### Enqueuing a Job
+
+```typescript
+await queueService.enqueue('email-notifications', {
+  userId: '123',
+  templateId: 'welcome-email',
+  recipientEmail: 'user@example.com'
+}, {
+  retryLimit: 3,
+  retryBackoff: true,
+  priority: 10
+});
+```
+
+### Registering a Worker
+
+```typescript
+await queueService.registerWorker(
+  'email-notifications',
+  async (job: QueueJob<EmailNotificationPayload>) => {
+    await emailService.send(job.data);
+  },
+  {
+    concurrency: 5,
+    pollingIntervalSeconds: 1
+  }
+);
+```
+
+### Using Singleton Keys with Stately Policy
+
+```typescript
+// Enqueue with singleton key
+await queueService.enqueue('knowledge-base-indexing', {
+  knowledgeBaseId: '456',
+  orgId: '789'
+}, {
+  singletonKey: 'kb-index:456',
+  retryLimit: 0
+});
+
+// Register worker with stately policy
+await queueService.registerWorker(
+  'knowledge-base-indexing',
+  async (job: QueueJob<IndexingPayload>) => {
+    await indexingService.process(job.data);
+  },
+  {
+    concurrency: 2,
+    policy: 'stately'
+  }
+);
+```
+
+### Scheduling Recurring Jobs
+
+```typescript
+// Schedule a job to run every hour
+await queueService.schedule(
+  'cleanup-tasks',
+  '0 * * * *',
+  { taskType: 'expired-sessions' }
+);
+
+// Unschedule the job
+await queueService.unschedule('cleanup-tasks');
+```
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Health Module" icon="heart-pulse" href="/backend/health/health-module-specification">
+    Health check integration with PgBossHealthIndicator
+  </Card>
+  <Card title="Messaging Module" icon="envelope" href="/backend/messaging/messaging-module-specification">
+    Messaging outbox poll queue implementation
+  </Card>
+  <Card title="Knowledge Base" icon="book" href="/backend/knowledge-base/knowledge-base-specification">
+    Knowledge base indexing queue details
+  </Card>
+  <Card title="Distribution Module" icon="share-nodes" href="/backend/distribution/distribution-specification">
+    Distribution job handling and priority processing
+  </Card>
+</CardGroup>

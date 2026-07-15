@@ -1,0 +1,465 @@
+---
+title: "AI Conversation Specification v37"
+description: "Customer-facing AI conversation system with automated and AI-assisted responses, including four AI modes (OFF, AUTO_REPLY, SUGGEST_ONLY, DRAFT), webhook integration, and LLM provider abstraction"
+---
+
+## Overview
+
+The AI Conversation System enables automated and AI-assisted responses within the unified messaging module. It integrates with the existing webhook processing pipeline, conversation model, and template system to provide four modes of AI interaction controlled per-conversation.
+
+<Note>
+**Vocabulary note:** Both the messaging AI and the internal CRM assistant must speak **"assignment" / "assignee" / "assigned to"** to users — never "stakeholder", even when the underlying DTO field is still named `stakeholders`. See `Docs/STAKEHOLDER_SYSTEM.md` → "Vocabulary" and `Docs/AI_MODULE_SPECIFICATION.md` → "Assignment vocabulary (v0.11)".
+</Note>
+
+**Last Updated:** 2026-05-23  
+**Status:** Draft
+
+## Internal Assistant Boundary
+
+This specification covers customer-facing messaging AI: inbound messages, conversation modes, suggestions, drafts, and optional auto-replies inside the messaging pipeline. The native Propwise CRM sidebar assistant is a separate internal-user surface under `src/modules/ai-assistant` with `POST /v1/ai-assistant/chat`.
+
+### Internal Assistant Characteristics
+
+<AccordionGroup>
+<Accordion title="Data Model & Scope">
+- Uses `ai_conversation`, `ai_message`, and `ai_tool_call` tables, not the messaging `conversation` / `message` tables
+- Runs with the current user's tenant token and never uses a service-account "see everything" mode
+- Fetches CRM context through existing services and resource checks instead of accepting browser-supplied entity payloads
+</Accordion>
+
+<Accordion title="Permissions & Safety">
+- Is read-only in V1; drafts and suggestions are allowed, but sending messages or mutating CRM records requires a later explicit approval protocol
+- Enforces a **scope + refusal + groundedness + Propwise-glossary + multi-turn-follow-ups + lead-routing** system prompt
+- Current version: `AI_ASSISTANT_SYSTEM_PROMPT_VERSION = crm-assistant-v0.6-lead-routing`
+- Multi-turn-follow-ups contract introduced in `v0.5-multi-turn-affirmation`
+</Accordion>
+
+<Accordion title="Behavior Rules">
+- Out-of-scope topics (markets, weather, news, general world knowledge, personal advice) are declined without tool calls
+- Factual claims about specific leads/deals/contacts/properties must be backed by trusted context or a same-turn tool result
+- Short affirmatives ("yes do that", "ok pull it") resolve to the offered follow-up tool
+- Never re-call an already-executed tool with the same input
+- Treat prior-turn tool replays as summary-only (re-call the tool to refresh `<source>` evidence)
+- Lead field/filter glossary questions are grounded through read-only `getLeadSchemaGlossary` / `getCrmSchemaGlossary` tool surface
+- Natural-language stage prompts must resolve through `listLeadStages` before `searchLeads.stageId`
+</Accordion>
+</AccordionGroup>
+
+<Info>
+Provider abstractions and cost/budget controls may converge later, but prompt versions and runtime policies remain distinct from customer messaging AI prompts.
+</Info>
+
+## AI Modes
+
+The system supports four distinct AI interaction modes per conversation:
+
+| Mode | Behavior |
+|------|----------|
+| `OFF` | No AI involvement. Messages routed to human agents only. |
+| `AUTO_REPLY` | AI generates and sends responses automatically as `senderType = BOT`. |
+| `SUGGEST_ONLY` | AI generates a suggested response and emits it via WebSocket. Agent sees suggestion but must send manually. |
+| `DRAFT` | AI pre-fills the reply input box. Agent can edit before sending. |
+
+### Mode Cascade for New Conversations
+
+When a new conversation is created, the AI mode is determined by cascade:
+
+```
+ChannelAccount.defaultAiMode ?? Organization.settings.defaultAiMode ?? AiMode.OFF
+```
+
+<Tip>
+Agents can override the mode at any time via the conversation header toggle using the endpoint:  
+`PUT /messaging/conversations/:id/ai-mode`
+</Tip>
+
+### Agent Availability Gate
+
+Enabling AI requires that `AiAgentResolverService.resolveForConversation()` resolves an agent for the conversation's channel.
+
+<Warning>
+Resolution has **no ORG-scoped fallback for PERSONAL channels**: a PERSONAL channel account resolves only a PERSONAL agent owned by that channel's owner and matching the channel; if none exists it returns `null` (it does **not** borrow an ORGANIZATION agent). Without a gate, toggling AI on for such a channel would set `aiMode = true` while the runtime silently produces no reply.
+</Warning>
+
+#### Server-Side Enforcement (Fail-Closed)
+
+`ConversationService.updateAiModeForUser()` rejects `aiMode = true` with:
+
+```
+BadRequestException('No AI agent is configured for this channel.')
+```
+
+This occurs when the resolver returns no agent.
+
+**Guard order:**
+1. `canReply` (403)
+2. 24h-window-open (400)
+3. agent-resolves (400)
+
+<Check>
+`aiMode = false` is always allowed regardless of agent availability.
+</Check>
+
+#### Client-Side Behavior (Disabled Toggle)
+
+`ConversationDetailDto.aiAgentAvailable` (value: `!!resolvedAgent`, reused from the same resolver call in `getConversationDetailForUser`) drives the header toggle.
+
+When `false`:
+- Toggle is disabled with tooltip: "No AI agent is configured for this channel."
+- **Exception:** If AI is already on, the user can still turn it OFF
+
+## AI Decision Pipeline
+
+### Interception Point
+
+AI processing occurs in **Phase B** of the webhook processor, after the message has been persisted (Phase A).
+
+<CardGroup cols={2}>
+<Card title="Benefits" icon="check">
+- Message persistence is never blocked by AI processing
+- AI failures are non-critical (logged, not thrown)
+- The inbound message is available for context composition
+</Card>
+
+<Card title="Latency Target" icon="clock">
+**Total:** < 5 seconds end-to-end for AI response generation
+
+**Breakdown:**
+- Context composition: < 200ms
+- LLM API call: < 4s (with timeout)
+- Response processing + send: < 800ms
+</Card>
+</CardGroup>
+
+### Pipeline Flow
+
+<Steps>
+<Step title="Phase A: Message Persistence">
+Persist message + update conversation (transactional)
+</Step>
+
+<Step title="Phase B: Side-Effects">
+Non-critical, isolated try-catch blocks:
+
+1. **Block 1:** WebSocket events (new-message, new-conversation)
+2. **Block 2:** Notification events (NewMessageEvent)
+3. **Block 3:** Automation rule evaluation
+4. **Block 4:** AI Response Pipeline ← **NEW**
+</Step>
+
+<Step title="AI Response Pipeline">
+```typescript
+// Check conversation.aiMode
+if (aiMode === 'OFF') skip;
+if (aiMode === 'AUTO_REPLY') generate + send;
+if (aiMode === 'SUGGEST_ONLY') generate + emit WebSocket;
+if (aiMode === 'DRAFT') generate + emit WebSocket (draft payload);
+
+// Check escalation triggers (before generating)
+if (escalationTriggered) {
+  setAiMode('OFF');
+  notifyAgent();
+  skip;
+}
+
+// Execute pipeline
+composePromptContext();
+callLlmProvider();
+processResponseByMode();
+incrementConversation.aiMessageCount();
+```
+</Step>
+</Steps>
+
+### Timeout Handling
+
+<Warning>
+If LLM call exceeds 8s, abort and log warning. Do not retry in the message pipeline — the opportunity has passed.
+</Warning>
+
+### Queue-Based Alternative (Future)
+
+For high-volume deployments, AI processing can be moved to a dedicated pg-boss queue (`ai-response`) to decouple it from the webhook worker entirely. The current Phase B approach is simpler and sufficient for initial rollout.
+
+## LLM Integration Architecture
+
+### Provider Abstraction
+
+The system uses a provider-agnostic interface to support multiple LLM vendors:
+
+```typescript
+interface LlmProvider {
+  generateResponse(request: LlmRequest): Promise<LlmResponse>;
+  countTokens(text: string): number;
+}
+
+interface LlmRequest {
+  systemPrompt: string;
+  messages: LlmMessage[];
+  maxTokens: number;
+  temperature: number;
+}
+
+interface LlmMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface LlmResponse {
+  content: string;
+  tokensUsed: { prompt: number; completion: number };
+  model: string;
+  finishReason: string;
+}
+```
+
+### Supported Providers
+
+| Provider | SDK | Models |
+|----------|-----|--------|
+| OpenAI | `openai` npm package | GPT-4o, GPT-4o-mini |
+| Google Gemini | `@google/generative-ai` | Gemini 2.0 Flash, Pro |
+| Anthropic | `@anthropic-ai/sdk` | Claude Sonnet, Haiku |
+
+### Configuration
+
+Provider selection is configured per organization via `Organization.settings`:
+
+```typescript
+interface OrganizationSettings {
+  defaultAiMode?: AiMode;
+  ai?: {
+    provider: 'openai' | 'gemini' | 'anthropic';
+    model: string;
+    apiKey: string; // encrypted at rest
+    maxTokensPerResponse: number; // default 500
+    temperature: number; // default 0.7
+  };
+}
+```
+
+### Conversation Context Composition
+
+The AI context window is built from multiple sources, ordered by priority:
+
+<Steps>
+<Step title="System Prompt">
+From the matched AI_PROMPT MessageTemplate (via `findAiPromptTemplate`). When no template matches, the hardcoded fallback string is used.
+
+<Note>
+There is no longer a separate `SystemPrompt` DB entity — the legacy `system_prompts` table was dropped by `Migration20260419000000_drop_n8n_artifacts`.
+</Note>
+</Step>
+
+<Step title="Knowledge Context">
+Relevant chunks from the RAG pipeline via:
+```typescript
+EmbeddingService.generateEmbedding(query, apiKey)
+```
+Plus pgvector cosine search on `knowledge_chunks` (if the org has an `OrganizationLlmKey` configured).
+</Step>
+
+<Step title="CRM Context">
+- Person name
+- Lead details (budget, timeline, intent)
+- Property interests
+</Step>
+
+<Step title="Conversation History">
+Last N messages (configurable, default 20), formatted as user/assistant turns.
+</Step>
+</Steps>
+
+### Token Budget Management
+
+```
+Total Budget = Organization.settings.ai.maxTokensPerResponse (completion)
+                + calculated prompt tokens (context)
+```
+
+#### Context Priority (When Trimming Needed)
+
+<Tabs>
+<Tab title="Priority Order">
+1. **System prompt** (never trimmed)
+2. **Last 5 messages** (never trimmed)
+3. **CRM context** (trimmed second)
+4. **Knowledge context** (trimmed first)
+5. **Older messages** (trimmed by removing oldest first)
+</Tab>
+
+<Tab title="Constraints">
+- Token counting uses the provider's tokenizer (tiktoken for OpenAI, approximate for others)
+- **Maximum context window:** 8,000 tokens for prompt (conservative default)
+- If total context exceeds budget, trim knowledge chunks first, then older messages
+</Tab>
+</Tabs>
+
+## AI Response Generation Service
+
+### Service Overview
+
+**Service:** `AiResponseService`  
+**Module:** `src/modules/messaging/services/ai-response.service.ts`  
+**Registered in:** `MessagingModule.providers`
+
+### Main Method: `processInboundMessage`
+
+```typescript
+async processInboundMessage(
+  conversation: Conversation,
+  inboundMessage: Message,
+  em: EntityManager,
+): Promise<void>
+```
+
+### Processing Flow
+
+<Steps>
+<Step title="Mode Check">
+If `conversation.aiMode === AiMode.OFF`, return immediately.
+</Step>
+
+<Step title="Escalation Check">
+Evaluate escalation triggers before generating (see section 3d). If triggered, abort.
+</Step>
+
+<Step title="Find AI Prompt Template">
+```typescript
+const template = await templateService.findAiPromptTemplate(
+  conversation.organization.id,
+  conversation.channelAccount.id,
+  conversation.tags,
+);
+const systemPrompt = template?.systemPrompt?.prompt 
+  ?? template?.body 
+  ?? DEFAULT_SYSTEM_PROMPT;
+```
+</Step>
+
+<Step title="Build Context">
+- Load last N messages for conversation
+- Load PersonChannel → Person → Lead context (if linked)
+- Query knowledge base for relevant chunks (if EmbeddingService available)
+- Compose `LlmRequest` with token budget enforcement
+</Step>
+
+<Step title="Call LLM Provider">
+```typescript
+const llmResponse = await llmProvider.generateResponse(request);
+```
+</Step>
+
+<Step title="Process by Mode">
+<Tabs>
+<Tab title="AUTO_REPLY">
+- Create outbound Message with `senderType = SenderType.BOT`
+- Create MessageOutbox entry (transactional outbox pattern)
+- Update conversation stats (lastMessageAt, lastMessagePreview)
+- Emit WebSocket `new-message` event
+</Tab>
+
+<Tab title="SUGGEST_ONLY">
+Emit WebSocket event `ai-suggestion` to the conversation room:
+
+```typescript
+{
+  conversationId: string;
+  suggestion: {
+    content: string;
+    generatedAt: Date;
+    confidence: number;
+  };
+}
+```
+</Tab>
+
+<Tab title="DRAFT">
+Emit WebSocket event `ai-draft` to the conversation room:
+
+```typescript
+{
+  conversationId: string;
+  draft: {
+    content: string;
+    generatedAt: Date;
+  };
+}
+```
+
+Client automatically populates the reply input field.
+</Tab>
+</Tabs>
+</Step>
+
+<Step title="Increment AI Message Count">
+```typescript
+conversation.aiMessageCount = (conversation.aiMessageCount ?? 0) + 1;
+await em.flush();
+```
+</Step>
+</Steps>
+
+### Error Handling
+
+<Warning>
+All errors in `processInboundMessage` are caught, logged, and **not** re-thrown. AI failures must never crash the webhook processor.
+</Warning>
+
+```typescript
+try {
+  await aiResponseService.processInboundMessage(conversation, message, em);
+} catch (error) {
+  logger.error('AI response generation failed', {
+    conversationId: conversation.id,
+    messageId: message.id,
+    error: error.message,
+  });
+  // Continue processing - AI failure is non-critical
+}
+```
+
+## Default Fallback Prompt
+
+When no AI_PROMPT template is found, the system uses this hardcoded fallback:
+
+```
+You are a helpful AI assistant for a real estate company. 
+Respond professionally and helpfully to customer inquiries.
+
+Guidelines:
+- Be concise and friendly
+- Stay on topic (real estate, properties, appointments)
+- If you don't know something, say so
+- Never make up property details or availability
+- Suggest connecting with a human agent for complex requests
+
+Context about the customer and their interests will be provided 
+in the conversation history below.
+```
+
+<Info>
+Organizations should create custom AI_PROMPT templates for better brand alignment and domain-specific behavior.
+</Info>
+
+---
+
+## Related Documentation
+
+<CardGroup cols={2}>
+<Card title="Stakeholder System" icon="users" href="/backend/docs/stakeholder-system">
+Assignment vocabulary and stakeholder management
+</Card>
+
+<Card title="AI Module Specification" icon="robot" href="/backend/docs/ai-module-specification">
+Internal CRM assistant and tool system
+</Card>
+
+<Card title="Messaging Module" icon="message" href="/backend/messaging/overview">
+Unified messaging pipeline and webhooks
+</Card>
+
+<Card title="Template System" icon="file-lines" href="/backend/messaging/templates">
+Message templates and AI prompts
+</Card>
+</CardGroup>
