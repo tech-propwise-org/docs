@@ -1,0 +1,1956 @@
+---
+title: "Messaging Module Specification v38"
+description: "Unified messaging system for WhatsApp, Instagram, and Facebook Messenger with shared entities, queue infrastructure, and WebSocket architecture"
+---
+
+<Note>
+**Last Updated:** 2026-06-01  
+**Status:** Active
+</Note>
+
+## Overview
+
+The Messaging module provides a unified, channel-agnostic messaging system for WhatsApp, Instagram, and Facebook Messenger. It replaces the separate per-channel modules with shared entities, a shared queue, and a single WebSocket namespace.
+
+### Problem → Solution
+
+| Problem | Solution |
+|---------|----------|
+| Duplicated logic across WhatsApp and Instagram modules | Single `MessagingModule` with channel providers |
+| No webhook signature validation (security gap) | Shared `MetaWebhookGuard` validates `X-Hub-Signature-256` |
+| Inconsistent WebSocket auth (Instagram gateway has no JWT) | Single `/messaging` gateway with JWT auth |
+| No Facebook Messenger support | Third channel provider |
+| Separate entity schemas per channel | Unified entities: `Conversation`, `Message`, `ChannelAccount` |
+| No shared queue infrastructure | Shared `PgBossQueueService` for messaging + notifications |
+
+### Key design decisions
+
+<AccordionGroup>
+  <Accordion title="pg-boss over BullMQ">
+    Project already uses pg-boss for notifications. No new Redis dependency. Interface-based design (`IQueueService`) allows swapping later.
+  </Accordion>
+
+  <Accordion title="Direct PersonChannel FK on Conversation">
+    Conversations link directly to the CRM's `PersonChannel` via FK. Simpler model, no bidirectional sync overhead.
+  </Accordion>
+
+  <Accordion title="Organization lifecycle integration">
+    `MessagingOrganizationLifecycleListener` handles organization deletion/restore by disconnecting WebSocket clients organization-wide and pausing/resuming Meta channel accounts non-destructively. 
+    
+    The `MessagingGateway` provides `disconnectOrganization()` for cluster-wide client disconnection via the Postgres IO adapter. 
+    
+    The lead FK was moved from Conversation to Lead (`Lead.sourceConversation`) — conversation detail loads the single active lead for the current conversation through that FK, while broader CRM screens can still query historical person leads through `personChannel → person → leads`. 
+    
+    Lead list, kanban, and detail DTOs expose `person.channels`, allowing CRM cards/panels to route users into the Inbox using the selected `PersonChannel`. 
+    
+    Conversations may also hold a nullable `contact_id`; when duplicate Persons/Contacts are merged, conversations pointing at absorbed Contacts are re-pointed to the surviving Contact so messaging activity and AI mode history stay attached to the business record. 
+    
+    Detail DTOs resolve the canonical contact as `conversation.contact` first and fall back to `conversation.personChannel.person.contact`, because the explicit conversation contact is an opportunistic cached link and may remain null if a Contact is created after the latest inbound webhook.
+  </Accordion>
+
+  <Accordion title="Archive as boolean, not status">
+    `Conversation.isArchived` is orthogonal to `status` (OPEN/CLOSED), following `ARCHIVE_SYSTEM_SPECIFICATION.md`. 
+    
+    Standard inbox rail reads keep the default `active` filter enabled, so archived conversations are hidden from the live Inbox; the rail exposes an explicit `isArchived=true` query for the Archived bucket. 
+    
+    Conversation detail, message reads, lifecycle methods, and WebSocket access may intentionally disable the archive filter so archived conversations remain reviewable. 
+    
+    Live inbound webhooks reuse an archived conversation for the same `channelAccount + personChannel` without unarchiving it; the new message is stored in the archived conversation, notifications are suppressed, and the live rail does not receive a new item. 
+    
+    Soft-deleted conversations are different: they are terminal inbox-thread tombstones. Account disconnect soft-deletes and archives all conversations for that `ChannelAccount`; restore with `restoreConversations=true` flips those conversations back to `isDeleted=false` and `isArchived=false`. 
+    
+    If the account is reconnected without restoring conversations, live inbound, live native-app echo, WhatsApp history sync, WhatsApp history media follow-up, WhatsApp history-safe SMB echo, or Instagram/Messenger Meta conversation sync can opt into deleted-predecessor detection and create an active replacement conversation for the same `channelAccount + personChannel`. 
+    
+    The replacement conversation is created with deleted-restart metadata, does not restore the old row, does not create or inherit/link a Lead or Deal, and skips lead-stakeholder auto-routing. Historical message import also ignores messages already stored only under a soft-deleted predecessor so the active replacement can receive its own rows. 
+    
+    The only CRM relation carried forward from the deleted row is its explicit `contact_id`, and only when that Contact is still live (`isDeleted=false`, `isArchived=false`).
+  </Accordion>
+
+  <Accordion title="ConversationAssignment entity (not entity_stakeholder)">
+    Conversations use a dedicated `conversation_assignment` table instead of the CRM `entity_stakeholder` pattern.
+    
+    **Lead stakeholder auto-assignment**: Auto-assign the PERSONAL channel account owner as the primary stakeholder (100%, FULL) of the conversation's lead. This is invoked only from `createAssignment` for the personal-account owner's assignment on a channel with `autoCreateLead` enabled—effectively new-conversation routing (MessageRouter priority 0). 
+    
+    Org accounts and non-owner agents never trigger stakeholder creation. The target lead is strictly the active lead attributed to this conversation via `Lead.sourceConversation`; an unrelated pre-existing lead for the same person is never used. 
+    
+    Skips when the channel is not personal, has no owner, does not auto-create leads, the conversation has no active source-conversation lead, or that lead already has a primary stakeholder.
+    
+    Each assignment is one row with nullable `user_id` and `team_id`: 
+    - `user + null` = direct assignment (e.g., lead stakeholder or personal account owner)
+    - `user + team` = agent on behalf of team
+    - `null + team` = team pool
+    
+    Multiple assignment rows per conversation are supported (e.g., a direct agent plus a team pool). 
+    
+    `conversation_assignment.is_owner` marks the single protected personal-account owner assignment row; any active assignment whose `user_id` matches the owner of a `PERSONAL` `ChannelAccount` is saved as `is_owner=true`, even when the row also has a `team_id` or is created by manual/workflow assignment paths. 
+    
+    Deleting a conversation soft-deletes all active assignment rows for that conversation so stale assignment recipients are not reused by deleted-thread restarts. 
+    
+    Repair migrations also insert a missing direct owner row for personal conversations that have no active owner assignment. 
+    
+    `entity_stakeholder` was not used because it carries commission splits and multi-stakeholder roles, adding join complexity without benefit for messaging. 
+    
+    Transfer history is tracked via WebSocket events (`conversation-updated`) and notification events (`CONVERSATION_TRANSFERRED`). 
+    
+    <Warning>
+    **Migration note:** the backfill from the old flat `assigned_agent_id`/`assigned_team_id` columns creates separate rows for agent and team (preserving their independence), not a single `user+team` row.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Transactional outbox">
+    Outbound messages use an outbox table written in the same DB transaction as the Message entity, guaranteeing at-least-once delivery.
+  </Accordion>
+
+  <Accordion title="Per-conversation AI mode with inbound coalescing">
+    Each conversation has an `aiMode` field (OFF, AUTO_REPLY, SUGGEST_ONLY, DRAFT). Default cascades: ChannelAccount.defaultAiMode → Organization default → OFF. 
+    
+    The comprehensive AI module (`AiModule`) provides automated conversation handling with inbound message coalescing, debounce management, tool execution, budget controls, and eval capabilities, including:
+    
+    - **Agent Templates**: 10 pre-configured agent types seeded via `AiAgentTemplateSeeder` including Receptionist, Sales Qualification, Listing Inquiry, Off-Plan Inquiry, Appointment Booking, After-Hours, FAQ & Support, Campaign Lead Capture, Spam Handler, and Human Handoff
+    - **Knowledge Base Integration**: FAQ, SNIPPET, DOCUMENT, and PAGE types with chunking, embedding, and RAG capabilities through `KnowledgeBaseService`
+    - **Credit Management**: AI-credit affordability/gating via the subscription module's unified-wallet `CreditMeteringService` (shared org pool with per-user ceilings)
+    - **OpenAI Integration**: Project provisioning and encrypted key management through `OpenAiProjectProvisioner` and `OpenAiEncryptionService`
+    - **Activity Logging**: Comprehensive tracking via `AiActivityLogService` with filtering and analytics
+    - **Queue-based Execution**: Reliable processing via pg-boss workers (`AiAgentExecuteWorker`) with step tracking
+    - **Tool Registry**: Extensible system for CRM tools through `AiAgentToolRegistryService` and `AiAgentActionService`
+    - **Media Processing**: Audio/image processing via `AiAgentMediaProcessorService`
+    - **Optimization**: Instruction optimization via `AiAgentOptimizeService` with protected token preservation
+    - **Security**: SSRF protection and AES-GCM encryption utilities for secure operations
+    - **Bidirectional Workflow Integration**: AI agents can be activated by workflow steps AND can trigger child workflows via the `trigger_workflow` action
+  </Accordion>
+
+  <Accordion title="Three-tier template system">
+    `MessageTemplate` supports three types: 
+    - `META_APPROVED` (platform-approved)
+    - `QUICK_REPLY` (agent shortcuts with variable resolution)
+    - `AI_PROMPT` (AI system prompts)
+  </Accordion>
+
+  <Accordion title="Personal accounts share org WABA token">
+    WhatsApp personal accounts reuse the organization's WABA access token (same Business Account). Instagram and Messenger personal accounts use their own Page Access Token obtained via OAuth.
+    
+    **OAuth state includes `level` for defense-in-depth**: The HMAC-signed OAuth state payload carries a `level` field (`personal` | `organization`). Both the personal and org connect-with-code endpoints validate that the state's level matches the expected flow, preventing cross-level misuse (e.g., a personal OAuth redirect being replayed against the org endpoint). The `tempToken` encrypted payload also carries the `level` for the same reason.
+  </Accordion>
+</AccordionGroup>
+
+## Architecture & Module Structure
+
+The messaging module follows a layered architecture with clear separation of concerns:
+
+```
+MessagingModule
+├── Controllers
+│   ├── MessagingWebhookController (Meta webhooks)
+│   ├── ConversationController (REST API)
+│   ├── MessageController (REST API)
+│   └── ChannelAccountController (REST API)
+├── Gateways
+│   └── MessagingGateway (WebSocket /messaging)
+├── Services
+│   ├── Core
+│   │   ├── ConversationService
+│   │   ├── MessageService
+│   │   ├── ChannelAccountService
+│   │   └── MessageTemplateService
+│   ├── Channel Providers
+│   │   ├── WhatsAppProvider
+│   │   ├── InstagramProvider
+│   │   └── MessengerProvider
+│   ├── Queue & Workers
+│   │   ├── PgBossQueueService (IQueueService)
+│   │   ├── MessageSendWorker
+│   │   ├── MessageOutboxWorker
+│   │   └── WebhookProcessorWorker
+│   └── Support
+│       ├── MessageRouter
+│       ├── WebhookSignatureValidator
+│       └── ConversationAssignmentService
+├── Entities
+│   ├── Conversation
+│   ├── Message
+│   ├── ChannelAccount
+│   ├── ConversationAssignment
+│   ├── MessageTemplate
+│   └── MessageOutbox
+└── Guards
+    └── MetaWebhookGuard
+```
+
+### Module responsibilities
+
+<CardGroup cols={2}>
+  <Card title="Core Services" icon="gear">
+    Handle business logic for conversations, messages, channel accounts, and templates
+  </Card>
+  <Card title="Channel Providers" icon="plug">
+    Abstract platform-specific API calls (WhatsApp, Instagram, Messenger)
+  </Card>
+  <Card title="Queue Infrastructure" icon="list-check">
+    Reliable message delivery and webhook processing via pg-boss
+  </Card>
+  <Card title="WebSocket Gateway" icon="signal-stream">
+    Real-time updates to connected clients via `/messaging` namespace
+  </Card>
+</CardGroup>
+
+## Multi-Tenancy Patterns
+
+The messaging module implements multi-tenancy through organization-scoped data and queries.
+
+### Organization isolation
+
+<Steps>
+  <Step title="Entity level">
+    All messaging entities include `organization_id` FK:
+    ```typescript
+    @ManyToOne(() => Organization)
+    @JoinColumn({ name: 'organization_id' })
+    organization: Organization;
+    
+    @Column({ name: 'organization_id' })
+    organizationId: string;
+    ```
+  </Step>
+
+  <Step title="Query level">
+    All queries filter by `organizationId` from authenticated context:
+    ```typescript
+    const conversations = await this.conversationRepository.find({
+      where: { 
+        organizationId: ctx.organizationId,
+        isDeleted: false 
+      }
+    });
+    ```
+  </Step>
+
+  <Step title="WebSocket level">
+    Clients join organization-specific rooms and only receive events for their organization:
+    ```typescript
+    client.join(`org:${organizationId}`);
+    this.server.to(`org:${organizationId}`).emit('message-created', payload);
+    ```
+  </Step>
+</Steps>
+
+### Channel account ownership
+
+<Tabs>
+  <Tab title="Organization Accounts">
+    - Type: `ORGANIZATION`
+    - Access: All users in the organization
+    - Token: Shared WABA token (WhatsApp) or Page Access Token (Instagram/Messenger)
+    - Use case: Shared inbox for teams
+  </Tab>
+
+  <Tab title="Personal Accounts">
+    - Type: `PERSONAL`
+    - Access: Only the `ownerId` user
+    - Token: Reuses org WABA (WhatsApp) or own Page token (Instagram/Messenger)
+    - Use case: Individual agent conversations
+    - Assignment: Personal account owner is automatically assigned with `is_owner=true`
+  </Tab>
+</Tabs>
+
+<Warning>
+Personal account conversations are visible to users with appropriate RBAC permissions (e.g., admins, managers), but assignment rules ensure the owner is automatically included.
+</Warning>
+
+## Entities
+
+### Conversation
+
+The core entity representing a messaging thread between a channel account and a contact.
+
+```typescript
+@Entity('conversation')
+export class Conversation extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ name: 'channel_account_id' })
+  channelAccountId: string;
+
+  @Column({ name: 'person_channel_id' })
+  personChannelId: string;
+
+  @Column({ name: 'contact_id', nullable: true })
+  contactId?: string;
+
+  @Column({ 
+    type: 'enum', 
+    enum: ConversationStatus,
+    default: ConversationStatus.OPEN 
+  })
+  status: ConversationStatus;
+
+  @Column({ name: 'is_archived', default: false })
+  isArchived: boolean;
+
+  @Column({ 
+    type: 'enum',
+    enum: AiMode,
+    name: 'ai_mode',
+    default: AiMode.OFF 
+  })
+  aiMode: AiMode;
+
+  @Column({ type: 'jsonb', nullable: true })
+  metadata?: Record<string, any>;
+
+  @Column({ name: 'last_message_at', type: 'timestamp' })
+  lastMessageAt: Date;
+
+  // Relations
+  @ManyToOne(() => Organization)
+  @JoinColumn({ name: 'organization_id' })
+  organization: Organization;
+
+  @ManyToOne(() => ChannelAccount)
+  @JoinColumn({ name: 'channel_account_id' })
+  channelAccount: ChannelAccount;
+
+  @ManyToOne(() => PersonChannel)
+  @JoinColumn({ name: 'person_channel_id' })
+  personChannel: PersonChannel;
+
+  @ManyToOne(() => Contact, { nullable: true })
+  @JoinColumn({ name: 'contact_id' })
+  contact?: Contact;
+
+  @OneToMany(() => Message, m => m.conversation)
+  messages: Message[];
+
+  @OneToMany(() => ConversationAssignment, a => a.conversation)
+  assignments: ConversationAssignment[];
+}
+```
+
+<Info>
+The `contact_id` is an opportunistic cached link. When duplicate Persons/Contacts are merged, conversations pointing at absorbed Contacts are re-pointed to the surviving Contact.
+</Info>
+
+### Message
+
+Represents a single message within a conversation.
+
+```typescript
+@Entity('message')
+export class Message extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'conversation_id' })
+  conversationId: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ 
+    type: 'enum',
+    enum: MessageDirection 
+  })
+  direction: MessageDirection; // INBOUND | OUTBOUND
+
+  @Column({ 
+    type: 'enum',
+    enum: MessageStatus,
+    default: MessageStatus.PENDING 
+  })
+  status: MessageStatus;
+
+  @Column({ type: 'text', nullable: true })
+  content?: string;
+
+  @Column({ type: 'jsonb', nullable: true })
+  media?: MessageMedia[];
+
+  @Column({ name: 'platform_message_id', nullable: true })
+  platformMessageId?: string;
+
+  @Column({ name: 'sender_user_id', nullable: true })
+  senderUserId?: string;
+
+  @Column({ name: 'sent_at', type: 'timestamp', nullable: true })
+  sentAt?: Date;
+
+  @Column({ name: 'delivered_at', type: 'timestamp', nullable: true })
+  deliveredAt?: Date;
+
+  @Column({ name: 'read_at', type: 'timestamp', nullable: true })
+  readAt?: Date;
+
+  @Column({ name: 'failed_at', type: 'timestamp', nullable: true })
+  failedAt?: Date;
+
+  @Column({ type: 'text', nullable: true })
+  error?: string;
+
+  @Column({ type: 'jsonb', nullable: true })
+  metadata?: Record<string, any>;
+
+  // Relations
+  @ManyToOne(() => Conversation, c => c.messages)
+  @JoinColumn({ name: 'conversation_id' })
+  conversation: Conversation;
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'sender_user_id' })
+  senderUser?: User;
+}
+```
+
+### ChannelAccount
+
+Represents a connected messaging channel (WhatsApp, Instagram, or Messenger).
+
+```typescript
+@Entity('channel_account')
+export class ChannelAccount extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ 
+    type: 'enum',
+    enum: MessagingChannel 
+  })
+  channel: MessagingChannel; // WHATSAPP | INSTAGRAM | MESSENGER
+
+  @Column({ 
+    type: 'enum',
+    enum: ChannelAccountType 
+  })
+  type: ChannelAccountType; // ORGANIZATION | PERSONAL
+
+  @Column({ name: 'owner_id', nullable: true })
+  ownerId?: string; // Required for PERSONAL type
+
+  @Column({ name: 'platform_account_id' })
+  platformAccountId: string; // Phone number ID, Instagram ID, Page ID
+
+  @Column({ name: 'display_name' })
+  displayName: string;
+
+  @Column({ name: 'profile_picture_url', nullable: true })
+  profilePictureUrl?: string;
+
+  @Column({ name: 'access_token_encrypted', type: 'text' })
+  accessTokenEncrypted: string;
+
+  @Column({ 
+    type: 'enum',
+    enum: ChannelAccountStatus,
+    default: ChannelAccountStatus.ACTIVE 
+  })
+  status: ChannelAccountStatus;
+
+  @Column({ 
+    type: 'enum',
+    enum: AiMode,
+    name: 'default_ai_mode',
+    default: AiMode.OFF 
+  })
+  defaultAiMode: AiMode;
+
+  @Column({ name: 'auto_create_lead', default: false })
+  autoCreateLead: boolean;
+
+  @Column({ type: 'jsonb', nullable: true })
+  metadata?: Record<string, any>;
+
+  // Relations
+  @ManyToOne(() => Organization)
+  @JoinColumn({ name: 'organization_id' })
+  organization: Organization;
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'owner_id' })
+  owner?: User;
+
+  @OneToMany(() => Conversation, c => c.channelAccount)
+  conversations: Conversation[];
+}
+```
+
+<Note>
+WhatsApp personal accounts reuse the organization's WABA access token. Instagram and Messenger personal accounts use their own Page Access Token obtained via OAuth.
+</Note>
+
+### ConversationAssignment
+
+Tracks which users/teams are assigned to a conversation.
+
+```typescript
+@Entity('conversation_assignment')
+export class ConversationAssignment extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'conversation_id' })
+  conversationId: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ name: 'user_id', nullable: true })
+  userId?: string;
+
+  @Column({ name: 'team_id', nullable: true })
+  teamId?: string;
+
+  @Column({ name: 'is_owner', default: false })
+  isOwner: boolean; // True for personal account owner
+
+  @Column({ name: 'assigned_at', type: 'timestamp' })
+  assignedAt: Date;
+
+  @Column({ name: 'assigned_by_user_id', nullable: true })
+  assignedByUserId?: string;
+
+  // Relations
+  @ManyToOne(() => Conversation, c => c.assignments)
+  @JoinColumn({ name: 'conversation_id' })
+  conversation: Conversation;
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'user_id' })
+  user?: User;
+
+  @ManyToOne(() => Team, { nullable: true })
+  @JoinColumn({ name: 'team_id' })
+  team?: Team;
+
+  @ManyToOne(() => User, { nullable: true })
+  @JoinColumn({ name: 'assigned_by_user_id' })
+  assignedBy?: User;
+}
+```
+
+<Check>
+**Assignment types supported:**
+- `user + null`: Direct assignment (lead stakeholder or personal account owner)
+- `user + team`: Agent on behalf of team
+- `null + team`: Team pool
+</Check>
+
+### MessageTemplate
+
+Supports three template types for different use cases.
+
+```typescript
+@Entity('message_template')
+export class MessageTemplate extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ 
+    type: 'enum',
+    enum: MessageTemplateType 
+  })
+  type: MessageTemplateType; // META_APPROVED | QUICK_REPLY | AI_PROMPT
+
+  @Column()
+  name: string;
+
+  @Column({ type: 'text' })
+  content: string;
+
+  @Column({ type: 'enum', enum: MessagingChannel })
+  channel: MessagingChannel;
+
+  @Column({ name: 'platform_template_id', nullable: true })
+  platformTemplateId?: string; // For META_APPROVED
+
+  @Column({ type: 'jsonb', nullable: true })
+  variables?: string[];
+
+  @Column({ name: 'is_active', default: true })
+  isActive: boolean;
+
+  // Relations
+  @ManyToOne(() => Organization)
+  @JoinColumn({ name: 'organization_id' })
+  organization: Organization;
+}
+```
+
+### MessageOutbox
+
+Transactional outbox pattern for reliable message delivery.
+
+```typescript
+@Entity('message_outbox')
+export class MessageOutbox extends BaseEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ name: 'message_id' })
+  messageId: string;
+
+  @Column({ name: 'organization_id' })
+  organizationId: string;
+
+  @Column({ 
+    type: 'enum',
+    enum: MessageOutboxStatus,
+    default: MessageOutboxStatus.PENDING 
+  })
+  status: MessageOutboxStatus;
+
+  @Column({ name: 'retry_count', default: 0 })
+  retryCount: number;
+
+  @Column({ name: 'next_retry_at', type: 'timestamp', nullable: true })
+  nextRetryAt?: Date;
+
+  @Column({ name: 'last_error', type: 'text', nullable: true })
+  lastError?: string;
+
+  // Relations
+  @ManyToOne(() => Message)
+  @JoinColumn({ name: 'message_id' })
+  message: Message;
+}
+```
+
+## Enums
+
+### MessagingChannel
+
+```typescript
+enum MessagingChannel {
+  WHATSAPP = 'WHATSAPP',
+  INSTAGRAM = 'INSTAGRAM',
+  MESSENGER = 'MESSENGER'
+}
+```
+
+### ChannelAccountType
+
+```typescript
+enum ChannelAccountType {
+  ORGANIZATION = 'ORGANIZATION',
+  PERSONAL = 'PERSONAL'
+}
+```
+
+### ChannelAccountStatus
+
+```typescript
+enum ChannelAccountStatus {
+  ACTIVE = 'ACTIVE',
+  PAUSED = 'PAUSED',
+  DISCONNECTED = 'DISCONNECTED',
+  ERROR = 'ERROR'
+}
+```
+
+### ConversationStatus
+
+```typescript
+enum ConversationStatus {
+  OPEN = 'OPEN',
+  CLOSED = 'CLOSED'
+}
+```
+
+### MessageDirection
+
+```typescript
+enum MessageDirection {
+  INBOUND = 'INBOUND',
+  OUTBOUND = 'OUTBOUND'
+}
+```
+
+### MessageStatus
+
+```typescript
+enum MessageStatus {
+  PENDING = 'PENDING',
+  QUEUED = 'QUEUED',
+  SENT = 'SENT',
+  DELIVERED = 'DELIVERED',
+  READ = 'READ',
+  FAILED = 'FAILED'
+}
+```
+
+### AiMode
+
+```typescript
+enum AiMode {
+  OFF = 'OFF',
+  AUTO_REPLY = 'AUTO_REPLY',
+  SUGGEST_ONLY = 'SUGGEST_ONLY',
+  DRAFT = 'DRAFT'
+}
+```
+
+### MessageTemplateType
+
+```typescript
+enum MessageTemplateType {
+  META_APPROVED = 'META_APPROVED',
+  QUICK_REPLY = 'QUICK_REPLY',
+  AI_PROMPT = 'AI_PROMPT'
+}
+```
+
+### MessageOutboxStatus
+
+```typescript
+enum MessageOutboxStatus {
+  PENDING = 'PENDING',
+  PROCESSING = 'PROCESSING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED'
+}
+```
+
+## Message Flows
+
+### Inbound message flow
+
+<Steps>
+  <Step title="Webhook received">
+    Meta platform sends webhook to `POST /webhooks/messaging/meta` with signature
+  </Step>
+
+  <Step title="Signature validation">
+    `MetaWebhookGuard` validates `X-Hub-Signature-256` header
+  </Step>
+
+  <Step title="Queue webhook">
+    `MessagingWebhookController` enqueues webhook payload to `webhook-processor` queue
+  </Step>
+
+  <Step title="Process webhook">
+    `WebhookProcessorWorker` dequeues and processes:
+    - Identifies or creates `PersonChannel`
+    - Finds or creates `Conversation` (reuses archived conversations without unarchiving)
+    - Creates `Message` with `direction: INBOUND`
+    - Updates conversation `lastMessageAt`
+  </Step>
+
+  <Step title="AI processing">
+    If conversation has `aiMode` enabled, queue AI agent execution via `AiModule`
+  </Step>
+
+  <Step title="WebSocket broadcast">
+    Emit `message-created` and `conversation-updated` to organization room
+  </Step>
+
+  <Step title="Notifications">
+    Create in-app and push notifications for assigned users/teams
+  </Step>
+</Steps>
+
+<Warning>
+Live inbound webhooks reuse archived conversations without unarchiving them. New messages are stored but notifications are suppressed and the live rail does not receive updates.
+</Warning>
+
+### Outbound message flow
+
+<Steps>
+  <Step title="API request">
+    User calls `POST /api/conversations/:id/messages` with message payload
+  </Step>
+
+  <Step title="Create message entity">
+    `MessageService` creates `Message` with `direction: OUTBOUND`, `status: PENDING`
+  </Step>
+
+  <Step title="Write to outbox">
+    In same transaction, create `MessageOutbox` entry with `status: PENDING`
+  </Step>
+
+  <Step title="Queue for sending">
+    `MessageOutboxWorker` picks up pending outbox entries
+  </Step>
+
+  <Step title="Send via channel provider">
+    - WhatsApp: `WhatsAppProvider.sendMessage()`
+    - Instagram: `InstagramProvider.sendMessage()`
+    - Messenger: `MessengerProvider.sendMessage()`
+  </Step>
+
+  <Step title="Update status">
+    - On success: Update message `status: SENT`, update outbox `status: COMPLETED`
+    - On failure: Update message `status: FAILED`, schedule retry in outbox
+  </Step>
+
+  <Step title="WebSocket broadcast">
+    Emit `message-created` to organization room
+  </Step>
+</Steps>
+
+<Info>
+The outbox pattern guarantees at-least-once delivery. Retries use exponential backoff: 1min, 5min, 15min, 1hr, 6hr.
+</Info>
+
+### Message status updates (webhooks)
+
+Message status updates (sent, delivered, read) arrive via webhooks and are processed similarly to inbound messages:
+
+```typescript
+// WebhookProcessorWorker
+async processStatusUpdate(payload: MetaStatusWebhook) {
+  const message = await this.messageService.findByPlatformMessageId(
+    payload.platformMessageId
+  );
+
+  if (!message) return;
+
+  switch (payload.status) {
+    case 'sent':
+      message.status = MessageStatus.SENT;
+      message.sentAt = new Date();
+      break;
+    case 'delivered':
+      message.status = MessageStatus.DELIVERED;
+      message.deliveredAt = new Date();
+      break;
+    case 'read':
+      message.status = MessageStatus.READ;
+      message.readAt = new Date();
+      break;
+  }
+
+  await this.messageService.update(message);
+  
+  // WebSocket broadcast
+  this.messagingGateway.emitToOrganization(
+    message.organizationId,
+    'message-updated',
+    { messageId: message.id, status: message.status }
+  );
+}
+```
+
+## Business Rules
+
+### Conversation creation & reuse
+
+<AccordionGroup>
+  <Accordion title="Active conversations">
+    When an inbound message arrives:
+    1. Find active conversation for `(channelAccountId, personChannelId)` where `isDeleted=false`
+    2. If found and `isArchived=false`, append message and update `lastMessageAt`
+    3. If found and `isArchived=true`, append message but suppress notifications and WebSocket updates to live rail
+    4. If no active conversation exists, create new conversation with `status: OPEN`, `isArchived: false`
+  </Accordion>
+
+  <Accordion title="Soft-deleted conversations">
+    Soft-deleted conversations are terminal tombstones:
+    - Account disconnect soft-deletes and archives all conversations for that `ChannelAccount`
+    - Restore with `restoreConversations=true` flips conversations to `isDeleted=false` and `isArchived=false`
+    - If account is reconnected without restoring, new inbound messages create a replacement conversation with deleted-restart metadata
+    - Replacement conversations do not restore old rows, do not create/inherit Leads or Deals, and skip lead-stakeholder auto-routing
+    - Only the explicit `contact_id` is carried forward if that Contact is still active
+  </Accordion>
+
+  <Accordion title="Lead creation">
+    When `channelAccount.autoCreateLead=true` and a new conversation is created:
+    1. Create `Lead` with `sourceConversation` FK pointing to the conversation
+    2. Auto-assign personal account owner as primary stakeholder (100%, FULL) if channel is personal
+    3. Lead detail DTOs resolve from `conversation.personChannel.person` to populate contact information
+  </Accordion>
+</AccordionGroup>
+
+### Assignment rules
+
+<Tabs>
+  <Tab title="Personal accounts">
+    - Personal account owner is automatically assigned with `is_owner=true`
+    - Owner assignment is protected and cannot be removed
+    - Additional agents/teams can be assigned alongside the owner
+  </Tab>
+
+  <Tab title="Organization accounts">
+    - No automatic assignment
+    - Manual assignment by agent or admin
+    - Assignment can be to user, team, or both (agent on behalf of team)
+  </Tab>
+
+  <Tab title="Transfer logic">
+    - Transfer creates new assignment(s) and removes old non-owner assignments
+    - Owner assignment on personal accounts is never removed
+    - Transfer emits `conversation-updated` WebSocket event
+    - Creates `CONVERSATION_TRANSFERRED` notification
+  </Tab>
+</Tabs>
+
+### AI mode cascade
+
+AI mode for a conversation cascades through these levels:
+
+<Steps>
+  <Step title="Conversation level">
+    If `conversation.aiMode` is explicitly set, use that value
+  </Step>
+
+  <Step title="Channel account level">
+    If conversation has no explicit AI mode, use `channelAccount.defaultAiMode`
+  </Step>
+
+  <Step title="Organization level">
+    If channel account has no default, use organization default
+  </Step>
+
+  <Step title="System default">
+    If organization has no default, use `AiMode.OFF`
+  </Step>
+</Steps>
+
+### Archive vs. soft-delete
+
+<CardGroup cols={2}>
+  <Card title="Archive" icon="box-archive">
+    **Purpose:** Hide from active inbox  
+    **Behavior:** Conversation remains queryable, new messages append but are suppressed  
+    **Reversible:** Yes, can be unarchived  
+    **Query filter:** `isArchived=false` (default in rail queries)
+  </Card>
+
+  <Card title="Soft-delete" icon="trash">
+    **Purpose:** Terminal tombstone state  
+    **Behavior:** Conversation is logically deleted  
+    **Reversible:** Only via restore operation  
+    **Query filter:** `isDeleted=false` (enforced everywhere except restore flows)  
+    **Trigger:** Account disconnect
+  </Card>
+</CardGroup>
+
+<Warning>
+When an account is disconnected, all its conversations are soft-deleted AND archived. Restore with `restoreConversations=true` reverses both flags.
+</Warning>
+
+## RBAC Permissions & Access Control
+
+### Permission scheme
+
+The messaging module uses the following permissions:
+
+| Permission | Resource | Action | Description |
+|------------|----------|--------|-------------|
+| `messaging:conversations:read` | Conversation | Read | View conversation list and details |
+| `messaging:conversations:read_all` | Conversation | Read | View all conversations (including personal accounts of other users) |
+| `messaging:conversations:write` | Conversation | Write | Send messages, update conversation |
+| `messaging:conversations:archive` | Conversation | Archive | Archive/unarchive conversations |
+| `messaging:conversations:delete` | Conversation | Delete | Soft-delete conversations |
+| `messaging:conversations:assign` | Conversation | Assign | Assign conversations to users/teams |
+| `messaging:channel_accounts:read` | ChannelAccount | Read | View channel accounts |
+| `messaging:channel_accounts:write` | ChannelAccount | Write | Connect/disconnect accounts |
+| `messaging:templates:read` | MessageTemplate | Read | View templates |
+| `messaging:templates:write` | MessageTemplate | Write | Create/update templates |
+
+### Access rules
+
+<AccordionGroup>
+  <Accordion title="Conversation access">
+    Users can access a conversation if ANY of these conditions are true:
+    - User has `messaging:conversations:read_all` permission
+    - User is assigned to the conversation (direct or via team)
+    - User owns the personal channel account
+    - User is admin/manager in the organization
+  </Accordion>
+
+  <Accordion title="Channel account access">
+    Users can view channel accounts if:
+    - Organization accounts: User has `messaging:channel_accounts:read`
+    - Personal accounts: User is the owner OR has `messaging:channel_accounts:read` + `read_all_conversations`
+  </Accordion>
+
+  <Accordion title="Message sending">
+    Users can send messages if ALL of these are true:
+    - User has `messaging:conversations:write` permission
+    - User has access to the conversation (see conversation access rules)
+    - Conversation is not soft-deleted
+  </Accordion>
+
+  <Accordion title="Assignment permissions">
+    Users can assign conversations if:
+    - User has `messaging:conversations:assign` permission
+    - User has access to the conversation
+    - Target user/team belongs to same organization
+  </Accordion>
+</AccordionGroup>
+
+### Role presets
+
+<Tabs>
+  <Tab title="Agent">
+    ```yaml
+    permissions:
+      - messaging:conversations:read
+      - messaging:conversations:write
+      - messaging:templates:read
+    behavior:
+      - Can only access assigned conversations and own personal accounts
+      - Cannot assign conversations to others
+      - Cannot access organization-level settings
+    ```
+  </Tab>
+
+  <Tab title="Team Lead">
+    ```yaml
+    permissions:
+      - messaging:conversations:read
+      - messaging:conversations:write
+      - messaging:conversations:assign
+      - messaging:templates:read
+    behavior:
+      - Can access conversations assigned to their team
+      - Can assign conversations to team members
+      - Cannot access personal accounts of other users
+    ```
+  </Tab>
+
+  <Tab title="Manager">
+    ```yaml
+    permissions:
+      - messaging:conversations:read_all
+      - messaging:conversations:write
+      - messaging:conversations:assign
+      - messaging:conversations:archive
+      - messaging:channel_accounts:read
+      - messaging:templates:read
+      - messaging:templates:write
+    behavior:
+      - Can access all conversations in organization
+      - Can assign any conversation
+      - Can manage templates
+      - Can view all channel accounts
+    ```
+  </Tab>
+
+  <Tab title="Admin">
+    ```yaml
+    permissions:
+      - messaging:conversations:*
+      - messaging:channel_accounts:*
+      - messaging:templates:*
+    behavior:
+      - Full access to all messaging features
+      - Can connect/disconnect channel accounts
+      - Can delete conversations
+    ```
+  </Tab>
+</Tabs>
+
+## Notification Types
+
+The messaging module creates the following notification types:
+
+### NEW_MESSAGE
+
+Triggered when an inbound message arrives in a conversation.
+
+```typescript
+{
+  type: 'NEW_MESSAGE',
+  recipientIds: [...assignedUserIds],
+  data: {
+    conversationId: string;
+    messageId: string;
+    senderName: string;
+    preview: string; // First 100 chars
+    channelAccountId: string;
+    channelType: MessagingChannel;
+  },
+  metadata: {
+    organizationId: string;
+    channel: MessagingChannel;
+  }
+}
+```
+
+**Suppressed when:**
+- Conversation is archived
+- Message direction is `OUTBOUND`
+- Message was sent by an assigned user
+
+### CONVERSATION_ASSIGNED
+
+Triggered when a conversation is assigned to a user or team.
+
+```typescript
+{
+  type: 'CONVERSATION_ASSIGNED',
+  recipientIds: [userId] | teamMemberIds,
+  data: {
+    conversationId: string;
+    assignedBy: string;
+    contactName: string;
+    channelType: MessagingChannel;
+  },
+  metadata: {
+    organizationId: string;
+  }
+}
+```
+
+### CONVERSATION_TRANSFERRED
+
+Triggered when a conversation is transferred from one user/team to another.
+
+```typescript
+{
+  type: 'CONVERSATION_TRANSFERRED',
+  recipientIds: [newUserId] | newTeamMemberIds,
+  data: {
+    conversationId: string;
+    transferredBy: string;
+    previousAssignee?: string;
+    contactName: string;
+    channelType: MessagingChannel;
+  },
+  metadata: {
+    organizationId: string;
+  }
+}
+```
+
+### AI_SUGGESTION_READY
+
+Triggered when AI agent generates a suggested response.
+
+```typescript
+{
+  type: 'AI_SUGGESTION_READY',
+  recipientIds: [...assignedUserIds],
+  data: {
+    conversationId: string;
+    suggestionId: string;
+    preview: string;
+  },
+  metadata: {
+    organizationId: string;
+    aiMode: AiMode;
+  }
+}
+```
+
+<Info>
+Only triggered when conversation is in `SUGGEST_ONLY` or `DRAFT` mode. `AUTO_REPLY` mode sends messages directly without notifications.
+</Info>
+
+## API Endpoints
+
+### Conversation endpoints
+
+<AccordionGroup>
+  <Accordion title="GET /api/conversations">
+    List conversations with filtering and pagination.
+
+    **Query parameters:**
+    - `status`: `OPEN` | `CLOSED`
+    - `isArchived`: `true` | `false` (default: `false`)
+    - `channelAccountId`: Filter by channel account
+    - `assignedToUserId`: Filter by assigned user
+    - `assignedToTeamId`: Filter by assigned team
+    - `search`: Search contact name or message content
+    - `page`: Page number (default: 1)
+    - `limit`: Items per page (default: 20)
+
+    **Response:**
+    ```json
+    {
+      "data": [
+        {
+          "id": "uuid",
+          "status": "OPEN",
+          "isArchived": false,
+          "lastMessageAt": "2026-06-01T10:30:00Z",
+          "unreadCount": 3,
+          "contact": {
+            "name": "John Doe",
+            "profilePictureUrl": "https://..."
+          },
+          "channelAccount": {
+            "id": "uuid",
+            "channel": "WHATSAPP",
+            "displayName": "+971501234567"
+          },
+          "assignments": [
+            {
+              "userId": "uuid",
+              "userName": "Jane Agent"
+            }
+          ],
+          "lastMessage": {
+            "content": "Hello, I'm interested...",
+            "direction": "INBOUND",
+            "createdAt": "2026-06-01T10:30:00Z"
+          }
+        }
+      ],
+      "meta": {
+        "total": 150,
+        "page": 1,
+        "limit": 20,
+        "totalPages": 8
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="GET /api/conversations/:id">
+    Get conversation detail with messages.
+
+    **Query parameters:**
+    - `includeMessages`: `true` | `false` (default: `true`)
+    - `messagePage`: Page number for messages (default: 1)
+    - `messageLimit`: Messages per page (default: 50)
+
+    **Response:**
+    ```json
+    {
+      "id": "uuid",
+      "status": "OPEN",
+      "isArchived": false,
+      "aiMode": "SUGGEST_ONLY",
+      "contact": {
+        "id": "uuid",
+        "name": "John Doe",
+        "phone": "+971501234567",
+        "email": "john@example.com"
+      },
+      "channelAccount": {
+        "id": "uuid",
+        "channel": "WHATSAPP",
+        "type": "PERSONAL",
+        "displayName": "+971509876543"
+      },
+      "assignments": [
+        {
+          "id": "uuid",
+          "user": { "id": "uuid", "name": "Jane Agent" },
+          "isOwner": true,
+          "assignedAt": "2026-06-01T09:00:00Z"
+        }
+      ],
+      "messages": {
+        "data": [
+          {
+            "id": "uuid",
+            "direction": "INBOUND",
+            "status": "DELIVERED",
+            "content": "Hello, I'm interested...",
+            "createdAt": "2026-06-01T10:30:00Z",
+            "sender": {
+              "type": "contact",
+              "name": "John Doe"
+            }
+          }
+        ],
+        "meta": {
+          "total": 25,
+          "page": 1,
+          "limit": 50
+        }
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="POST /api/conversations/:id/messages">
+    Send a message in a conversation.
+
+    **Request body:**
+    ```json
+    {
+      "content": "Thank you for your interest...",
+      "media": [
+        {
+          "type": "image",
+          "url": "https://...",
+          "caption": "Floor plan"
+        }
+      ],
+      "templateId": "uuid" // Optional: use quick reply template
+    }
+    ```
+
+    **Response:**
+    ```json
+    {
+      "id": "uuid",
+      "conversationId": "uuid",
+      "direction": "OUTBOUND",
+      "status": "QUEUED",
+      "content": "Thank you for your interest...",
+      "createdAt": "2026-06-01T10:35:00Z"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="PATCH /api/conversations/:id">
+    Update conversation properties.
+
+    **Request body:**
+    ```json
+    {
+      "status": "CLOSED",
+      "aiMode": "AUTO_REPLY",
+      "isArchived": true
+    }
+    ```
+
+    **Response:** Updated conversation object
+  </Accordion>
+
+  <Accordion title="POST /api/conversations/:id/assign">
+    Assign conversation to user(s) and/or team(s).
+
+    **Request body:**
+    ```json
+    {
+      "assignments": [
+        { "userId": "uuid" }, // Direct user assignment
+        { "teamId": "uuid" }, // Team pool
+        { "userId": "uuid", "teamId": "uuid" } // Agent on behalf of team
+      ]
+    }
+    ```
+
+    **Response:** Updated conversation with assignments
+  </Accordion>
+
+  <Accordion title="DELETE /api/conversations/:id">
+    Soft-delete a conversation.
+
+    **Response:** `204 No Content`
+
+    <Warning>
+    This is a terminal operation. The conversation becomes a tombstone and cannot receive new messages.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+### Channel account endpoints
+
+<AccordionGroup>
+  <Accordion title="GET /api/channel-accounts">
+    List channel accounts for the organization.
+
+    **Query parameters:**
+    - `channel`: Filter by `WHATSAPP` | `INSTAGRAM` | `MESSENGER`
+    - `type`: Filter by `ORGANIZATION` | `PERSONAL`
+    - `status`: Filter by status
+
+    **Response:**
+    ```json
+    {
+      "data": [
+        {
+          "id": "uuid",
+          "channel": "WHATSAPP",
+          "type": "ORGANIZATION",
+          "displayName": "+971501234567",
+          "profilePictureUrl": "https://...",
+          "status": "ACTIVE",
+          "defaultAiMode": "SUGGEST_ONLY",
+          "autoCreateLead": true,
+          "connectedAt": "2026-01-15T08:00:00Z"
+        }
+      ]
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="GET /api/channel-accounts/:id">
+    Get channel account details.
+
+    **Response:** Single channel account object with additional metadata
+  </Accordion>
+
+  <Accordion title="POST /api/channel-accounts/connect">
+    Initiate OAuth flow to connect a new channel account.
+
+    **Request body:**
+    ```json
+    {
+      "channel": "INSTAGRAM",
+      "type": "PERSONAL",
+      "returnUrl": "https://app.example.com/inbox"
+    }
+    ```
+
+    **Response:**
+    ```json
+    {
+      "authUrl": "https://www.facebook.com/v18.0/dialog/oauth?...",
+      "state": "encrypted-state-token"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="POST /api/channel-accounts/connect-callback">
+    Complete OAuth flow after redirect from Meta.
+
+    **Request body:**
+    ```json
+    {
+      "code": "auth-code-from-meta",
+      "state": "encrypted-state-token"
+    }
+    ```
+
+    **Response:** Newly created channel account object
+  </Accordion>
+
+  <Accordion title="PATCH /api/channel-accounts/:id">
+    Update channel account settings.
+
+    **Request body:**
+    ```json
+    {
+      "displayName": "Sales WhatsApp",
+      "defaultAiMode": "AUTO_REPLY",
+      "autoCreateLead": false,
+      "status": "PAUSED"
+    }
+    ```
+
+    **Response:** Updated channel account object
+  </Accordion>
+
+  <Accordion title="DELETE /api/channel-accounts/:id">
+    Disconnect a channel account.
+
+    **Query parameters:**
+    - `restoreConversations`: `true` | `false` (for reconnect scenarios)
+
+    **Behavior:**
+    - Soft-deletes and archives all conversations for this account
+    - Sets account status to `DISCONNECTED`
+    - Revokes access token (if applicable)
+
+    **Response:** `204 No Content`
+  </Accordion>
+</AccordionGroup>
+
+### Template endpoints
+
+<AccordionGroup>
+  <Accordion title="GET /api/message-templates">
+    List message templates.
+
+    **Query parameters:**
+    - `type`: Filter by template type
+    - `channel`: Filter by channel
+    - `isActive`: Filter active templates
+
+    **Response:**
+    ```json
+    {
+      "data": [
+        {
+          "id": "uuid",
+          "type": "QUICK_REPLY",
+          "name": "Property Inquiry Response",
+          "content": "Thank you for your interest in {{property_name}}...",
+          "channel": "WHATSAPP",
+          "variables": ["property_name", "agent_name"],
+          "isActive": true
+        }
+      ]
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="POST /api/message-templates">
+    Create a new template.
+
+    **Request body:**
+    ```json
+    {
+      "type": "QUICK_REPLY",
+      "name": "Follow-up",
+      "content": "Hi {{contact_name}}, following up on...",
+      "channel": "WHATSAPP",
+      "variables": ["contact_name"]
+    }
+    ```
+
+    **Response:** Created template object
+  </Accordion>
+
+  <Accordion title="PATCH /api/message-templates/:id">
+    Update a template.
+
+    **Request body:** Same as POST
+
+    **Response:** Updated template object
+  </Accordion>
+
+  <Accordion title="DELETE /api/message-templates/:id">
+    Soft-delete a template (sets `isActive: false`).
+
+    **Response:** `204 No Content`
+  </Accordion>
+</AccordionGroup>
+
+### Webhook endpoints
+
+<AccordionGroup>
+  <Accordion title="GET /webhooks/messaging/meta">
+    Meta webhook verification endpoint.
+
+    **Query parameters:**
+    - `hub.mode`: `subscribe`
+    - `hub.verify_token`: Verification token
+    - `hub.challenge`: Challenge string
+
+    **Response:** Echo back the challenge string
+  </Accordion>
+
+  <Accordion title="POST /webhooks/messaging/meta">
+    Receive Meta platform webhooks (WhatsApp, Instagram, Messenger).
+
+    **Headers:**
+    - `X-Hub-Signature-256`: HMAC signature for validation
+
+    **Request body:** Meta webhook payload (varies by event type)
+
+    **Response:** `200 OK` (webhooks are queued for async processing)
+
+    <Check>
+    The `MetaWebhookGuard` validates the signature before accepting the webhook.
+    </Check>
+  </Accordion>
+</AccordionGroup>
+
+## WebSocket Events & Room Architecture
+
+The messaging module uses a single WebSocket namespace at `/messaging` with JWT authentication.
+
+### Connection & authentication
+
+```typescript
+// Client connection
+const socket = io('/messaging', {
+  auth: {
+    token: 'jwt-token'
+  }
+});
+
+// Server validates JWT and joins organization room
+@WebSocketGateway({ namespace: '/messaging' })
+export class MessagingGateway {
+  @WebSocketServer()
+  server: Server;
+
+  async handleConnection(client: Socket) {
+    const token = client.handshake.auth.token;
+    const user = await this.authService.validateToken(token);
+    
+    if (!user) {
+      client.disconnect();
+      return;
+    }
+
+    client.data.userId = user.id;
+    client.data.organizationId = user.organizationId;
+    
+    // Join organization room
+    client.join(`org:${user.organizationId}`);
+    
+    // Join user-specific room
+    client.join(`user:${user.id}`);
+  }
+}
+```
+
+### Room structure
+
+<CardGroup cols={3}>
+  <Card title="Organization rooms" icon="building">
+    `org:{organizationId}`  
+    All users in the organization
+  </Card>
+  <Card title="User rooms" icon="user">
+    `user:{userId}`  
+    Individual user for targeted events
+  </Card>
+  <Card title="Conversation rooms" icon="comments">
+    `conv:{conversationId}`  
+    Users actively viewing a conversation
+  </Card>
+</CardGroup>
+
+### Client-to-server events
+
+<AccordionGroup>
+  <Accordion title="join-conversation">
+    Join a conversation room to receive real-time updates.
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid"
+    }
+    ```
+
+    **Server behavior:**
+    - Verify user has access to conversation
+    - Join client to `conv:{conversationId}` room
+    - Emit typing indicators and read receipts to this room
+  </Accordion>
+
+  <Accordion title="leave-conversation">
+    Leave a conversation room.
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid"
+    }
+    ```
+
+    **Server behavior:**
+    - Remove client from `conv:{conversationId}` room
+  </Accordion>
+
+  <Accordion title="typing-start">
+    Indicate user is typing in a conversation.
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid"
+    }
+    ```
+
+    **Server behavior:**
+    - Broadcast to other users in `conv:{conversationId}` room (excluding sender)
+  </Accordion>
+
+  <Accordion title="typing-stop">
+    Indicate user stopped typing.
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid"
+    }
+    ```
+
+    **Server behavior:**
+    - Broadcast to other users in `conv:{conversationId}` room
+  </Accordion>
+
+  <Accordion title="mark-read">
+    Mark messages as read in a conversation.
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "messageIds": ["uuid1", "uuid2"]
+    }
+    ```
+
+    **Server behavior:**
+    - Update read status in database
+    - Broadcast read receipt to `conv:{conversationId}` room
+  </Accordion>
+</AccordionGroup>
+
+### Server-to-client events
+
+<AccordionGroup>
+  <Accordion title="message-created">
+    New message created in a conversation.
+
+    **Target room:** `org:{organizationId}` (or `conv:{conversationId}` if users are joined)
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "message": {
+        "id": "uuid",
+        "direction": "INBOUND",
+        "status": "DELIVERED",
+        "content": "Hello...",
+        "createdAt": "2026-06-01T10:30:00Z",
+        "sender": {
+          "type": "contact",
+          "name": "John Doe"
+        }
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="message-updated">
+    Message status updated (sent, delivered, read, failed).
+
+    **Target room:** `org:{organizationId}` or `conv:{conversationId}`
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "messageId": "uuid",
+      "status": "READ",
+      "readAt": "2026-06-01T10:35:00Z"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="conversation-updated">
+    Conversation properties updated (status, archive, AI mode, assignment).
+
+    **Target room:** `org:{organizationId}`
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "changes": {
+        "status": "CLOSED",
+        "isArchived": true,
+        "assignments": [...]
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="conversation-assigned">
+    Conversation assigned to user/team.
+
+    **Target room:** `user:{userId}` or team members
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "assignment": {
+        "userId": "uuid",
+        "teamId": "uuid",
+        "assignedBy": "uuid"
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="typing-indicator">
+    User is typing in a conversation.
+
+    **Target room:** `conv:{conversationId}` (excluding sender)
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "user": {
+        "id": "uuid",
+        "name": "Jane Agent"
+      },
+      "isTyping": true
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="read-receipt">
+    Messages marked as read by a user.
+
+    **Target room:** `conv:{conversationId}`
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "messageIds": ["uuid1", "uuid2"],
+      "readBy": {
+        "id": "uuid",
+        "name": "Jane Agent"
+      },
+      "readAt": "2026-06-01T10:35:00Z"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="ai-suggestion-ready">
+    AI agent generated a suggested response.
+
+    **Target room:** `user:{userId}` (assigned users)
+
+    **Payload:**
+    ```json
+    {
+      "conversationId": "uuid",
+      "suggestion": {
+        "id": "uuid",
+        "content": "Thank you for your inquiry...",
+        "confidence": 0.92,
+        "createdAt": "2026-06-01T10:30:00Z"
+      }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Organization-wide disconnection
+
+For organization lifecycle events (deletion/suspension):
+
+```typescript
+// MessagingOrganizationLifecycleListener
+async handleOrganizationDeleted(organizationId: string) {
+  // Disconnect all WebSocket clients for this organization
+  await this.messagingGateway.disconnectOrganization(organizationId);
+  
+  // Pause all channel accounts
+  await this.channelAccountService.pauseAllForOrganization(organizationId);
+}
+
+// MessagingGateway
+async disconnectOrganization(organizationId: string) {
+  const sockets = await this.server
+    .in(`org:${organizationId}`)
+    .fetchSockets();
+  
+  for (const socket of sockets) {
+    socket.disconnect(true);
+  }
+}
+```
+
+<Info>
+The Postgres IO adapter ensures disconnection happens cluster-wide across all server instances.
+</Info>
+
+## Messaging-Specific Conventions
+
+### Entity naming
+
+- **Entities**: PascalCase, singular (e.g., `Conversation`, `Message`)
+- **Tables**: snake_case, singular (e.g., `conversation`, `message`)
+- **Columns**: snake_case (e.g., `organization_id`, `last_message_at`)
+
+### Service methods
+
+```typescript
+// Standard CRUD
+findById(id: string, options?: FindOptions): Promise<Entity>
+findAll(filters: Filters, pagination: Pagination): Promise<PaginatedResult<Entity>>
+create(data: CreateDto): Promise<Entity>
+update(id: string, data: UpdateDto): Promise<Entity>
+delete(id: string): Promise<void> // Soft-delete
+
+// Domain-specific
+findConversationByChannelAndPerson(channelAccountId: string, personChannelId: string): Promise<Conversation>
+sendMessage(conversationId: string, messageData: SendMessageDto): Promise<Message>
+assignConversation(conversationId: string, assignments: AssignmentDto[]): Promise<Conversation>
+```
+
+### DTO naming
+
+- **Create DTOs**: `Create{Entity}Dto`
+- **Update DTOs**: `Update{Entity}Dto`
+- **Response DTOs**: `{Entity}ResponseDto` or `{Entity}DetailDto`
+- **Query DTOs**: `{Entity}QueryDto` or `List{Entity}Dto`
+
+### Error handling
+
+```typescript
+// Use domain-specific exceptions
+throw new ConversationNotFoundException(conversationId);
+throw new UnauthorizedConversationAccessException(userId, conversationId);
+throw new MessageSendFailedException(messageId, error);
+throw new WebhookSignatureInvalidException();
+
+// Base exceptions inherit from HttpException
+export class ConversationNotFoundException extends NotFoundException {
+  constructor(conversationId: string) {
+    super(`Conversation ${conversationId} not found`);
+  }
+}
+```
+
+## Query Patterns
+
+### Conversation queries with access control
+
+```typescript
+async findAccessibleConversations(
+  userId: string,
+  organizationId: string,
+  filters: ConversationFilters
+): Promise<Conversation[]> {
+  const qb = this.conversationRepository
+    .createQueryBuilder('conv')
+    .leftJoin('conv.channelAccount', 'ca')
+    .leftJoin('conv.assignments', 'ca')
+    .where('conv.organizationId = :organizationId', { organizationId })
+    .andWhere('conv.isDeleted = false');
+
+  // Apply archive filter (default: hide archived)
+  if (filters.isArchived !== undefined) {
+    qb.andWhere('conv.isArchived = :isArchived', { 
+      isArchived: filters.isArchived 
+    });
+  } else {
+    qb.andWhere('conv.isArchived = false');
+  }
+
+  // Access control: user sees conversations if they are:
+  // 1. Assigned directly
+  // 2. Assigned via team
+  // 3. Owner of personal account
+  // 4. Has read_all permission
+  if (!userHasReadAllPermission) {
+    qb.andWhere(
+      new Brackets(qb => {
+        qb.where('ca.userId = :userId', { userId })
+          .orWhere('ca.teamId IN (:...teamIds)', { teamIds: userTeamIds })
+          .orWhere('(ca.type = :personal AND ca.ownerId = :userId)', {
+            personal: ChannelAccountType.PERSONAL,
+            userId
+          });
+      })
+    );
+  }
+
+  // Apply additional filters
+  if (filters.status) {
+    qb.andWhere('conv.status = :status', { status: filters.status });
+  }
+
+  if (filters.channelAccountId) {
+    qb.andWhere('conv.channelAccountId = :channelAccountId', {
+      channelAccountId: filters.channelAccountId
+    });
+  }
+
+  return qb
+    .orderBy('conv.lastMessageAt', 'DESC')
+    .limit(filters.limit || 20)
+    .offset((filters.page - 1) * (filters.limit || 20))
+    .getMany();
+}
+```
+
+### Message queries with pagination
+
+```typescript
+async findMessagesForConversation(
+  conversationId: string,
+  pagination: { page: number; limit: number }
+): Promise<PaginatedResult<Message>> {
+  const [messages, total] = await this.messageRepository.findAndCount({
+    where: {

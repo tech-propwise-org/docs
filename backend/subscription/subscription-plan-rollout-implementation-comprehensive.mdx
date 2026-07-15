@@ -1,0 +1,1881 @@
+---
+title: "Subscription Plan Rollout - Implementation Guide"
+description: "Comprehensive implementation plan for Free/Pro/Business subscription tiers with phased backend and frontend rollout, including trial mechanics, credit metering, and seat management"
+---
+
+# Subscription Plan Rollout - Implementation Guide
+
+This guide details the complete implementation plan for rolling out the Free/Pro/Business subscription packaging strategy with phased backend and frontend changes. It addresses 12 identified gaps and implements evergreen trials, unified credit metering, entity caps, and seat management.
+
+<Note>
+This implementation plan is based on `SUBSCRIPTION_PACKAGING_STRATEGY.md` and incorporates two code-level verification passes that confirmed current-state facts and refined the execution plan.
+</Note>
+
+## Overview
+
+### Subscription Tiers
+
+<CardGroup cols={3}>
+  <Card title="Free" icon="gift">
+    - 20 AI credits/month
+    - 1 seat
+    - 10 companies
+    - 25 inventory units
+    - 5 GB storage
+  </Card>
+  <Card title="Pro" icon="star">
+    - 10,000 credits/seat/month
+    - Unlimited seats
+    - No entity caps
+    - 90-day trial
+    - +25 GB storage packs
+  </Card>
+  <Card title="Business" icon="building">
+    - 15,000 credits/seat/month
+    - Unlimited seats
+    - No entity caps
+    - 90-day trial
+    - +25 GB storage packs
+  </Card>
+</CardGroup>
+
+### Key Decisions
+
+<AccordionGroup>
+  <Accordion title="Internal vs Display Tier Names">
+    Keep the internal tier ID as `PROFESSIONAL` but display it as "Pro" throughout the UI. This avoids renaming the enum across DB rows, Stripe metadata, DTOs, and frontend types. The `STARTER` tier is retired completely.
+  </Accordion>
+
+  <Accordion title="Seat Model Consolidation">
+    Collapse the manager/agent two-SKU seat model into a single per-agent seat SKU per tier. Repurpose existing `agentSeats*` columns as the unified seat counter and zero out `managerSeats*` (no DDL changes needed).
+  </Accordion>
+
+  <Accordion title="Credit Wallet Ownership">
+    The unified wallet is owned by the subscription module via a new `CreditMeteringService` facade. This consolidates the two AI budget planes (`AiUsageAccount`, `AiCreditUsage`) into ONE store, eliminating independent cost planes.
+  </Accordion>
+
+  <Accordion title="Budget Model - Shared Pool with Ceilings">
+    Implement a shared org pool with per-user CEILINGS (not reserved carve-outs). A user ceiling caps how much of the shared pool that user may personally consume:
+    
+    ```
+    effective_user_draw = min(userLimit - userOrgSpent, orgPoolRemaining)
+    ```
+    
+    Ceilings MAY oversubscribe the allowance—remove the Σ budgets and Σ caps ≤ allowance validation.
+  </Accordion>
+
+  <Accordion title="Personal Credits Fallback">
+    Users may buy personal credits separate from org-set limits. Consumption order:
+    1. Org pool first
+    2. Personal credits as fallback
+    
+    Owner/Admin and org-level-channel AI route to org pool. Regular agent assistant/Propilot and personal-channel AI route to user allocation. Personal credits work as after-org fallback for ANY human actor (including owner/admin).
+  </Accordion>
+
+  <Accordion title="AI Provider Strategy">
+    - **OpenAI**: Billable model traffic only, routed through per-org OpenAI project key
+    - **Anthropic**: Eval judge only
+    - **Gemini**: Dropped
+    - **Embeddings**: OpenAI
+    
+    OpenAI's per-project usage provides true-$ telemetry; customers are billed in credits via cost map (not raw USD).
+  </Accordion>
+
+  <Accordion title="Entity Cap Source-of-Record">
+    - **Lead**: Reuse `Lead.leadSource === LeadSource.IMPORTED` (no new column)
+    - **Contact/Deal/Company**: New `isImported` boolean
+    
+    Imported rows are excluded from cap counts. Auto-created companies during contact import MUST be stamped `isImported = true`.
+  </Accordion>
+
+  <Accordion title="Entity Cap Count Predicate">
+    Count predicate: `isImported = false AND isDeleted = false`
+    
+    **Archived rows STILL count toward the cap**—archiving never frees a slot (only delete does). Keep `isDeleted` filter ON; disable `active` filter (`{ isArchived: false }`) on count queries.
+  </Accordion>
+
+  <Accordion title="Cap Enforcement Strategy">
+    - **User-initiated creates**: Hard-block with 403 (manual, create-from-listing, manual API)
+    - **Inbound WhatsApp/Meta**: Soft-degrade (create lead + emit over-limit signal, never drop live demand)
+    - **Bulk import**: Skip cap enforcement entirely
+    - **Storage uploads**: Hard-block user uploads; soft-degrade inbound messaging media
+    
+    Accept bounded check-then-create overshoot (no row locks), consistent with credit soft-guard.
+  </Accordion>
+
+  <Accordion title="Permission Model">
+    - **Org buying + subscription management**: OWNER-only (`system.owner`)
+    - **Per-user ceiling distribution**: Admin-level
+    - **Route**: Single `/settings/billing` route (OWNER-gated via `system.owner`, NOT admin)
+  </Accordion>
+</AccordionGroup>
+
+## Current State Verification
+
+<Warning>
+These facts were code-verified across two review passes and inform the phased rollout below.
+</Warning>
+
+### Existing Enforcement
+
+- **Assistant budget gate**: ALREADY LIVE (not telemetry). `AiUsageGuardService.assertCanCallModel` throws `AiBudgetExceededError` to BLOCK calls today
+- **Agent-side guard**: `AiAgentBudgetGuardService` guard + `incrementSpend` ledger also live
+- **Subscription-wallet deduction**: Only the `CreditType` subscription-wallet deduction is `SUBSCRIPTION_GATE`-staged
+
+<Info>
+Phase 5 must treat these as REPLACEMENTS of existing gates (behavior-equivalence risk), not new gates.
+</Info>
+
+### Credit Storage
+
+- **USD ledger**: Lives in `AiCreditUsage`/`AiUsageAccount`, NOT `aiCreditsUsed`
+- **SubscriptionUsage.aiCreditsUsed**: `numeric(12,6)` but has NO live writer (effectively 0)
+- **Migration target**: The numeric→credits migration/reset targets the two USD ledger tables
+
+### Subscription Gate Markers
+
+`ai-agent-runtime.service.ts` has **FOUR** `SUBSCRIPTION_GATE` block markers:
+- Line 225
+- Line 1681
+- Line 1735
+- Line 1873
+
+### Webhook Routing Gap
+
+One-time credit-pack purchases need **NET-NEW webhook routing**. Currently:
+- `routeEvent` only handles 5 subscription events
+- `handleCheckoutCompleted` early-returns unless `mode==='subscription'`
+
+### Seat Count Query
+
+`countSeatsByType` already runs cross-module raw SQL on `user_org_roles`. Plan: collapse to `getSeatCount` without multiplying the module-boundary violation.
+
+### Frontend Partial State
+
+Trial UX + credit wallet are **PARTIAL**, not greenfield:
+- `trialEndsAt` DTO field exists
+- Static "Trial" badge exists
+- Pack-remaining display exists
+- **NEW**: Countdown/banner/top-up flows
+
+### Credit Allowance Re-base
+
+Free `aiCreditsPerMonth` is currently **20** in code vs **2000** proposed—an intentional ~100× re-base. Land Phase 0 before Phase 6's threshold math.
+
+## Phased Implementation Plan
+
+<Steps>
+
+<Step title="Phase 0: Starter Removal & Plan Definition">
+
+Remove the `STARTER` tier and establish the three-tier plan structure.
+
+### 0.1 Data Migration: Repoint Starter Subscriptions
+
+<Warning>
+Ship this migration FIRST before enum/code changes to avoid MikroORM hydration errors.
+</Warning>
+
+```typescript
+// Migration: repoint-starter-to-pro.ts
+import { Migration } from '@mikro-orm/migrations';
+
+export class RePointStarterToPro extends Migration {
+  async up(): Promise<void> {
+    // Repoint all starter subscriptions to professional
+    this.addSql(`
+      UPDATE organization_subscriptions
+      SET tier = 'professional'
+      WHERE tier = 'starter';
+    `);
+
+    // Delete the starter plan definition row
+    this.addSql(`
+      DELETE FROM subscription_plan
+      WHERE tier = 'starter';
+    `);
+  }
+
+  async down(): Promise<void> {
+    // Restore starter plan
+    this.addSql(`
+      INSERT INTO subscription_plan (tier, name, ...)
+      VALUES ('starter', 'Starter', ...);
+    `);
+
+    // Downgrade is not automatic - manual intervention required
+    this.addSql(`
+      -- Manual restore of starter subscriptions if needed
+    `);
+  }
+}
+```
+
+### 0.2 Enum & Type Updates
+
+```typescript
+// plan-tier.enum.ts
+export enum PlanTier {
+  FREE = 'free',
+  PROFESSIONAL = 'professional',  // Display as "Pro"
+  BUSINESS = 'business',
+  // STARTER removed
+}
+
+// PLAN_TIER_ORDER constant
+export const PLAN_TIER_ORDER = [
+  PlanTier.FREE,
+  PlanTier.PROFESSIONAL,
+  PlanTier.BUSINESS,
+];
+```
+
+### 0.3 Plan Definitions Update
+
+```typescript
+// plan-definitions.ts
+export const PLAN_DEFINITIONS: Record<PlanTier, PlanDefinition> = {
+  [PlanTier.FREE]: {
+    tier: PlanTier.FREE,
+    name: 'Free',
+    displayName: 'Free',
+    price: 0,
+    aiCreditsPerMonth: 20,  // Re-based from 2000
+    agentSeatsIncluded: 1,
+    managerSeatsIncluded: 0,  // Deprecated
+    hasTrialPeriod: false,
+    trialDays: 0,
+    limits: {
+      maxCompanies: 10,
+      maxInventoryUnits: 25,
+      storageGB: 5,
+    },
+  },
+  [PlanTier.PROFESSIONAL]: {
+    tier: PlanTier.PROFESSIONAL,
+    name: 'Professional',
+    displayName: 'Pro',  // UI display name
+    price: 99,  // AED per seat/month
+    aiCreditsPerMonth: 10000,  // Per seat
+    agentSeatsIncluded: 0,
+    managerSeatsIncluded: 0,  // Deprecated
+    hasTrialPeriod: true,
+    trialDays: 90,
+    limits: {
+      maxCompanies: null,  // Unlimited
+      maxInventoryUnits: null,
+      storageGB: 50,  // Base + purchasable +25GB packs
+    },
+  },
+  [PlanTier.BUSINESS]: {
+    tier: PlanTier.BUSINESS,
+    name: 'Business',
+    displayName: 'Business',
+    price: 149,  // AED per seat/month
+    aiCreditsPerMonth: 15000,  // Per seat
+    agentSeatsIncluded: 0,
+    managerSeatsIncluded: 0,  // Deprecated
+    hasTrialPeriod: true,
+    trialDays: 90,
+    limits: {
+      maxCompanies: null,
+      maxInventoryUnits: null,
+      storageGB: 100,  // Base + purchasable +25GB packs
+    },
+  },
+};
+```
+
+### 0.4 Stripe Product/Price Setup
+
+<Tabs>
+  <Tab title="Stripe Dashboard">
+    Create new products and prices for Pro and Business tiers in AED:
+
+    **Pro Tier:**
+    - Product: "PropWise Pro"
+    - Price: 99 AED/seat/month (recurring)
+    - Metadata: `{ tier: 'professional', trial_days: 90 }`
+
+    **Business Tier:**
+    - Product: "PropWise Business"
+    - Price: 149 AED/seat/month (recurring)
+    - Metadata: `{ tier: 'business', trial_days: 90 }`
+
+    **One-Time Credit Packs:**
+    - Product: "AI Credits - 1,000 pack"
+    - Price: 29 AED (one-time)
+    - Metadata: `{ type: 'credit_pack', credits: 1000 }`
+  </Tab>
+  <Tab title="stripe-ids.json">
+    ```json
+    {
+      "products": {
+        "pro_seat": "prod_XXXXXXXXXX",
+        "business_seat": "prod_YYYYYYYYYY",
+        "credit_pack_1000": "prod_ZZZZZZZZZZ",
+        "storage_pack_25gb": "prod_AAAAAAAAAA"
+      },
+      "prices": {
+        "pro_seat_monthly": "price_XXXXXXXXXX",
+        "business_seat_monthly": "price_YYYYYYYYYY",
+        "credit_pack_1000": "price_ZZZZZZZZZZ",
+        "storage_pack_25gb": "price_AAAAAAAAAA"
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### 0.5 Testing Checklist
+
+<Check>Starter→Pro migration runs without error on staging</Check>
+<Check>Existing starter orgs load with PROFESSIONAL tier</Check>
+<Check>PLAN_DEFINITIONS has exactly 3 tiers</Check>
+<Check>Stripe products configured with correct metadata</Check>
+<Check>Plan comparison page renders 3 tiers correctly</Check>
+
+</Step>
+
+<Step title="Phase 1: Webhook Routing for One-Time Purchases">
+
+Extend webhook handling to support one-time credit pack and storage pack purchases.
+
+### 1.1 Current Webhook State
+
+```typescript
+// stripe-webhook.controller.ts (CURRENT)
+private routeEvent(event: Stripe.Event): Promise<void> {
+  switch (event.type) {
+    case 'checkout.session.completed':
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+    case 'invoice.payment_succeeded':
+      return this.stripeWebhookService.handleEvent(event);
+    default:
+      return Promise.resolve();  // Silently ignore
+  }
+}
+
+// stripe-webhook.service.ts (CURRENT)
+async handleCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
+  if (session.mode !== 'subscription') {
+    return;  // Early return - one-time purchases ignored
+  }
+  // ... subscription activation logic
+}
+```
+
+<Warning>
+One-time purchases currently fall through webhook routing without processing.
+</Warning>
+
+### 1.2 Extend Webhook Routing
+
+```typescript
+// stripe-webhook.controller.ts (NEW)
+private routeEvent(event: Stripe.Event): Promise<void> {
+  switch (event.type) {
+    case 'checkout.session.completed':
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+    case 'invoice.payment_succeeded':
+      return this.stripeWebhookService.handleEvent(event);
+    
+    // NEW: Handle one-time purchase events
+    case 'charge.succeeded':
+      return this.stripeWebhookService.handleChargeSucceeded(event);
+    
+    // OUT OF SCOPE v1: Refunds/disputes
+    // case 'charge.refunded':
+    // case 'charge.dispute.created':
+    
+    default:
+      this.logger.debug(`Unhandled webhook event: ${event.type}`);
+      return Promise.resolve();
+  }
+}
+```
+
+### 1.3 One-Time Purchase Handler
+
+```typescript
+// stripe-webhook.service.ts (NEW)
+async handleChargeSucceeded(event: Stripe.Event): Promise<void> {
+  const charge = event.data.object as Stripe.Charge;
+  
+  // Only process one-time purchases (not subscription invoices)
+  if (charge.invoice) {
+    return;  // Subscription charge, handled via invoice.payment_succeeded
+  }
+
+  const session = await this.stripe.checkout.sessions.retrieve(
+    charge.metadata.session_id,
+    { expand: ['line_items'] }
+  );
+
+  if (session.mode !== 'payment') {
+    return;  // Not a one-time purchase
+  }
+
+  const orgId = session.metadata.organization_id;
+  const userId = session.metadata.user_id;
+  const productType = session.metadata.product_type;
+
+  switch (productType) {
+    case 'credit_pack':
+      await this.fulfillCreditPack(orgId, userId, session);
+      break;
+    case 'storage_pack':
+      await this.fulfillStoragePack(orgId, session);
+      break;
+    default:
+      this.logger.warn(`Unknown product type: ${productType}`);
+  }
+}
+
+private async fulfillCreditPack(
+  orgId: string,
+  userId: string,
+  session: Stripe.Checkout.Session
+): Promise<void> {
+  const lineItem = session.line_items.data[0];
+  const credits = parseInt(lineItem.price.metadata.credits, 10);
+
+  // Record the purchase
+  await this.creditPurchaseRepository.create({
+    organizationId: orgId,
+    userId,
+    stripeChargeId: session.payment_intent as string,
+    stripeSessionId: session.id,
+    credits,
+    amountPaid: session.amount_total / 100,  // Convert cents to AED
+    currency: session.currency.toUpperCase(),
+    purchasedAt: new Date(),
+  });
+
+  // Credit the user's PERSONAL wallet (not org pool)
+  await this.creditMeteringService.addPersonalCredits(userId, credits, {
+    source: 'purchase',
+    referenceId: session.id,
+  });
+
+  this.logger.log(
+    `Fulfilled ${credits} credit pack purchase for user ${userId} in org ${orgId}`
+  );
+}
+
+private async fulfillStoragePack(
+  orgId: string,
+  session: Stripe.Checkout.Session
+): Promise<void> {
+  const lineItem = session.line_items.data[0];
+  const storageGB = parseInt(lineItem.price.metadata.storage_gb, 10);
+
+  await this.subscriptionUsageService.addStorageAllowance(orgId, storageGB);
+
+  this.logger.log(
+    `Added ${storageGB}GB storage pack to org ${orgId}`
+  );
+}
+```
+
+### 1.4 Checkout Session Metadata
+
+When creating checkout sessions for one-time purchases:
+
+```typescript
+// subscription.service.ts
+async createCreditPackCheckout(
+  orgId: string,
+  userId: string,
+  packSize: number
+): Promise<string> {
+  const priceId = this.stripeConfig.prices[`credit_pack_${packSize}`];
+  
+  const session = await this.stripe.checkout.sessions.create({
+    mode: 'payment',
+    customer: await this.getOrCreateStripeCustomer(orgId),
+    line_items: [
+      {
+        price: priceId,
+        quantity: 1,
+      },
+    ],
+    metadata: {
+      organization_id: orgId,
+      user_id: userId,
+      product_type: 'credit_pack',
+      session_id: '{{CHECKOUT_SESSION_ID}}',  // Stripe fills this
+    },
+    success_url: `${this.config.appUrl}/settings/billing?success=credit_pack`,
+    cancel_url: `${this.config.appUrl}/settings/billing?canceled=true`,
+  });
+
+  return session.url;
+}
+```
+
+<Note>
+**Deferred v1**: Refund/dispute handling (`charge.refunded`, `charge.dispute.created`) is OUT OF SCOPE. Document the gap in `SUBSCRIPTION_MODULE_SPECIFICATION.md`.
+</Note>
+
+### 1.5 Testing Checklist
+
+<Check>One-time credit pack purchase triggers `charge.succeeded`</Check>
+<Check>Credits added to user's personal wallet (not org pool)</Check>
+<Check>Storage pack purchase increases org storage allowance</Check>
+<Check>Subscription invoice charges don't trigger duplicate processing</Check>
+<Check>Webhook idempotency prevents double-crediting</Check>
+
+</Step>
+
+<Step title="Phase 2: Trial Mechanics (Backend)">
+
+Implement evergreen 90-day card-upfront trial on Pro & Business tiers.
+
+### 2.1 Trial Wiring Chokepoint
+
+<Info>
+The checkout.session.completed webhook and `fulfillCheckoutSession` already share `buildActivationParamsFromCheckoutMetadata` + `activateSubscription`. Derive TRIALING + `trialEndsAt` from the Stripe subscription INSIDE that shared builder so one edit fixes both paths.
+</Info>
+
+### 2.2 Shared Activation Parameter Builder
+
+```typescript
+// subscription-activation.service.ts (NEW/REFACTOR)
+private buildActivationParamsFromCheckoutMetadata(
+  stripeSubscription: Stripe.Subscription,
+  checkoutMetadata: Record<string, string>
+): SubscriptionActivationParams {
+  const tier = checkoutMetadata.tier as PlanTier;
+  const planDef = PLAN_DEFINITIONS[tier];
+
+  // Derive trial state from Stripe subscription
+  const isTrialing = stripeSubscription.status === 'trialing';
+  const trialEndsAt = isTrialing && stripeSubscription.trial_end
+    ? new Date(stripeSubscription.trial_end * 1000)
+    : null;
+
+  return {
+    organizationId: checkoutMetadata.organization_id,
+    tier,
+    stripeSubscriptionId: stripeSubscription.id,
+    stripeCustomerId: stripeSubscription.customer as string,
+    status: this.mapStripeStatus(stripeSubscription.status),
+    isTrialing,
+    trialEndsAt,
+    currentPeriodStart: new Date(stripeSubscription.current_period_start * 1000),
+    currentPeriodEnd: new Date(stripeSubscription.current_period_end * 1000),
+    agentSeatsTotal: this.extractSeatCount(stripeSubscription),
+    managerSeatsTotal: 0,  // Deprecated, always 0
+  };
+}
+
+private mapStripeStatus(stripeStatus: Stripe.Subscription.Status): SubscriptionStatus {
+  const statusMap: Record<string, SubscriptionStatus> = {
+    'trialing': SubscriptionStatus.TRIALING,
+    'active': SubscriptionStatus.ACTIVE,
+    'past_due': SubscriptionStatus.PAST_DUE,
+    'canceled': SubscriptionStatus.CANCELED,
+    'unpaid': SubscriptionStatus.UNPAID,
+    'incomplete': SubscriptionStatus.INCOMPLETE,
+    'incomplete_expired': SubscriptionStatus.INCOMPLETE_EXPIRED,
+  };
+  return statusMap[stripeStatus] || SubscriptionStatus.ACTIVE;
+}
+```
+
+### 2.3 Activation Service
+
+```typescript
+// subscription-activation.service.ts
+async activateSubscription(params: SubscriptionActivationParams): Promise<void> {
+  const org = await this.em.findOneOrFail(Organization, params.organizationId);
+
+  // Create or update subscription record
+  let subscription = await this.em.findOne(OrganizationSubscription, {
+    organization: org,
+  });
+
+  if (!subscription) {
+    subscription = this.em.create(OrganizationSubscription, {
+      organization: org,
+      tier: params.tier,
+      stripeSubscriptionId: params.stripeSubscriptionId,
+      stripeCustomerId: params.stripeCustomerId,
+      status: params.status,
+      isTrialing: params.isTrialing,
+      trialEndsAt: params.trialEndsAt,
+      currentPeriodStart: params.currentPeriodStart,
+      currentPeriodEnd: params.currentPeriodEnd,
+    });
+  } else {
+    subscription.tier = params.tier;
+    subscription.status = params.status;
+    subscription.isTrialing = params.isTrialing;
+    subscription.trialEndsAt = params.trialEndsAt;
+    subscription.currentPeriodStart = params.currentPeriodStart;
+    subscription.currentPeriodEnd = params.currentPeriodEnd;
+  }
+
+  await this.em.persistAndFlush(subscription);
+
+  // Initialize usage record
+  await this.subscriptionUsageService.initializeUsage(
+    params.organizationId,
+    params.agentSeatsTotal,
+    params.tier
+  );
+
+  this.logger.log(
+    `Activated ${params.tier} subscription for org ${params.organizationId}` +
+    (params.isTrialing ? ` (trial ends ${params.trialEndsAt})` : '')
+  );
+}
+```
+
+### 2.4 Trial Creation in Checkout
+
+```typescript
+// subscription.service.ts
+async createSubscriptionCheckout(
+  orgId: string,
+  tier: PlanTier,
+  seatCount: number
+): Promise<string> {
+  const planDef = PLAN_DEFINITIONS[tier];
+  const priceId = this.stripeConfig.prices[`${tier}_seat_monthly`];
+
+  const sessionParams: Stripe.Checkout.SessionCreateParams = {
+    mode: 'subscription',
+    customer: await this.getOrCreateStripeCustomer(orgId),
+    line_items: [
+      {
+        price: priceId,
+        quantity: seatCount,
+      },
+    ],
+    subscription_data: {},
+    metadata: {
+      organization_id: orgId,
+      tier,
+    },
+    success_url: `${this.config.appUrl}/settings/billing?success=subscription`,
+    cancel_url: `${this.config.appUrl}/settings/billing?canceled=true`,
+  };
+
+  // Add trial if eligible
+  if (planDef.hasTrialPeriod) {
+    sessionParams.subscription_data.trial_period_days = planDef.trialDays;
+    sessionParams.payment_method_collection = 'always';  // Card upfront
+  }
+
+  const session = await this.stripe.checkout.sessions.create(sessionParams);
+  return session.url;
+}
+```
+
+### 2.5 Trial End Webhook (Future Phase)
+
+<Warning>
+The `trial_will_end` webhook is NOT currently handled and is deferred to Phase 10 frontend work. Document in `SUBSCRIPTION_MODULE_SPECIFICATION.md`.
+</Warning>
+
+```typescript
+// stripe-webhook.controller.ts (FUTURE)
+// NOT implemented in Phase 2—add to Phase 10
+case 'customer.subscription.trial_will_end':
+  return this.stripeWebhookService.handleTrialWillEnd(event);
+```
+
+### 2.6 Testing Checklist
+
+<Check>Pro checkout session created with 90-day trial</Check>
+<Check>Business checkout session created with 90-day trial</Check>
+<Check>Free tier has no trial period</Check>
+<Check>Subscription activated with `isTrialing=true` and correct `trialEndsAt`</Check>
+<Check>Trial→Active transition updates status on first invoice</Check>
+<Check>Card is collected upfront before trial begins</Check>
+
+</Step>
+
+<Step title="Phase 3: Column Additions (Entities, Usage, Credits)">
+
+Add database columns for entity caps, inventory limits, storage tracking, and credit metering.
+
+### 3.1 Entity `isImported` Columns
+
+```typescript
+// Migration: add-is-imported-columns.ts
+export class AddIsImportedColumns extends Migration {
+  async up(): Promise<void> {
+    // Contact
+    this.addSql(`
+      ALTER TABLE contacts
+      ADD COLUMN is_imported BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+
+    // Deal
+    this.addSql(`
+      ALTER TABLE deals
+      ADD COLUMN is_imported BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+
+    // Company
+    this.addSql(`
+      ALTER TABLE companies
+      ADD COLUMN is_imported BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+
+    // Index for cap queries
+    this.addSql(`
+      CREATE INDEX idx_contacts_cap_count
+      ON contacts (organization_id, is_imported, is_deleted)
+      WHERE is_imported = FALSE AND is_deleted = FALSE;
+    `);
+
+    this.addSql(`
+      CREATE INDEX idx_companies_cap_count
+      ON companies (organization_id, is_imported, is_deleted)
+      WHERE is_imported = FALSE AND is_deleted = FALSE;
+    `);
+  }
+
+  async down(): Promise<void> {
+    this.addSql(`DROP INDEX IF EXISTS idx_contacts_cap_count;`);
+    this.addSql(`DROP INDEX IF EXISTS idx_companies_cap_count;`);
+    this.addSql(`ALTER TABLE contacts DROP COLUMN is_imported;`);
+    this.addSql(`ALTER TABLE deals DROP COLUMN is_imported;`);
+    this.addSql(`ALTER TABLE companies DROP COLUMN is_imported;`);
+  }
+}
+```
+
+### 3.2 Entity Definitions Update
+
+```typescript
+// contact.entity.ts
+@Entity({ tableName: 'contacts' })
+export class Contact extends BaseEntity {
+  // ... existing fields
+
+  @Property({ default: false })
+  isImported: boolean = false;
+}
+
+// deal.entity.ts
+@Entity({ tableName: 'deals' })
+export class Deal extends BaseEntity {
+  // ... existing fields
+
+  @Property({ default: false })
+  isImported: boolean = false;
+}
+
+// company.entity.ts
+@Entity({ tableName: 'companies' })
+export class Company extends BaseEntity {
+  // ... existing fields
+
+  @Property({ default: false })
+  isImported: boolean = false;
+}
+```
+
+### 3.3 PlanLimits Columns
+
+```typescript
+// Migration: add-plan-limits.ts
+export class AddPlanLimits extends Migration {
+  async up(): Promise<void> {
+    // Add limits columns to subscription_plan
+    this.addSql(`
+      ALTER TABLE subscription_plan
+      ADD COLUMN max_companies INTEGER,
+      ADD COLUMN max_inventory_units INTEGER,
+      ADD COLUMN storage_gb INTEGER NOT NULL DEFAULT 5;
+    `);
+
+    // Seed limits
+    this.addSql(`
+      UPDATE subscription_plan
+      SET max_companies = 10,
+          max_inventory_units = 25,
+          storage_gb = 5
+      WHERE tier = 'free';
+    `);
+
+    this.addSql(`
+      UPDATE subscription_plan
+      SET max_companies = NULL,
+          max_inventory_units = NULL,
+          storage_gb = 50
+      WHERE tier = 'professional';
+    `);
+
+    this.addSql(`
+      UPDATE subscription_plan
+      SET max_companies = NULL,
+          max_inventory_units = NULL,
+          storage_gb = 100
+      WHERE tier = 'business';
+    `);
+  }
+
+  async down(): Promise<void> {
+    this.addSql(`
+      ALTER TABLE subscription_plan
+      DROP COLUMN max_companies,
+      DROP COLUMN max_inventory_units,
+      DROP COLUMN storage_gb;
+    `);
+  }
+}
+```
+
+### 3.4 Usage Tracking Columns
+
+```typescript
+// Migration: add-usage-tracking.ts
+export class AddUsageTracking extends Migration {
+  async up(): Promise<void> {
+    // Add usage counters to subscription_usage
+    this.addSql(`
+      ALTER TABLE subscription_usage
+      ADD COLUMN companies_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN inventory_units_count INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN storage_used_bytes BIGINT NOT NULL DEFAULT 0,
+      ADD COLUMN storage_allowance_bytes BIGINT NOT NULL DEFAULT 5368709120;  -- 5GB
+    `);
+
+    // Initialize from current data
+    this.addSql(`
+      UPDATE subscription_usage su
+      SET companies_count = (
+        SELECT COUNT(*)
+        FROM companies c
+        WHERE c.organization_id = su.organization_id
+          AND c.is_deleted = FALSE
+          AND c.is_imported = FALSE
+      ),
+      inventory_units_count = (
+        SELECT COUNT(*)
+        FROM inventory_units iu
+        WHERE iu.organization_id = su.organization_id
+          AND iu.is_deleted = FALSE
+      ),
+      storage_used_bytes = COALESCE((
+        SELECT SUM(file_size)
+        FROM file_uploads fu
+        WHERE fu.organization_id = su.organization_id
+          AND fu.is_deleted = FALSE
+      ), 0);
+    `);
+  }
+
+  async down(): Promise<void> {
+    this.addSql(`
+      ALTER TABLE subscription_usage
+      DROP COLUMN companies_count,
+      DROP COLUMN inventory_units_count,
+      DROP COLUMN storage_used_bytes,
+      DROP COLUMN storage_allowance_bytes;
+    `);
+  }
+}
+```
+
+### 3.5 Credit Metering Tables
+
+```typescript
+// Migration: credit-metering-tables.ts
+export class CreditMeteringTables extends Migration {
+  async up(): Promise<void> {
+    // User credit allocation table (per-user ceilings + personal credits)
+    this.addSql(`
+      CREATE TABLE user_credit_allocation (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        
+        -- Org pool ceiling (NULL = no ceiling, can use full org balance)
+        org_credit_ceiling NUMERIC(12, 2),
+        
+        -- Personal credits (separate from org pool)
+        personal_credits_balance NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        
+        -- Consumption tracking (org pool only; personal tracked separately)
+        org_credits_consumed NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        
+        -- Reset tracking
+        last_reset_at TIMESTAMPTZ,
+        
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        
+        UNIQUE(user_id, organization_id)
+      );
+    `);
+
+    this.addSql(`
+      CREATE INDEX idx_user_credit_allocation_org
+      ON user_credit_allocation(organization_id);
+    `);
+
+    // Credit purchase ledger (one-time purchases)
+    this.addSql(`
+      CREATE TABLE credit_purchases (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        
+        stripe_charge_id VARCHAR(255) NOT NULL UNIQUE,
+        stripe_session_id VARCHAR(255) NOT NULL,
+        
+        credits NUMERIC(12, 2) NOT NULL,
+        amount_paid NUMERIC(10, 2) NOT NULL,
+        currency VARCHAR(3) NOT NULL,
+        
+        purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    this.addSql(`
+      CREATE INDEX idx_credit_purchases_user
+      ON credit_purchases(user_id);
+    `);
+
+    this.addSql(`
+      CREATE INDEX idx_credit_purchases_org
+      ON credit_purchases(organization_id);
+    `);
+  }
+
+  async down(): Promise<void> {
+    this.addSql(`DROP TABLE IF EXISTS credit_purchases;`);
+    this.addSql(`DROP TABLE IF EXISTS user_credit_allocation;`);
+  }
+}
+```
+
+### 3.6 Entity Definitions
+
+```typescript
+// user-credit-allocation.entity.ts
+@Entity({ tableName: 'user_credit_allocation' })
+export class UserCreditAllocation extends BaseEntity {
+  @ManyToOne(() => User, { onDelete: 'cascade' })
+  user!: User;
+
+  @ManyToOne(() => Organization, { onDelete: 'cascade' })
+  organization!: Organization;
+
+  @Property({ type: 'numeric', precision: 12, scale: 2, nullable: true })
+  orgCreditCeiling?: number;
+
+  @Property({ type: 'numeric', precision: 12, scale: 2, default: 0 })
+  personalCreditsBalance: number = 0;
+
+  @Property({ type: 'numeric', precision: 12, scale: 2, default: 0 })
+  orgCreditsConsumed: number = 0;
+
+  @Property({ nullable: true })
+  lastResetAt?: Date;
+
+  @Index()
+  @Property()
+  createdAt: Date = new Date();
+
+  @Property({ onUpdate: () => new Date() })
+  updatedAt: Date = new Date();
+}
+
+// credit-purchase.entity.ts
+@Entity({ tableName: 'credit_purchases' })
+export class CreditPurchase extends BaseEntity {
+  @ManyToOne(() => Organization, { onDelete: 'set null', nullable: true })
+  organization?: Organization;
+
+  @ManyToOne(() => User, { onDelete: 'cascade' })
+  user!: User;
+
+  @Property({ unique: true })
+  stripeChargeId!: string;
+
+  @Property()
+  stripeSessionId!: string;
+
+  @Property({ type: 'numeric', precision: 12, scale: 2 })
+  credits!: number;
+
+  @Property({ type: 'numeric', precision: 10, scale: 2 })
+  amountPaid!: number;
+
+  @Property({ length: 3 })
+  currency!: string;
+
+  @Property()
+  purchasedAt: Date = new Date();
+
+  @Property()
+  createdAt: Date = new Date();
+}
+```
+
+### 3.7 Testing Checklist
+
+<Check>Migrations run successfully on dev/staging</Check>
+<Check>Entity imports stamp `isImported=true` correctly</Check>
+<Check>Plan limits seeded with correct values</Check>
+<Check>Usage counters initialized from existing data</Check>
+<Check>Credit allocation table created with proper constraints</Check>
+<Check>No existing rows fail enum hydration</Check>
+
+</Step>
+
+<Step title="Phase 4: Entity Cap Enforcement">
+
+Implement hard-block enforcement for Company (Free: 10), Deal (future), Contact (future), and Inventory Units (Free: 25).
+
+### 4.1 Cap Service Core
+
+```typescript
+// entity-cap.service.ts
+import { Injectable } from '@nestjs/common';
+import { EntityManager } from '@mikro-orm/core';
+
+export enum EntityType {
+  COMPANY = 'company',
+  DEAL = 'deal',
+  CONTACT = 'contact',
+  INVENTORY_UNIT = 'inventory_unit',
+}
+
+@Injectable()
+export class EntityCapService {
+  constructor(private readonly em: EntityManager) {}
+
+  async assertCanCreate(
+    orgId: string,
+    entityType: EntityType,
+    skipForImport: boolean = false
+  ): Promise<void> {
+    if (skipForImport) {
+      return;  // Bulk import bypasses caps
+    }
+
+    const subscription = await this.getSubscription(orgId);
+    const limit = this.getLimit(subscription.tier, entityType);
+
+    if (limit === null) {
+      return;  // Unlimited for Pro/Business
+    }
+
+    const currentCount = await this.countEntities(orgId, entityType);
+
+    if (currentCount >= limit) {
+      throw new EntityCapExceededError(entityType, limit, currentCount);
+    }
+  }
+
+  private async countEntities(
+    orgId: string,
+    entityType: EntityType
+  ): Promise<number> {
+    // Count predicate: isImported = false AND isDeleted = false
+    // Archived rows STILL count (disable active filter)
+    const baseWhere = {
+      organization: orgId,
+      isDeleted: false,
+    };
+
+    switch (entityType) {
+      case EntityType.COMPANY:
+        return this.em.count(Company, {
+          ...baseWhere,
+          isImported: false,
+        });
+
+      case EntityType.DEAL:
+        return this.em.count(Deal, {
+          ...baseWhere,
+          isImported: false,
+        });
+
+      case EntityType.CONTACT:
+        return this.em.count(Contact, {
+          ...baseWhere,
+          isImported: false,
+        });
+
+      case EntityType.INVENTORY_UNIT:
+        return this.em.count(InventoryUnit, {
+          ...baseWhere,
+          // No isImported column on inventory
+        });
+
+      default:
+        throw new Error(`Unknown entity type: ${entityType}`);
+    }
+  }
+
+  private getLimit(tier: PlanTier, entityType: EntityType): number | null {
+    const planDef = PLAN_DEFINITIONS[tier];
+
+    switch (entityType) {
+      case EntityType.COMPANY:
+        return planDef.limits.maxCompanies;
+      case EntityType.INVENTORY_UNIT:
+        return planDef.limits.maxInventoryUnits;
+      case EntityType.DEAL:
+      case EntityType.CONTACT:
+        // Future: add to plan limits
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  private async getSubscription(orgId: string): Promise<OrganizationSubscription> {
+    const sub = await this.em.findOne(OrganizationSubscription, {
+      organization: orgId,
+    });
+
+    if (!sub) {
+      // Default to Free for orgs without explicit subscription
+      return { tier: PlanTier.FREE } as OrganizationSubscription;
+    }
+
+    return sub;
+  }
+
+  async getCapStatus(
+    orgId: string,
+    entityType: EntityType
+  ): Promise<CapStatus> {
+    const subscription = await this.getSubscription(orgId);
+    const limit = this.getLimit(subscription.tier, entityType);
+    const current = await this.countEntities(orgId, entityType);
+
+    return {
+      entityType,
+      limit,
+      current,
+      remaining: limit === null ? null : Math.max(0, limit - current),
+      isUnlimited: limit === null,
+      isAtLimit: limit !== null && current >= limit,
+    };
+  }
+}
+
+// entity-cap-exceeded.error.ts
+export class EntityCapExceededError extends Error {
+  constructor(
+    public readonly entityType: EntityType,
+    public readonly limit: number,
+    public readonly current: number
+  ) {
+    super(
+      `Entity cap exceeded: ${entityType} (limit: ${limit}, current: ${current})`
+    );
+    this.name = 'EntityCapExceededError';
+  }
+}
+```
+
+### 4.2 Company Service Integration
+
+```typescript
+// company.service.ts
+async create(
+  orgId: string,
+  dto: CreateCompanyDto,
+  actorId: string
+): Promise<Company> {
+  // Hard-block user-initiated creates
+  await this.entityCapService.assertCanCreate(
+    orgId,
+    EntityType.COMPANY,
+    false  // skipForImport
+  );
+
+  const company = this.em.create(Company, {
+    organization: orgId,
+    name: dto.name,
+    isImported: false,  // User-created, not imported
+    // ... other fields
+  });
+
+  await this.em.persistAndFlush(company);
+  return company;
+}
+
+async createFromImport(
+  orgId: string,
+  importData: CompanyImportData
+): Promise<Company> {
+  // Bulk import bypasses caps
+  const company = this.em.create(Company, {
+    organization: orgId,
+    name: importData.name,
+    isImported: true,  // Mark as imported
+    // ... other fields
+  });
+
+  await this.em.persistAndFlush(company);
+  return company;
+}
+```
+
+### 4.3 Auto-Create Company from Contact Import
+
+<Warning>
+Auto-created companies during contact import MUST be stamped `isImported = true`.
+</Warning>
+
+```typescript
+// contact-import.service.ts
+private async getOrCreateCompany(
+  orgId: string,
+  companyName: string,
+  isImported: boolean
+): Promise<Company> {
+  let company = await this.em.findOne(Company, {
+    organization: orgId,
+    name: companyName,
+  });
+
+  if (!company) {
+    // Auto-created company inherits import status from contact
+    company = this.em.create(Company, {
+      organization: orgId,
+      name: companyName,
+      isImported,  // CRITICAL: inherit from contact
+    });
+
+    await this.em.persistAndFlush(company);
+  }
+
+  return company;
+}
+```
+
+### 4.4 Inventory Unit Service Integration
+
+```typescript
+// inventory.service.ts
+async createUnit(
+  orgId: string,
+  dto: CreateInventoryUnitDto,
+  actorId: string
+): Promise<InventoryUnit> {
+  await this.entityCapService.assertCanCreate(
+    orgId,
+    EntityType.INVENTORY_UNIT,
+    false
+  );
+
+  const unit = this.em.create(InventoryUnit, {
+    organization: orgId,
+    propertyId: dto.propertyId,
+    unitNumber: dto.unitNumber,
+    // ... other fields
+  });
+
+  await this.em.persistAndFlush(unit);
+  return unit;
+}
+```
+
+### 4.5 Inbound Lead Soft-Degrade
+
+```typescript
+// lead-ingestion.service.ts
+async createFromInboundMessage(
+  orgId: string,
+  messageData: InboundMessageData
+): Promise<Lead> {
+  // Soft-degrade: create lead + emit warning, never drop inbound demand
+  const capStatus = await this.entityCapService.getCapStatus(
+    orgId,
+    EntityType.COMPANY
+  );
+
+  const lead = this.em.create(Lead, {
+    organization: orgId,
+    leadSource: LeadSource.WHATSAPP,
+    // ... other fields
+  });
+
+  await this.em.persistAndFlush(lead);
+
+  if (capStatus.isAtLimit) {
+    // Emit over-limit event (monitor but don't block)
+    await this.eventBus.publish(
+      new EntityCapExceededEvent({
+        organizationId: orgId,
+        entityType: EntityType.COMPANY,
+        limit: capStatus.limit,
+        current: capStatus.current,
+        source: 'inbound_whatsapp',
+      })
+    );
+
+    this.logger.warn(
+      `Org ${orgId} exceeded company cap (${capStatus.current}/${capStatus.limit}) ` +
+      `via inbound message but lead was created`
+    );
+  }
+
+  return lead;
+}
+```
+
+### 4.6 Cap Status Endpoint
+
+```typescript
+// subscription.controller.ts
+@Get('caps')
+@UseGuards(JwtAuthGuard, OrganizationGuard)
+async getCapStatus(
+  @CurrentOrganization() org: Organization
+): Promise<CapStatusResponse> {
+  const [companies, inventory] = await Promise.all([
+    this.entityCapService.getCapStatus(org.id, EntityType.COMPANY),
+    this.entityCapService.getCapStatus(org.id, EntityType.INVENTORY_UNIT),
+  ]);
+
+  return {
+    companies,
+    inventoryUnits: inventory,
+  };
+}
+```
+
+### 4.7 Testing Checklist
+
+<Check>Free org blocked at 10th company create</Check>
+<Check>Free org blocked at 25th inventory unit create</Check>
+<Check>Pro/Business orgs have no entity caps</Check>
+<Check>Imported companies excluded from cap count</Check>
+<Check>Auto-created companies during contact import stamped `isImported=true`</Check>
+<Check>Archived companies still count toward cap</Check>
+<Check>Inbound WhatsApp lead creates emit warning but don't block</Check>
+<Check>Bulk import bypasses all cap checks</Check>
+
+</Step>
+
+<Step title="Phase 5: Credit Metering Service (Backend Core)">
+
+Build the unified `CreditMeteringService` facade that consolidates AI budget planes and implements the org-pool-with-ceilings model.
+
+<Warning>
+**Forward dependency**: Phase 5.4's per-seat allowance calculation requires `getSeatCount(orgId)` from Phase 9. Execute Phase 9's seat count consolidation BEFORE landing Phase 5.4.
+</Warning>
+
+### 5.1 Service Architecture
+
+```typescript
+// credit-metering.service.ts
+@Injectable()
+export class CreditMeteringService {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly allocationRepo: EntityRepository<UserCreditAllocation>,
+    private readonly subscriptionService: SubscriptionService,
+    private readonly configService: ConfigService,
+  ) {}
+
+  /**
+   * Get effective credit balance for a spend context
+   * Respects isSubscriptionEnforcementEnabled() flag
+   */
+  async getBalance(context: SpendContext): Promise<CreditBalance> {
+    if (!this.isEnforcementEnabled()) {
+      return this.getUnlimitedBalance();
+    }
+
+    const [orgBalance, userAllocation] = await Promise.all([
+      this.getOrgPoolBalance(context.organizationId),
+      this.getUserAllocation(context.userId, context.organizationId),
+    ]);
+
+    // Org-level channel or no user context → org pool only
+    if (!context.userId || context.channel === 'org_level') {
+      return {
+        source: 'org_pool',
+        available: Math.max(0, orgBalance),
+        orgPool: orgBalance,
+        personalCredits: 0,
+      };
+    }
+
+    // Calculate user's effective draw from org pool
+    const userOrgDraw = this.calculateUserOrgDraw(
+      userAllocation,
+      orgBalance
+    );
+
+    return {
+      source: 'user_allocated',
+      available: userOrgDraw + userAllocation.personalCreditsBalance,
+      orgPool: userOrgDraw,
+      personalCredits: userAllocation.personalCreditsBalance,
+    };
+  }
+
+  /**
+   * Deduct credits from the appropriate balance(s)
+   * Order: org pool first, then personal credits
+   */
+  async deductCredits(
+    context: SpendContext,
+    amount: number,
+    metadata: DeductionMetadata
+  ): Promise<DeductionResult> {
+    if (!this.isEnforcementEnabled()) {
+      return { deducted: amount, source: 'unlimited' };
+    }
+
+    const balance = await this.getBalance(context);
+
+    if (balance.available < amount) {
+      throw new InsufficientCreditsError(amount, balance.available);
+    }
+
+    // Deduct from org pool first
+    let remaining = amount;
+    const deductions: DeductionRecord[] = [];
+
+    if (balance.orgPool > 0 && remaining > 0) {
+      const orgDeduct = Math.min(remaining, balance.orgPool);
+      await this.deductFromOrgPool(
+        context.organizationId,
+        context.userId,
+        orgDeduct,
+        metadata
+      );
+      deductions.push({ source: 'org_pool', amount: orgDeduct });
+      remaining -= orgDeduct;
+    }
+
+    // Deduct from personal credits if needed
+    if (balance.personalCredits > 0 && remaining > 0) {
+      const personalDeduct = Math.min(remaining, balance.personalCredits);
+      await this.deductFromPersonalCredits(
+        context.userId,
+        personalDeduct,
+        metadata
+      );
+      deductions.push({ source: 'personal', amount: personalDeduct });
+      remaining -= personalDeduct;
+    }
+
+    return {
+      deducted: amount,
+      source: deductions.length === 1 ? deductions[0].source : 'mixed',
+      breakdown: deductions,
+    };
+  }
+
+  private calculateUserOrgDraw(
+    allocation: UserCreditAllocation,
+    orgBalance: number
+  ): number {
+    if (!allocation.orgCreditCeiling) {
+      // No ceiling = can use full org balance
+      return orgBalance;
+    }
+
+    // User draw = min(ceiling - consumed, org remaining)
+    const userRemaining = Math.max(
+      0,
+      allocation.orgCreditCeiling - allocation.orgCreditsConsumed
+    );
+
+    return Math.min(userRemaining, orgBalance);
+  }
+
+  private isEnforcementEnabled(): boolean {
+    return this.configService.get('subscription.enforcementEnabled', true);
+  }
+
+  private getUnlimitedBalance(): CreditBalance {
+    // When enforcement is OFF, return sentinel value
+    return {
+      source: 'unlimited',
+      available: Number.MAX_SAFE_INTEGER,
+      orgPool: Number.MAX_SAFE_INTEGER,
+      personalCredits: 0,
+    };
+  }
+}
+```
+
+### 5.2 Org Pool Balance Calculation
+
+```typescript
+// credit-metering.service.ts (continued)
+private async getOrgPoolBalance(orgId: string): Promise<number> {
+  const usage = await this.em.findOneOrFail(SubscriptionUsage, {
+    organization: orgId,
+  });
+
+  const subscription = await this.em.findOne(OrganizationSubscription, {
+    organization: orgId,
+  });
+
+  const planDef = PLAN_DEFINITIONS[subscription?.tier || PlanTier.FREE];
+
+  // Monthly allowance = aiCreditsPerMonth × seat count
+  // (Requires Phase 9's getSeatCount to be implemented first)
+  const seatCount = await this.subscriptionService.getSeatCount(orgId);
+  const monthlyAllowance = planDef.aiCreditsPerMonth * seatCount;
+
+  // Purchased credits (one-time packs)
+  const purchasedCredits = await this.getPurchasedOrgCredits(orgId);
+
+  // Total pool = allowance + purchased - consumed
+  const totalPool = monthlyAllowance + purchasedCredits - usage.aiCreditsUsed;
+
+  return Math.max(0, totalPool);
+}
+
+private async getPurchasedOrgCredits(orgId: string): Promise<number> {
+  // Aggregate one-time credit pack purchases for this org
+  const purchases = await this.em.find(CreditPurchase, {
+    organization: orgId,
+  });
+
+  return purchases.reduce((sum, p) => sum + p.credits, 0);
+}
+```
+
+### 5.3 User Allocation Management
+
+```typescript
+// credit-metering.service.ts (continued)
+async getUserAllocation(
+  userId: string,
+  orgId: string
+): Promise<UserCreditAllocation> {
+  let allocation = await this.allocationRepo.findOne({
+    user: userId,
+    organization: orgId,
+  });
+
+  if (!allocation) {
+    // Auto-create with no ceiling (can use full org pool)
+    allocation = this.em.create(UserCreditAllocation, {
+      user: userId,
+      organization: orgId,
+      orgCreditCeiling: null,
+      personalCreditsBalance: 0,
+      orgCreditsConsumed: 0,
+    });
+
+    await this.em.persistAndFlush(allocation);
+  }
+
+  return allocation;
+}
+
+async setUserCeiling(
+  userId: string,
+  orgId: string,
+  ceiling: number | null
+): Promise<void> {
+  const allocation = await this.getUserAllocation(userId, orgId);
+
+  allocation.orgCreditCeiling = ceiling;
+  allocation.updatedAt = new Date();
+
+  await this.em.persistAndFlush(allocation);
+
+  this.logger.log(
+    `Set org credit ceiling for user ${userId} in org ${orgId}: ${ceiling ?? 'unlimited'}`
+  );
+}
+
+async addPersonalCredits(
+  userId: string,
+  amount: number,
+  metadata: { source: string; referenceId: string }
+): Promise<void> {
+  // Personal credits are org-agnostic (user owns them across orgs)
+  // For simplicity, attach to the user's current/primary org
+  const user = await this.em.findOneOrFail(User, userId, {
+    populate: ['currentOrganization'],
+  });
+
+  const allocation = await this.getUserAllocation(
+    userId,
+    user.currentOrganization.id
+  );
+
+  allocation.personalCreditsBalance += amount;
+  allocation.updatedAt = new Date();
+
+  await this.em.persistAndFlush(allocation);
+
+  this.logger.log(
+    `Added ${amount} personal credits to user ${userId} (source: ${metadata.source})`
+  );
+}
+```
+
+### 5.4 Deduction Ledger
+
+```typescript
+// credit-metering.service.ts (continued)
+private async deductFromOrgPool(
+  orgId: string,
+  userId: string,
+  amount: number,
+  metadata: DeductionMetadata
+): Promise<void> {
+  // Update org usage
+  const usage = await this.em.findOneOrFail(SubscriptionUsage, {
+    organization: orgId,
+  });
+
+  usage.aiCreditsUsed += amount;
+  usage.updatedAt = new Date();
+
+  // Update user allocation consumed counter
+  const allocation = await this.getUserAllocation(userId, orgId);
+  allocation.orgCreditsConsumed += amount;
+  allocation.updatedAt = new Date();
+
+  await this.em.persistAndFlush([usage, allocation]);
+
+  // Record the transaction (audit trail)
+  await this.recordDeduction({
+    organizationId: orgId,
+    userId,
+    amount,
+    source: 'org_pool',
+    metadata,
+  });
+}
+
+private async deductFromPersonalCredits(
+  userId: string,
+  amount: number,
+  metadata: DeductionMetadata
+): Promise<void> {
+  const user = await this.em.findOneOrFail(User, userId, {
+    populate: ['currentOrganization'],
+  });
+
+  const allocation = await this.getUserAllocation(
+    userId,
+    user.currentOrganization.id
+  );
+
+  allocation.personalCreditsBalance -= amount;
+  allocation.updatedAt = new Date();
+
+  await this.em.persistAndFlush(allocation);
+
+  await this.recordDeduction({
+    userId,
+    amount,
+    source: 'personal',
+    metadata,
+  });
+}
+```
+
+### 5.5 Monthly Reset Job
+
+```typescript
+// credit-reset.job.ts
+@Injectable()
+export class CreditResetJob {
+  @Cron('0 0 1 * *')  // 1st of every month at midnight
+  async handleMonthlyReset(): Promise<void> {
+    const orgs = await this.em.find(Organization, {});
+
+    for (const org of orgs) {
+      await this.resetOrgCredits(org.id);
+    }
+
+    this.logger.log(`Reset credits for ${orgs.length} organizations`);
+  }
+
+  private async resetOrgCredits(orgId: string): Promise<void> {
+    // Reset org usage consumed counter (allowance refreshes monthly)
+    const usage = await this.em.findOne(SubscriptionUsage, {
+      organization: orgId,
+    });
+
+    if (usage) {
+      usage.aiCreditsUsed = 0;
+      usage.updatedAt = new Date();
+    }
+
+    // Reset all user org-consumed counters
+    const allocations = await this.em.find(UserCreditAllocation, {
+      organization: orgId,
+    });
+
+    for (const allocation of allocations) {
+      allocation.orgCreditsConsumed = 0;
+      allocation.lastResetAt = new Date();
+      allocation.updatedAt = new Date();
+    }
+
+    await this.em.persistAndFlush([usage, ...allocations]);
+
+    this.logger.log(`Reset credits for org ${orgId}`);
+  }
+}
+```
+
+### 5.6 Integration with Existing Gates
+
+<Warning>
+These gates are REPLACEMENTS of existing enforcement, not new additions. Verify behavior equivalence.
+</Warning>
+
+```typescript
+// ai-usage-guard.service.ts (REPLACE existing)
+@Injectable()
+export class AiUsageGuardService {
+  constructor(
+    private readonly creditMetering: CreditMeteringService,
+    private readonly costMap: AiCostMapService,
+  ) {}
+
+  async assertCanCallModel(context: SpendContext): Promise<void> {
+    const estimatedCost = this.costMap.estimatePromptCost(
+      context.model,
+      context.estimatedTokens || 1000
+    );
+
+    const balance = await this.creditMetering.getBalance(context);
+
+    if (balance.available < estimatedCost) {
+      throw new AiBudgetExceededError(
+        `Insufficient credits: need ${estimatedCost}, have ${balance.available}`
+      );
+    }
+  }
+}
+
+// ai-agent-runtime.service.ts (REPLACE 4 gate markers)
+// Line 225, 1681, 1735, 1873
+async generateResponse(
+  conversationId: string,
+  userMessage: string,
+  actorId: string
+): Promise<AgentResponse> {
+  const conversation = await this.getConversation(conversationId);
+  const context: SpendContext = {
+    organizationId: conversation.organizationId,
+    userId: actorId,
+    channel: 'agent',
+    model: 'gpt-4o-mini',
+  };
+
+  // GATE: Check credits before streaming
+  await this.aiUsageGuard.assertCanCallModel(context);
+
+  const response = await this.openaiService.streamChatCompletion({
+    // ... streaming config
+  });
+
+  // Deduct actual cost after completion
+  await this.creditMetering.deductCredits(
+    context,
+    response.actualCost,
+    {
+      action: 'agent_response',
+      conversationId,
+      model: response.model,
+      tokensUsed: response.tokensUsed,
+    }
+  );
+
+  return response;
+}
+```
+
+<Note>
+**Valuation Charge Waiver**: The 300-credit valuation charge + prompt-charge waiver is assistant-orchestrator-specific. It does NOT apply to the agent path unless the agent gains a valuation tool in the future. Implement only in the assistant orchestrator.
+</Note>
+
+### 5.7 Testing Checklist
+
+<Check>Org pool balance calculated correctly (allowance + purchased - consumed)</Check>
+<Check>User ceiling caps org pool draw correctly</Check>
+<Check>Personal credits used as fallback after org pool</Check>
+<Check>Enforcement respects `isSubscriptionEnforcementEnabled()` flag</Check>
+<Check>Monthly reset job zeroes consumed counters</Check>
+<Check>All 4 agent gate markers replaced with new metering</Check>
+<Check>Balance endpoint returns "unlimited" sentinel when enforcement OFF</Check>
+
+</Step>
+
+<Step title="Phase 6: Cost Map & Storage Limits">
+
+Define the AI credit cost map and implement storage cap enforcement.
+
+### 6.1 AI Cost Map
+
+```typescript
+// ai-cost-map.service.ts
+@Injectable()
+export class AiCostMapService {
+  private readonly COST_MAP: Record<string, ModelCost> = {
+    'gpt-4o': {
+      inputPer1M: 2.50,
+      outputPer1M: 10.00,
+      creditsPerInputToken: 0.0000025,
+      creditsPerOutputToken: 0.00001,
+    },
+    'gpt-4o-mini': {
+      inputPer1M: 0.15,
+      outputPer1M: 0.60,
+      creditsPerInputToken: 0.00000015,
+      creditsPerOutputToken: 0.0000006,
+    },
+    'gpt-4-turbo': {
+      inputPer1M: 10.00,
+      outputPer1M: 30.00,
+      creditsPerInputToken: 0.00001,
+      creditsPerOutputToken: 0.00003,
+    },
+    'text-embedding-3-small': {
+      inputPer1M: 0.02,
+      outputPer1M: 0,
+      creditsPerInputToken: 0.00000002,
+      creditsPerOutputToken: 0,
+    },
+    'text-embedding-3-large': {
+      inputPer1M: 0.13,
+      outputPer1M: 0,
+      creditsPerInputToken: 0.00000013,
+      creditsPerOutputToken: 0,
+    },
+  };
+
+  calculateCost(
+    model: string,
+    inputTokens: number,
+    outputTokens: number
+  ): number {
+    const costs = this.COST_MAP[model];
+
+    if (!costs) {
+      throw new Error(`Unknown model: ${model}`);
+    }
+
+    const inputCost = inputTokens * costs.creditsPerInputToken;
+    const outputCost = outputTokens * costs.cred
